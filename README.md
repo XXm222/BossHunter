@@ -1,201 +1,198 @@
-## 本分支：招聘端改造
-
-本分支基于 BossHunter 2.4.0 开发面试前招聘 Agent，目标是按人工选定的岗位找人、沟通回复、接收并评估简历、协调面试邀约，之后交接人工。实际面试、Offer、录用与入职不在范围内。
-
-默认入口为 `/recruiting`，原求职工作台保留在 `/jobseeker`。**当前仍为单会话最小样本试运行，主动打招呼及自动外发尚未完整接通，面试邀约禁止发送。** 下方原项目介绍描述的是求职端能力，不代表招聘端均已完成。
-
-- [招聘端目标、架构与当前进度](docs/RECRUITING.md)
-- [招聘界面设计规范](DESIGN.md)
-
----
-
 <p align="center">
-  <a href="https://github.com/shengjidaguai-china"><strong>升级打怪开源社区</strong></a> 首批开放共建项目 ·
-  <a href="https://github.com/shengjidaguai-china">点击组织首页右上角 <strong>Follow</strong></a>，及时获取新项目与共建活动
+  基于 <a href="https://github.com/shengjidaguai-china/BossHunter"><strong>BossHunter</strong></a> 的招聘端改造 ·
+  <a href="https://github.com/XXm222/BossHunter/tree/recruiting-agent">招聘端开发分支</a>
 </p>
 
-<h1 align="center">BossHunter v2.4.0</h1>
+<h1 align="center">BossHunter 招聘助手</h1>
 
 <p align="center">
-  某直聘智能求职 Agent：本地完成岗位采集、AI 评分、人工确认投递、回复监测与定制简历生成。
+  面向招聘方的面试前工作 Agent：围绕岗位找人、候选人沟通、简历评估和面试安排，减少重复操作。
 </p>
 
 <p align="center">
-  <a href="https://github.com/shengjidaguai-china/BossHunter/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/shengjidaguai-china/BossHunter?style=social"></a>
-  <a href="https://github.com/shengjidaguai-china/BossHunter"><img alt="Version" src="https://img.shields.io/badge/version-v2.4.0-FB6511"></a>
+  <a href="https://github.com/XXm222/BossHunter/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/XXm222/BossHunter?style=social"></a>
+  <a href="docs/RECRUITING.md"><img alt="Stage: Pilot" src="https://img.shields.io/badge/stage-pilot-FB6511"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white"></a>
-  <a href="https://github.com/shengjidaguai-china/BossHunter/issues"><img alt="GitHub Issues" src="https://img.shields.io/github/issues/shengjidaguai-china/BossHunter"></a>
-  <a href="https://github.com/shengjidaguai-china/BossHunter/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/shengjidaguai-china/BossHunter"></a>
+  <a href="src/bosshunter/web/frontend/package.json"><img alt="React and TypeScript" src="https://img.shields.io/badge/React-TypeScript-3178C6?logo=react&logoColor=white"></a>
+  <a href="https://github.com/XXm222/BossHunter/commits/recruiting-agent"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/XXm222/BossHunter/recruiting-agent"></a>
 </p>
 
 <p align="center">
-  🚀 本地运行 · 🔒 人工确认 · 🤖 多模型兼容 · 🧭 Chrome 自动化
+  🚀 本地运行 · 💬 上下文沟通 · 📄 收到简历自动评估 · 🧭 复用 Chrome 登录状态
 </p>
 
 <p align="center">
-  ⭐ 如果 BossHunter 对你有帮助，欢迎 <a href="https://github.com/shengjidaguai-china/BossHunter/stargazers"><strong>Star 项目</strong></a>；想及时获取新版本，请使用仓库右上角 <strong>Watch → Custom → Releases</strong>。
+  ⭐ 欢迎 <a href="https://github.com/XXm222/BossHunter/stargazers"><strong>Star 项目</strong></a>，关注招聘端改造进展。
 </p>
 
-**BossHunter** 帮助集中求职的用户减少重复搜索、筛选和沟通准备，把最终投递决定留给本人。所有投递必须先经过人工确认，不会在未经确认时发送。
+**BossHunter 招聘助手**的目标是帮助招聘方完成面试前的工作：读取已发布岗位，由人工选择处理范围；寻找候选人、打招呼、结合上下文回复；收到简历后按岗位 JD 评估，并协调线上或线下面试，最后交接人工。
 
-[观看产品演示](docs/demo/JD猎手_AI求职_BossHunter_产品功能演示.mp4) · [完整上手指南](docs/QUICKSTART.md) · [提交问题](https://github.com/shengjidaguai-china/BossHunter/issues)
+实际面试、面试评价、定薪、Offer、录用和入职管理不在本项目范围内。
 
-> [!WARNING]
-> 自动化操作招聘平台存在账号限制或封禁风险。本项目仅供学习、研究和个人求职效率提升；请遵守平台规则，保持低频，并自行承担使用风险。项目与任何招聘平台及其关联公司不存在隶属、合作或背书关系。
+[项目目标与当前进度](docs/RECRUITING.md) · [快速开始](#快速开始) · [界面设计规范](DESIGN.md) · [原项目](https://github.com/shengjidaguai-china/BossHunter)
+
+> [!IMPORTANT]
+> 当前为**单公司、单账号、单绑定会话的最小样本试运行版**。主动打招呼执行与平台剩余额度尚未接通，自动外发未开放，面试邀约禁止发送。以下会明确区分产品目标与已实现能力，页面上有入口不代表平台动作已验收。
 
 ## 核心能力
 
-| 能力 | 说明 |
-|---|---|
-| 多平台岗位池 | 串行采集 BOSS 直聘、智联招聘、前程无忧 51job 和猎聘，支持来源去重 |
-| AI 评分与筛选 | 先做关键词预筛，再结合岗位 JD 深度评分 |
-| 人工确认 | 投递前必须审核，支持逐个或批量确认 |
-| 个性化沟通 | 根据岗位 JD 和个人简历，为已确认岗位生成招呼语 |
-| 保守发送 | 随机间隔、时间窗口、每日上限和发送前浏览 |
-| 工作台与跟进 | 管理岗位、投递状态和 HR 回复 |
-| 定制化简历 | 识别 HR 的简历请求，并结合岗位 JD 辅助生成定制化简历 |
-
-### 平台能力边界
-
-| 平台 | 采集与 AI 处理 | 投递与监听 |
+| 能力 | 说明 | 当前状态 |
 |---|---|---|
-| BOSS 直聘 | 支持 | 人工确认后低频发送，并支持回复监听 |
-| 智联招聘 | 支持只读采集、评分和招呼语准备 | 在原平台手动投递，再回填“已发送” |
-| 前程无忧 51job | 支持只读采集、评分和招呼语准备 | 在原平台手动投递，再回填“已发送” |
-| 猎聘 | 支持只读采集、评分和招呼语准备 | 在原平台手动投递，再回填“已发送” |
+| 已发布岗位同步 | 从招聘账号读取岗位，由人工勾选允许处理的开放岗位 | 已实现读取与勾选 |
+| 主动找人与打招呼 | 按选中岗位寻找候选人，使用平台可用额度或自定义每日上限 | 界面与额度配置已实现，执行器待接通 |
+| 候选人沟通 | 在同一页面查看会话、回复建议、简历评估和面试安排 | 已实现，当前绑定一个会话 |
+| 上下文回复 | 组合已读取的双方消息、公司说明、岗位 JD、简历和有效评估生成回复草稿 | 流程已实现，真实模型与发送闭环待验收 |
+| 收到简历自动评估 | 识别附件、下载 PDF、逐页提取文字，自动调用岗位评估流程 | 已实现，需配置模型与 JD |
+| 公司说明 | 一个大文本框维护公司信息，结合各岗位 JD 供回复使用 | 已实现 |
+| 消息与简历监测 | 每 120 秒检查当前绑定会话，发现简历后自动处理 | 已实现进程内监测，非全账号同步 |
+| 面试安排 | 在候选人详情中填写线上或线下方式、时间、地址或会议信息 | 仅保存本地安排，禁止发送 |
+| 人工接管与运行记录 | 暂停自动处理，保留资料版本、处理状态和异常原因 | 已实现 |
 
-各平台严格串行采集。检测到验证码、频率限制、登录墙或未知页面结构时会安全停止，不尝试绕过。
+### 招聘流程
+
+```mermaid
+flowchart LR
+    A[同步岗位并人工勾选] --> B[找人与主动打招呼]
+    B --> C[候选人沟通]
+    D[候选人发来消息] --> C
+    C --> E[收到简历并读取]
+    E --> F[按 JD 评估与必要追问]
+    F --> G[协调面试时间和方式]
+    G --> H[确认安排并交接人工]
+```
+
+上图是最终业务目标。当前已实现部分的详细边界见下表；实际面试及其后的业务交给人工处理。
+
+### 当前能力边界
+
+| 项目 | 当前行为 |
+|---|---|
+| 平台范围 | 招聘端目前只适配 BOSS 直聘；原项目的多平台求职能力不等于多平台招聘已接入 |
+| 每日额度 | 可选择平台额度模式或自定义上限；平台剩余额度尚未读取，不会将保存配置当作启动外发 |
+| 额度目标 | 最终以使用当天可用额度为目标；平台限制、暂停和异常优先，不能保证每天一定耗尽 |
+| 聊天上下文 | 使用平台当前可返回的消息，明确历史覆盖范围，不声称已读取不可访问的历史 |
+| 简历完整性 | PDF 文字层逐页提取；图片、表格和文字顺序仍需核对，扫描件 OCR 待实现 |
+| 评分依据 | 评价岗位相关的职业证据，保留原文引用和未知项；不使用年龄、性别、婚育或外貌筛选 |
+| 自动评分 | 缺模型或 JD 时等待；资料、JD 或模型配置变化后重新评估；相同输入去重，失败不反复调用 |
+| 回复与邀约 | 回复目前保留草稿和核对流程，自动外发未开放；面试邀约在执行层禁发 |
+| 暂停与恢复 | 人工接管、停止联系或岗位暂停时停止自动处理；结果不明的发送保留待核实状态 |
+| 新账号使用 | 尚无完整会话绑定向导；全新安装不代表已具备完整自动招聘流程 |
 
 ## 项目结构图
 
-<a href="https://shengjidaguai-china.github.io/BossHunter/architecture/">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/bosshunter.dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/architecture/bosshunter.light.png">
-    <img alt="BossHunter 项目结构图：工作台、任务编排、AI、多平台采集、人工确认与浏览器执行。点击打开交互版。" src="docs/architecture/bosshunter.light.png" width="100%">
-  </picture>
-</a>
+```mermaid
+flowchart TD
+    UI[React + TypeScript 招聘界面] --> API[Python Bottle 本地接口]
+    API --> Service[RecruitingService 招聘流程]
+    Monitor[后台监测线程] --> Service
+    Service --> Store[SQLite 招聘数据库]
+    Service --> HTTP[本地登录状态 + HTTP 读取]
+    Service --> Runtime[原项目 Browser Runtime / Chrome CDP]
+    Service --> Agent[岗位评估与上下文回复]
+    HTTP --> BOSS[BOSS 招聘端]
+    Runtime --> BOSS
+    Agent --> Model[配置的模型 API]
+```
 
-**[点击打开交互结构图 ↗](https://shengjidaguai-china.github.io/BossHunter/architecture/)** · [可编辑源文件](docs/architecture/bosshunter.architecture.json)
+**本地单体应用，招聘业务独立存储。** 前端与 API 由同一个本地服务提供，招聘数据使用 `recruiting.db`；原求职模块继续保留。
 
-交互版支持缩放、节点搜索、关系追踪、深浅主题切换和图片导出。由 [Archify](https://github.com/yuppiez99999/archify-) 生成。
+- **后台读取：**使用本地 Chrome 的 BOSS 登录 Cookie 读取岗位、绑定会话和已收到的 PDF，Cookie 仅在内存中使用。
+- **页面操作：**复用原项目的 `RuntimeClient → Node Browser Runtime → Chrome CDP`，招聘端已移除 Kimi WebBridge 运行依赖。
+- **标签页范围：**只连接明确的现有招聘页面，不自动新建、导航、关闭或激活标签页，不自动切换聊天对象；目标不明确或失效时停止。
+- **模型调用：**程序控制流程，模型负责评估和生成内容；配置并运行相关功能后，对应上下文会发往所配置的模型接口。
+- **监测方式：**服务进程内线程每 120 秒检查一次；服务退出后监测停止，尚未采用独立任务队列。
+
+[查看招聘端模块说明](docs/RECRUITING.md#技术架构) · [查看招聘业务源码](src/bosshunter/recruiting)
 
 ## 快速开始
 
-需要 Python 3.10+、Node.js 22+、最新版 Google Chrome 和可用的 AI API。第一次使用按以下顺序操作：
+需要 Python 3.10+、Node.js 22+、Google Chrome，以及用于评分和回复的模型 API。
+
+**当前本地 Cookie 读取实现针对 macOS 的 Chrome 默认配置目录。Windows、Linux 及其他 Chrome 配置目录尚未适配这条招聘读取路径。** 下列命令以 macOS 为例。
 
 ```bash
-git clone https://github.com/shengjidaguai-china/BossHunter.git
+# 获取招聘端分支
+git clone --branch recruiting-agent https://github.com/XXm222/BossHunter.git
 cd BossHunter
+
+# 创建 Python 环境并安装招聘依赖
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[recruiting]'
+
+# 安装并构建前端
 npm --prefix src/bosshunter/web/frontend ci
 npm --prefix src/bosshunter/web/frontend run build
-pip install -e .
-bosshunter web
+
+# 启动本地服务
+bosshunter web --no-open
 ```
 
-在本地打开的 `http://127.0.0.1:8686` 面板中上传本人的真实简历，设置岗位条件，并连接 AI 服务。API Key 只在本地面板输入，不要发送到聊天、Issue 或提交文件中。
+打开 [招聘工作台](http://127.0.0.1:8686/recruiting)，按以下顺序准备资料与连接：
 
-随后开启 Chrome 远程调试，在同一个 Chrome 窗口登录招聘平台，再检查并运行：
+1. 在本机 Chrome 默认配置中登录 BOSS 招聘端，使用自己的招聘账号。
+2. 在“模型设置”配置模型接口和密钥；密钥只在本地填写。
+3. 在“公司说明”填写公司资料和岗位 JD，再同步已发布岗位并人工勾选处理范围。勾选目前不会启动自动外发。
+4. 完成会话身份绑定后，在候选人沟通中检查消息、简历及岗位关联，再开启消息与简历监测。当前缺少新账号绑定向导，请勿跳过身份核对直接写入候选人数据。
+5. 需要页面操作时，按原项目说明准备 Chrome 调试连接和 Browser Runtime；后台 HTTP 读取不依赖这条页面连接。
+
+招聘端入口为 `/recruiting`，原求职工作台保留在 `/jobseeker`。原版文档中的 `bosshunter run`、投递和定制个人简历流程属于求职端，不是招聘端启动步骤。
+
+### 开发验证
 
 ```bash
-bosshunter ai-status
-bosshunter connect
-bosshunter run
+# 招聘端后端测试
+python -m unittest discover -s tests -p 'test_recruiting*.py'
+
+# 前端测试与生产构建
+npm --prefix src/bosshunter/web/frontend test
+npm --prefix src/bosshunter/web/frontend run build
 ```
 
-`bosshunter connect` 只检查连接，不会替你启动 Chrome 或登录招聘平台。Windows、macOS、Linux 的 Chrome 设置和完整排错步骤见 [完整上手指南](docs/QUICKSTART.md)。
+2026-09-27 发布前检查：**69 项招聘后端测试、41 项前端测试和前端构建通过**。这些结果验证代码与隔离场景，真实模型质量、Chrome 页面执行和完整平台业务链仍需分别验收。
 
 ## 文档导航
 
 | 文档 | 内容 |
 |---|---|
-| [完整上手指南](docs/QUICKSTART.md) | 安装、Chrome 连接、首次配置和安全边界 |
-| [本机 Agent Tool API](docs/AGENT_API.md) | 让本机 Agent 通过纯后端接口完成通用建档、采集、无 Key 的岗位评估与监测 |
-| [CLI 命令](docs/CLI.md) | 一键流程、分步命令、监听与状态查看 |
-| [配置指南](docs/CONFIGURATION.md) | 平台、AI、简历和风险控制配置 |
-| [常见问题](docs/FAQ.md) | 封号风险、平台边界、简历格式和连接排错 |
-| [贡献指南](CONTRIBUTING.md) | Issue、PR、开发与维护者申请 |
-| [项目治理](GOVERNANCE.md) | 模块责任、权限、晋升与统计口径 |
+| [招聘端目标与当前进度](docs/RECRUITING.md) | 产品范围、已实现能力、试运行限制与技术结构 |
+| [招聘界面设计规范](DESIGN.md) | 蓝白布局、彩色图标、组件与响应式规范 |
+| [模型及基础配置参考](docs/CONFIGURATION.md) | 原项目配置说明；其中求职者简历、投递配置不属于招聘流程 |
+| [Chrome 连接与安装参考](docs/QUICKSTART.md) | 原项目安装及浏览器连接排错，业务操作部分仍以求职端为主 |
+| [原项目 CLI 参考](docs/CLI.md) | 通用命令与原求职命令，不代表招聘端已有对应自动执行能力 |
+| [上游版本记录](CHANGELOG.md) | 原项目历史版本与升级说明 |
+| [许可证](LICENSE) | 源码使用、修改和分发条款 |
 
 <details>
-<summary><strong>版本更新</strong></summary>
+<summary><strong>招聘端改造记录</strong></summary>
 
-| 日期 | 版本号 | 类型 | 更新内容 |
-|---|---|---|---|
-| 2026-09-09 | v2.4.0 | 采集、AI、简历与工作台 | 改进多平台断点续采、完整简历评分与进度反馈，补齐发送和简历失败重试、定制简历预览确认；精简首页提示和筛选，增加趋势统计，修复 AI 连接诊断、macOS 面板加载与源码安装步骤。 |
-| 2026-09-01 | v2.3.2 | 采集与简历稳定性 | 完成 51job API 只读采集的安全整合和真实环境验证；修复智联登录误判、单平台阻断后续任务和中文 PDF 简历乱码。 |
-| 2026-08-25 | v2.3.1 | 多平台与安全整合 | 合入智联/51job 只读采集、外部平台人工投递闭环、岗位池与筛选增强、Windows 兼容、招呼语与消息判定修复，并重整 BOSS 页面访问保护设置。 |
+| 日期 | 范围 | 更新内容 |
+|---|---|---|
+| 2026-09-27 | 浏览器接入与文档 | 页面操作改用原项目 Browser Runtime，移除招聘端 WebBridge 依赖；增加目标与进度文档，发布招聘端分支。 |
+| 2026-09-19 | 招聘工作台与流程 | 新增招聘界面、岗位勾选与额度设置、单会话同步、PDF 读取、自动评分流程、上下文回复草稿和公司说明。 |
 
-完整版本历史、升级说明和验证记录见 [CHANGELOG.md](CHANGELOG.md)。
+本分支基于 BossHunter 2.4.0 开发，以上为改造记录，不代表发布了新的完整稳定版本。
 
 </details>
 
-## 🧭 现任维护者
+## 🧭 维护与来源
 
-包括项目负责人在内的 5 名正式维护者共同维护全项目，不设置固定模块；擅长方向仅用于协作参考。
+本招聘端改造维护在 [XXm222/BossHunter](https://github.com/XXm222/BossHunter/tree/recruiting-agent) 的 `recruiting-agent` 分支。
 
-| GitHub | 身份 | 贡献占比 | 擅长方向 | 任期 |
-|---|---|---|---|---|
-| [@yukinoshi](https://github.com/yukinoshi) | 正式维护者（Write） | 26.2%（试算） | AI、错误恢复与产品流程 | 2026-08-29 起 |
-| [@fengziliang43-cmyk](https://github.com/fengziliang43-cmyk) | 正式维护者（Write） | 25.4%（试算） | 运行时、发送安全与监测链路 | 2026-08-30 起 |
-| [@yuppiez99999](https://github.com/yuppiez99999) | 正式维护者（Write） | 25.4%（试算） | 平台采集、城市数据与测试 | 2026-08-29 起 |
-| [@bianshilong0604](https://github.com/bianshilong0604) | 正式维护者（Write） | 23.0%（试算） | Web、产品流程与隐私边界 | 2026-08-30 起 |
-| [@powerycy](https://github.com/powerycy) 跑跑蹦蹦跳跳 | 项目负责人兼正式技术维护者（Admin） | 不参评 | 全仓技术审核、安全复核与合并；贡献文档与评分 | 项目发起至今；2026-09-06 起计入技术审核池 |
+感谢 [shengjidaguai-china/BossHunter](https://github.com/shengjidaguai-china/BossHunter) 及其贡献者提供的 Python、Web 工作台、模型接入和 Browser Runtime 基础。上游的维护者名单、贡献榜和历史治理记录保留在原文档中，不作为本招聘分支的维护者或贡献统计。
 
-截至 **2026-09-07 14:00（Asia/Shanghai）**，以上为经项目负责人确认的试算结果。维护贡献与项目贡献分别记录；0604 的审核团队邀请尚待接受。
-
-[查看维护者任期](MAINTAINERS.md) · [查看维护贡献及评分](MAINTENANCE_CONTRIBUTIONS.md) · [查看技术审核规则](GOVERNANCE.md)
-
-技术 PR 的审核、测试验证与合并由包括项目负责人在内的正式维护者完成，项目负责人的有效批准按一人计入；本人提交或参与编写的技术改动不得自审计票，高风险 PR 仍需两名不同的非作者维护者批准。项目负责人负责 PR 项目贡献和维护贡献两类文档，并单方面决定维护贡献评分；本页摘要由维护者按贡献文档同步。
-
-## 🔥 近 30 天贡献榜 Top 10
-
-统计窗口：**2026-08-09 至 2026-09-07（Asia/Shanghai）**；实际核对截至 **9 月 7 日 14:00**。只计算该窗口内被主线采纳的部分，同分并列。
-
-| 排名 | 贡献者 | 本期主要贡献 |
-|:---:|---|---|
-| 🥇 | [@yuppiez99999](https://github.com/yuppiez99999) | BOSS、51job 与猎聘采集回归；智联 API 与过滤链；三平台续采、城市快照及前端构建交付 |
-| 🥈 | [@shuaigechz-cloud](https://github.com/shuaigechz-cloud) | 会话送达、消息方向与招呼语约束；母版项目保留、PNG/PDF 定制简历预览和显式人工确认 |
-| 🥈 | [@zhenian-666](https://github.com/zhenian-666) | 多范围岗位导出、城市目录、回收站与独立 AI 评分；统一平台采集架构和智联只读采集 |
-| 4 | [@yukinoshi](https://github.com/yukinoshi) | 多 AI 兼容、评分 JSON、错误恢复、凭据优先级与批次删除保护 |
-| 5 | [@fengziliang43-cmyk](https://github.com/fengziliang43-cmyk) | 监测回复轮次、安全操作、本地凭据与面板交互；猎聘临时失败/保存失败保留断点的共同实现 |
-| 6 | [@haohao-fly](https://github.com/haohao-fly) | 岗位筛选、分页与统计；结构化评分、失败重试、投递队列和任务保护 |
-| 7 | [@hdfhssg](https://github.com/hdfhssg) | 学历与招聘类型筛选、评分上下文、岗位池排序、投递队列和额度提示 |
-| 7 | [@meixiaoxie](https://github.com/meixiaoxie) | 配置原子写入与无凭据下载；公司屏蔽、城市查询与 Windows 回归测试 |
-| 9 | [@Hebuyu688](https://github.com/Hebuyu688) | AI 诊断和模型别名解析、薪资区间过滤、招呼语正向依据与毕业届别校验 |
-| 10 | [@yuj-029](https://github.com/yuj-029) | 51job 页面研究、只读采集核心、API 采样与断点续采实现 |
-
-## 🏆 贡献总榜 Top 10
-
-数据快照：**2026-09-07 14:00（Asia/Shanghai）**。只统计实际进入主线的外部人类贡献，按完整榜的四维影响评分归一化；同分并列，不按提交次数或代码行数排名。
-
-| 排名 | 贡献者 | 贡献度 | 主要贡献方向 |
-|:---:|---|:---:|---|
-| 🥇 | [@yuppiez99999](https://github.com/yuppiez99999) | **10.0%** | BOSS、51job 与猎聘采集回归；智联 API 与过滤链；三平台续采、城市快照及前端构建交付 |
-| 🥈 | [@shuaigechz-cloud](https://github.com/shuaigechz-cloud) | **7.9%** | 会话送达、消息方向与招呼语约束；母版项目保留、PNG/PDF 定制简历预览和显式人工确认 |
-| 🥈 | [@yukinoshi](https://github.com/yukinoshi) | **7.9%** | Thinking 与多 AI 兼容；评分 JSON、错误传播、暂停恢复和凭据优先级；评分期间删除岗位不中断批次 |
-| 🥈 | [@zhenian-666](https://github.com/zhenian-666) | **7.9%** | 多范围岗位导出、城市目录、回收站与独立 AI 评分；统一平台采集架构和智联只读采集 |
-| 5 | [@GioiaZheng](https://github.com/GioiaZheng) | **6.8%** | API Key 脱敏与安全读取；PDF 依赖降级；人工确认、招呼语和发送选择修复 |
-| 6 | [@atticus-zhou](https://github.com/atticus-zhou) | **6.5%** | AI 评分与招呼语重试、前台浏览器交互、送达验证和防重复发送 |
-| 7 | [@fengziliang43-cmyk](https://github.com/fengziliang43-cmyk) | **6.4%** | 监测回复轮次、安全操作、本地凭据与面板交互；猎聘临时失败/保存失败保留断点的共同实现 |
-| 8 | [@haohao-fly](https://github.com/haohao-fly) | **5.4%** | 岗位筛选、分页与统计；结构化评分、失败重试、投递队列和任务保护 |
-| 9 | [@hdfhssg](https://github.com/hdfhssg) | **4.6%** | 学历与招聘类型筛选、评分上下文、岗位池排序、投递队列和额度提示 |
-| 9 | [@meixiaoxie](https://github.com/meixiaoxie) | **4.6%** | 配置原子写入与无凭据下载；公司屏蔽、城市查询与 Windows 回归测试 |
-
-[查看完整榜单、证据链接、历月快照与计算口径](CONTRIBUTORS.md)
+[上游维护者记录](MAINTAINERS.md) · [上游贡献者记录](CONTRIBUTORS.md) · [原项目](https://github.com/shengjidaguai-china/BossHunter)
 
 ## 许可证
 
-本项目源码公开，采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。许可证允许符合其定义的非商业用途，以及为这些用途修改和分发本软件；商业使用不在该许可证的授权范围内，需事先取得另行书面授权。
-
-因此，BossHunter 属于 **source-available（源码可用）的非商业许可软件**，不是 [OSI 定义下的开源软件](https://opensource.org/osd)。
+本项目沿用原项目的 [PolyForm Noncommercial License 1.0.0](LICENSE)。招聘端改造不改变原许可证的非商业使用限制；商业使用需取得另行授权。
 
 ## 参与项目
 
-欢迎 [Star](https://github.com/shengjidaguai-china/BossHunter/stargazers)、提交 [Issue](https://github.com/shengjidaguai-china/BossHunter/issues) 或 Pull Request。大改动建议先开 Issue 讨论。
+欢迎 [Star](https://github.com/XXm222/BossHunter/stargazers)，或通过 [Pull Request](https://github.com/XXm222/BossHunter/pulls) 改进招聘端。提交时请说明改动对应的业务流程、验证方式及仍未接通的部分。
 
-- 不接受绕过平台安全机制、规避检测或提高默认发送频率的 PR。
-- 不接受绕过人工确认，或收集、上传、外发用户隐私数据的 PR。
-- 所有修改必须走 PR 并通过 CI；贡献记录以合入主线的实际影响为准。
-
-[查看贡献指南](CONTRIBUTING.md) · [查看完整贡献榜](CONTRIBUTORS.md) · [申请成为候选维护者](https://github.com/shengjidaguai-china/BossHunter/issues/new?template=maintainer_application.md) · [关注升级打怪开源社区](https://github.com/shengjidaguai-china)
+- 优先完善准确身份绑定、上下文完整性、简历读取、模型质量及异常恢复。
+- 使用合成数据编写测试；不要提交真实简历、聊天截图、候选人联系方式、Cookie、数据库或 API 密钥。
+- 保留人工接管、停止联系、结果待核实和面试邀约禁发约束。
+- 遇到验证码、登录失效或平台限制时暂停，不加入绕过机制。
+- 原求职功能与招聘功能分别说明、分别验收，避免把一方能力当作另一方已完成。
