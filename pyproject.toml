@@ -23,6 +23,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+recruiting = [
+    "browser-cookie3>=0.20,<0.21",
+]
 pdf = [
     "xhtml2pdf>=0.2.11",
 ]

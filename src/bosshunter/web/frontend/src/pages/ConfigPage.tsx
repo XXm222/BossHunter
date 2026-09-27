@@ -54,12 +54,13 @@ const BOSS_FILTER_OPTIONS = {
   salary: ['3K以下', '3-5K', '5-10K', '10-20K', '20-50K', '50K以上'],
 } as const
 
-export default function ConfigPage() {
+export default function ConfigPage({ aiOnly = false }: { aiOnly?: boolean }) {
   const { config, schema, loading, saving, dirty, error, message, updateConfig, saveConfig, resetConfig } = useConfig()
   const requestedSection = new URLSearchParams(window.location.search).get('section')
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>(() => ({
-    profile: true,
-    search: true,
+    profile: !aiOnly,
+    search: !aiOnly,
+    ai: aiOnly,
     ...(requestedSection ? { [requestedSection]: true } : {}),
   }))
   const [aiTest, setAiTest] = useState<{ testing: boolean; ok?: boolean; message?: string }>({ testing: false })
@@ -105,6 +106,7 @@ export default function ConfigPage() {
   }
 
   useEffect(() => {
+    if (aiOnly) return
     fetch('/api/cities', { cache: 'no-store' })
       .then(r => r.json())
       .then(data => {
@@ -130,7 +132,7 @@ export default function ConfigPage() {
         if (Array.isArray(data.cities)) setLiepinCityOptions(data.cities)
       })
       .catch(() => {})
-  }, [])
+  }, [aiOnly])
 
   const toggleSection = (key: string) => {
     setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }))
@@ -301,6 +303,7 @@ export default function ConfigPage() {
           </div>
         </div>
 
+        {!aiOnly && <>
         {/* Profile Section */}
         <SectionCard title="个人信息" sectionKey="profile" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
@@ -525,6 +528,7 @@ export default function ConfigPage() {
           </div>
         </SectionCard>
 
+        </>}
         {/* AI Section */}
         <SectionCard title="AI 设置" sectionKey="ai" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
@@ -614,6 +618,7 @@ export default function ConfigPage() {
                 max={600}
               />
             </Field>
+            {!aiOnly && <>
             <Field label="AI 评分并发数">
               <Select
                 value={String(config.ai?.scoring_concurrency || 1)}
@@ -653,6 +658,8 @@ export default function ConfigPage() {
                 />
               </div>
             </div>
+            </>}
+            {aiOnly && <p className="text-sm text-muted">招聘试运行按单会话执行；评分只提供岗位证据与待确认问题，资料不完整时不计算完整总分。回复先保存草稿，面试邀约禁止发送。</p>}
             <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
@@ -674,6 +681,7 @@ export default function ConfigPage() {
           </div>
         </SectionCard>
 
+        {!aiOnly && <>
         {/* Anti-monitoring Section */}
         <SectionCard title="反监测设置" sectionKey="collection" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
@@ -820,6 +828,7 @@ export default function ConfigPage() {
             </Field>
           </div>
         </SectionCard>
+        </>}
     </div>
   )
 }

@@ -1,0 +1,17 @@
+import type { ReactNode } from 'react'
+export type RecruitIconName = 'brand' | 'workbench' | 'jobs' | 'search' | 'chat' | 'company' | 'record' | 'settings' | 'resume'
+const drawings: Record<RecruitIconName, ReactNode> = {
+  brand: <><path fill="#057AA7" d="M5 2h16l8 8v20H5z" /><path fill="#03A5CA" d="M5 2h16v13L5 27z" /><path fill="#05B89B" d="m21 2 10 10-15 15-10-9z" /><path fill="#FFFFFF" d="m10 17 4 4 12-12 3 3-15 15-7-7z" /></>,
+  workbench: <><rect x="3" y="3" width="12" height="12" rx="3" fill="#1B71ED" /><rect x="18" y="3" width="11" height="12" rx="3" fill="#49C8E8" /><rect x="3" y="18" width="12" height="11" rx="3" fill="#39B7D8" /><rect x="18" y="18" width="11" height="11" rx="3" fill="#2755BE" /><path fill="#1264D5" d="M3 9h12v3a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z" /></>,
+  jobs: <><path d="M11 10V6h10v4" fill="none" stroke="#315778" strokeWidth="3" strokeLinejoin="round" /><rect x="3" y="10" width="26" height="19" rx="4" fill="#166B8D" /><path fill="#F5A742" d="M3 10a3 3 0 0 1 3-3h20a3 3 0 0 1 3 3v8H3z" /><path fill="#FFC778" d="M6 7h20a3 3 0 0 1 3 3v3H3v-3a3 3 0 0 1 3-3" /><rect x="14" y="15" width="5" height="7" rx="1.5" fill="#FFF3D6" /></>,
+  search: <><path d="m21 22 7 7" stroke="#236299" strokeWidth="6" strokeLinecap="round" /><circle cx="14" cy="14" r="12" fill="#37C6D9" /><circle cx="14" cy="14" r="8" fill="#D8F7F9" /><circle cx="14" cy="12" r="3" fill="#22638D" /><path d="M8 21a6 6 0 0 1 12 0" fill="#22638D" /><path d="M6 10a9 9 0 0 1 10-5" fill="none" stroke="#77E0E8" strokeWidth="2" strokeLinecap="round" /></>,
+  chat: <><path d="M3 3h16a5 5 0 0 1 5 5v9a5 5 0 0 1-5 5H9l-6 5v-6a4 4 0 0 1-2-4V8a5 5 0 0 1 2-5" fill="#29B5EB" /><path d="M16 12h10a5 5 0 0 1 5 5v7a5 5 0 0 1-4 5v3l-5-3h-6a5 5 0 0 1-5-5v-7a5 5 0 0 1 5-5" fill="#F4777A" /><path d="M16 12h10a5 5 0 0 1 5 5v2H11v-2a5 5 0 0 1 5-5" fill="#FF9594" /><circle cx="17" cy="21" r="1.4" fill="white" /><circle cx="24" cy="21" r="1.4" fill="white" /></>,
+  company: <><rect x="18" y="10" width="12" height="21" rx="2" fill="#F4AF50" /><path fill="#008E96" d="M4 5 21 1v30H4z" /><path fill="#23BAC0" d="m4 5 10-2v28H4z" /><path stroke="#A4F1EA" strokeWidth="2" d="M8 10h9M8 15h9M8 20h9" /><path fill="#D9FFF6" d="M10 25h5v6h-5z" /><path stroke="#FFE1A7" strokeWidth="2" d="M25 15v3m0 4v3" /></>,
+  record: <><rect x="8" y="6" width="21" height="25" rx="3" fill="#91ACC9" /><rect x="3" y="2" width="22" height="26" rx="3" fill="#3A577B" /><rect x="8" y="7" width="12" height="4" rx="1" fill="#F0F6FF" /><path d="M8 16h11M8 21h7" stroke="#C5D9F1" strokeWidth="2" strokeLinecap="round" /></>,
+  settings: <><path fill="#456384" d="m12 2 8 0 1 4 4 2 4-1 4 7-3 3v4l3 3-4 7-4-1-4 2-1 4h-8l-1-4-4-2-4 1-4-7 3-3v-4l-3-3 4-7 4 1 4-2z" transform="translate(2 0) scale(.84)" /><circle cx="15.5" cy="16" r="7" fill="#A7BCD7" /><circle cx="15.5" cy="16" r="3.4" fill="#F5F9FD" /><circle cx="24" cy="7" r="4" fill="#57BCEA" /></>,
+  resume: <><rect x="12" y="5" width="17" height="26" rx="3" fill="#EDA447" /><path d="M5 1h14l6 6v23H5a3 3 0 0 1-3-3V4a3 3 0 0 1 3-3" fill="#0AABA9" /><path fill="#65D6CF" d="M19 1v7h6z" /><path stroke="#C4F5ED" strokeWidth="2" strokeLinecap="round" d="M8 12h10M8 17h10M8 22h6" /></>,
+}
+/** Authored layered SVG artwork; no raster dependency or monochrome icon recoloring. */
+export function RecruitIcon({ name, size = 24 }: { name: RecruitIconName; size?: number }) {
+  return <svg className="recruit-color-icon" width={size} height={size} viewBox="0 0 34 34" fill="none" aria-hidden="true" focusable="false">{drawings[name]}</svg>
+}

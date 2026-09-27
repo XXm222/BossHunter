@@ -133,7 +133,7 @@ def _is_loopback_address(value: str) -> bool:
 @app.hook("before_request")
 def _restrict_agent_to_local_requests():
 	"""Keep sensitive Agent routes local even when the workbench binds to LAN."""
-	if not (request.path == "/api/agent" or request.path.startswith("/api/agent/")):
+	if not (request.path == "/api/agent" or request.path.startswith("/api/agent/") or request.path.startswith("/api/recruiting/")):
 		return
 	# Read the transport peer, never X-Forwarded-For/Forwarded supplied by a client.
 	peer = request.environ.get("REMOTE_ADDR", "")
@@ -206,6 +206,11 @@ def _json_response(data, status_code=200):
 	response.content_type = "application/json; charset=utf-8"
 	response.status = status_code
 	return json.dumps(data, ensure_ascii=False, default=str)
+
+
+from bosshunter.recruiting.api import register as register_recruiting
+
+register_recruiting(app, lambda: DATA_DIR, lambda: load_config(CONFIG_PATH), _json_response)
 
 
 def _serialize_history_items(items):

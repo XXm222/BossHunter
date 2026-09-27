@@ -43,6 +43,10 @@ src/bosshunter/web/frontend/dist/
 # Local generated artifacts
 output/
 tmp/
+js_reverse_cache/
+.impeccable/
+.env
+.env.*
 
 # OS
 .DS_Store
