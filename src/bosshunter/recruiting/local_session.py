@@ -13,6 +13,7 @@ import re
 import time
 import httpx
 from .browser import BrowserError
+import html
 
 
 class LocalBossSession:
@@ -195,7 +196,19 @@ class LocalBossSession:
         kind = body.get('type')
         text = body.get('text')
         if kind == 1 and isinstance(text, str) and text.strip():
-            return text.strip(), 'text', item.get('type') == 4
+            # BOSS 用 &lt;copy&gt;/&lt;phone&gt; 包装联系信息，解码实体并去掉标签，只留内容
+            clean = re.sub(r'</?(?:copy|phone)\s*>', '', html.unescape(text))
+            return clean.strip(), 'text', item.get('type') == 4
+        if kind == 2 and isinstance(body.get('sound'), dict):
+            # 语音消息：不转录，只标注时长；不作为候选人的口头回答
+            duration = body['sound'].get('duration')
+            return (f'语音消息（{duration} 秒）' if isinstance(duration, int) else '语音消息'), 'system', True
+        if kind == 3 and isinstance(body.get('image'), dict):
+            # 图片消息：不识别内容，仅标注；不作为候选人的口头回答
+            return '图片消息', 'system', True
+        if kind == 4 and isinstance(body.get('action'), dict):
+            # 动作/操作记录（交换微信、接受简历等系统动作），不作为候选人的口头回答
+            return '系统操作记录', 'system', True
         if kind == 12 and isinstance(body.get('hyperLink'), dict):
             text = body['hyperLink'].get('text')
             if isinstance(text, str) and text.strip():
