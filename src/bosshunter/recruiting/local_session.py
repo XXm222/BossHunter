@@ -159,15 +159,25 @@ class LocalBossSession:
             for index, page in enumerate(reader.pages, 1):
                 value = (page.extract_text() or '').strip()
                 pages.append({'page': index, 'text': value})
-            text = '\n\n'.join(f"第 {page['page']} / {count} 页\n{page['text'] or '（本页没有可提取文字，需核对图片或扫描内容）'}" for page in pages)
-            if len(text) > 100000:
-                raise BrowserError('简历文字超过读取上限，保留原记录，不能静默截断')
-            if not any(page['text'] for page in pages):
-                raise BrowserError('该 PDF 没有可提取的文字层，需 OCR 或人工补全；保留已有简历')
-            empty = [page['page'] for page in pages if not page['text']]
-            note = f'已读取 PDF 全部 {count} 页的文字层；图片、表格及文字顺序仍需核对。'
-            if empty:
-                note += ' 第 ' + '、'.join(map(str, empty)) + ' 页没有可提取文字。'
+                # 没有文字层时（扫描版简历）尝试 OCR 兜底；失败或未安装则抛错。
+                ocr_used = False
+                if not any(page['text'] for page in pages):
+                    _ocr_pdf_or_raise(content, pages)
+                    ocr_used = True
+
+                text = '\n\n'.join(
+                    f"第 {page['page']} / {count} 页\n{page['text'] or '（本页没有可提取文字，需核对图片或扫描内容）'}" for
+                    page in pages)
+                if len(text) > 100000:
+                    raise BrowserError('简历文字超过读取上限，保留原记录，不能静默截断')
+
+                empty = [page['page'] for page in pages if not page['text']]
+                if ocr_used:
+                    note = f'已通过 OCR 识别 PDF 全部 {count} 页；识别结果与文字顺序需人工核对。'
+                else:
+                    note = f'已读取 PDF 全部 {count} 页的文字层；图片、表格及文字顺序仍需核对。'
+                if empty:
+                    note += ' 第 ' + '、'.join(map(str, empty)) + ' 页没有可提取文字。'
             return {'source': 'boss_attachment_pdf_http', 'text': text, 'complete': False,
                     'meta': {'page_count': count, 'pages': [p['page'] for p in pages],
                              'page_characters': [len(p['text']) for p in pages], 'empty_pages': empty,
@@ -268,3 +278,100 @@ class LocalBossSession:
                     raise BrowserError('平台分页信息不一致，本次不更新岗位范围')
                 time.sleep(.5)
         raise BrowserError('岗位列表超出读取范围')
+
+
+# 渲染分辨率（DPI）：中文简历识别精度与耗时/内存之间的平衡点；需要更高精度可调到 300，但会更慢、更占内存。
+_OCR_RENDER_DPI = 200
+
+
+def _ocr_available():
+    """OCR 依赖（PyMuPDF + RapidOCR）是否可导入。
+
+    只做 import 探测，不初始化引擎——引擎初始化失败会单独在
+    _ocr_pdf_pages 里抛错，由调用方统一转成用户可读的提示。
+    """
+    try:
+        import fitz  # noqa: F401  PyMuPDF
+        import rapidocr_onnxruntime  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _ocr_pdf_pages(content: bytes):
+    """把 PDF 每页渲染成图片并 OCR，返回每页识别出的文字。
+
+    返回的列表长度等于 PDF 页数、顺序与页序一致，便于调用方逐页回填。
+    依赖在函数内懒加载：未安装 `ocr` extra 时招聘端其余功能不受影响。
+    """
+    # 懒加载，避免把重依赖（PyMuPDF / RapidOCR）压到模块导入期。
+    import fitz
+    from rapidocr_onnxruntime import RapidOCR
+
+    engine = RapidOCR()  # 首次初始化会下载模型权重到本地缓存
+    pages: list[str] = []
+    # 直接从内存字节打开 PDF，不落盘，避免残留中间图片文件。
+    with fitz.open(stream=content, filetype="pdf") as doc:
+        for page in doc:
+            # get_pixmap 把 PDF 页栅格化；OCR 输入用 PNG 字节，不依赖 numpy。
+            png = page.get_pixmap(dpi=_OCR_RENDER_DPI).tobytes("png")
+            pages.append(_ocr_image_text(engine, png))
+    return pages
+
+
+def _ocr_image_text(engine, png: bytes):
+    """对单页渲染图跑 OCR，按行拼接识别出的文字。
+
+    行与行之间用换行连接，与 pypdf 提取文字层时保持同一拼接口径。
+    """
+    result = engine(png)
+    # rapidocr_onnxruntime 1.x 返回 (result, elapse)；result 才是识别结果。
+    if isinstance(result, tuple):
+        result = result[0]
+    if not result:  # 空页，或未识别出任何文字
+        return ""
+    lines = []
+    for item in result:
+        text = _ocr_entry_text(item)
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _ocr_entry_text(item):
+    """从单个 OCR 结果条目里取出识别文字。
+
+    兼容多种返回形态：1.x 的 [box, text, score] 列表，以及带 .text
+    属性的对象；取不到时返回空串，由上层统一过滤。
+    """
+    if isinstance(item, str):
+        return item.strip()
+    text = getattr(item, "text", None)
+    if isinstance(text, str):
+        return text.strip()
+    # 1.x 列表形态：[box(4 点坐标), text(识别文字), score(置信度)]
+    if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], str):
+        return item[1].strip()
+    return ""
+
+
+def _ocr_pdf_or_raise(content: bytes, pages: list[dict]):
+    """没有文字层时尝试 OCR，并把识别文字回填进 pages（原地修改）。
+
+    未安装 OCR 依赖或识别失败时抛 BrowserError，绝不静默吞掉——
+    保持与「文字层为空时明确失败」相同的安全边界，只是多一条兜底路径。
+    """
+    if not _ocr_available():
+        # 依赖未安装：给出可执行的安装提示，而不是含糊的「请先 OCR」。
+        raise BrowserError('该 PDF 没有可提取的文字层，且未安装 OCR 依赖；'
+                           '请用 `pip install -e ".[ocr]"` 安装后重试，或人工补全；保留已有简历')
+    try:
+        ocr_texts = _ocr_pdf_pages(content)
+    except Exception as exc:
+        # 识别失败不静默继续，保留已有简历由人工核对。
+        raise BrowserError('该 PDF 没有可提取的文字层，OCR 识别失败；保留已有简历，请人工核对') from exc
+    if len(ocr_texts) != len(pages):
+        raise BrowserError('OCR 识别出的页数与 PDF 页数不一致；保留已有简历，请人工核对')
+    # 逐页回填；识别为空的行后续仍会进入 empty_pages 供人工核对。
+    for entry, ocr_text in zip(pages, ocr_texts):
+        entry['text'] = ocr_text.strip()
