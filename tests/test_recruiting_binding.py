@@ -69,5 +69,19 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(service.store.setting('pilot_conversation'), '999999-0')
 
 
+    def test_monitor_state_persists_across_restart(self):
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / 'recruiting.db'
+        service = RecruitingService(path, lambda: {}, Mock(), Mock())
+        service.monitor['last_success'] = '2026-09-28T10:00:00'
+        service.monitor['error'] = '登录失效'
+        service._persist_monitor_state()
+        # 重启：新实例读同一 DB，应恢复上次的监测状态
+        service2 = RecruitingService(path, lambda: {}, Mock(), Mock())
+        self.assertEqual(service2.monitor['last_success'], '2026-09-28T10:00:00')
+        self.assertEqual(service2.monitor['error'], '登录失效')
+
+
 if __name__ == '__main__':
     unittest.main()

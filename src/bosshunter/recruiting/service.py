@@ -26,7 +26,9 @@ class RecruitingService:
         self.lock = RLock()
         self.stop_event = Event()
         self.worker = None
-        self.monitor = {"running": False, "last_success": None, "error": "", "interval_seconds": 120,
+        saved_monitor = self.store.setting('monitor_state', {})
+        self.monitor = {"running": False, "last_success": saved_monitor.get('last_success'),
+                        "error": saved_monitor.get('error') or "", "interval_seconds": 120,
                         "mode": "read_assess_and_draft", "note": "监测绑定会话，收到简历自动读取和评分；不会自动外发"}
         self.connection = {"connected": False, "message": "尚未核实本地 BOSS 登录状态", "transport": "local_cookie_http"}
         self.store.recover_outbox()
@@ -485,21 +487,32 @@ class RecruitingService:
             self.store.event("outbound_" + status, ident, message)
             return self.store.row("outbox", ident)
 
+    def _persist_monitor_state(self):
+        """把监测状态写回 DB，供服务重启后恢复显示。"""
+        self.store.set_setting('monitor_state', {
+            'last_success': self.monitor['last_success'],
+            'error': self.monitor['error'],
+        })
+
     def monitor_once(self):
         cid = self.store.setting("pilot_conversation")
         if not cid:
+            self._persist_monitor_state()
             return {"changed": False, "last_success": self.monitor["last_success"]}
-        before = self.store.row("conversations", cid)
-        after = self.sync(cid, process=True)
-        if before["context_hash"] != after["context_hash"]:
-            self.store.event("conversation_changed", cid, "会话发生变化，旧草稿已过期")
-            messages = json.loads(after["snapshot"])["messages"]
-            if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
-                try:
-                    self.prepare_reply(cid)
-                except ValueError as exc:
-                    self.store.event("reply_needs_attention", cid, str(exc))
-        return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}
+        try:
+            before = self.store.row("conversations", cid)
+            after = self.sync(cid, process=True)
+            if before["context_hash"] != after["context_hash"]:
+                self.store.event("conversation_changed", cid, "会话发生变化，旧草稿已过期")
+                messages = json.loads(after["snapshot"])["messages"]
+                if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
+                    try:
+                        self.prepare_reply(cid)
+                    except ValueError as exc:
+                        self.store.event("reply_needs_attention", cid, str(exc))
+            return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}
+        finally:
+            self._persist_monitor_state()
 
     def start_monitor(self):
         with self.lock:
@@ -508,6 +521,7 @@ class RecruitingService:
             self.sync()  # Baseline only: never answer historical messages on startup.
             self.stop_event.clear()
             self.monitor.update(running=True, error="")
+            self._persist_monitor_state()
 
             def run():
                 try:
