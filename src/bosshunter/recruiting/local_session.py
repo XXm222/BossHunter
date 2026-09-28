@@ -14,12 +14,20 @@ import time
 import httpx
 from .browser import BrowserError
 import html
+from bosshunter.throttle import PageThrottle
 
 
 class LocalBossSession:
-    def __init__(self, cookie_loader=None, transport=None):
+    def __init__(self, cookie_loader=None, transport=None, throttle=None):
         self.cookie_loader = cookie_loader or self.load_cookies
         self.transport = transport
+        # 后台读取节流：真实网络下每个操作间隔 2-5 秒降低风控；测试用 MockTransport 时不加延迟
+        if throttle is not None:
+            self.throttle = throttle
+        elif transport is None:
+            self.throttle = PageThrottle(delay_min=2.0, delay_max=5.0)
+        else:
+            self.throttle = PageThrottle(delay_min=0.0, delay_max=0.0)
 
     def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False):
         """Read one already-bound conversation. Never mark read or operate a tab.
@@ -28,6 +36,7 @@ class LocalBossSession:
         All returned messages must belong to this exact peer and one employer.
         Unknown payloads remain explicit system records, not guessed dialogue.
         """
+        self.throttle.wait()
         match = re.fullmatch(r'([1-9][0-9]*)-([01])', ident)
         if not match:
             raise BrowserError('绑定会话的标识不支持后台读取，请先核对会话身份')
@@ -125,6 +134,7 @@ class LocalBossSession:
             raise BrowserError('附件地址不属于已验证的 BOSS 简历预览接口，停止读取')
         limit = 20 * 1024 * 1024
         content = bytearray()
+        self.throttle.wait()
         try:
             with httpx.Client(cookies=self.cookie_loader(), transport=self.transport, trust_env=False,
                               timeout=30, follow_redirects=False,
@@ -249,6 +259,7 @@ class LocalBossSession:
 
     def read_jobs(self):
         # Each explicit sync refreshes the local login state; secrets stay in memory.
+        self.throttle.wait()
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,
@@ -298,6 +309,7 @@ class LocalBossSession:
         返回 [{ident, name, position_title, last_ts}]，按最后消息时间倒序。
         filterByLabel 只返回 uid 和姓名、不返回岗位名，position_title 留空由绑定时手动填写。
         """
+        self.throttle.wait()
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,
