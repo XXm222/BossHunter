@@ -60,12 +60,12 @@ class RecruitingTests(unittest.TestCase):
         data.update(overrides)
         return self.service.knowledge(data)
 
-    def test_import_is_idempotent_and_second_person_blocked(self):
+    def test_import_is_idempotent_and_second_person_allowed(self):
         self.service.import_current()
         self.assertEqual(len(self.service.store.rows("conversations")), 1)
         self.browser.snapshot["id"] = "sample-2"
-        with self.assertRaisesRegex(ValueError, "最小样本"):
-            self.service.import_current()
+        self.service.import_current()  # 多会话：第二个会话应允许导入
+        self.assertEqual(len(self.service.store.rows("conversations")), 2)
 
     def test_changed_position_is_not_silently_rebound(self):
         self.browser.snapshot["position_title"] = "另一岗位"

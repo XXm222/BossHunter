@@ -292,6 +292,45 @@ class LocalBossSession:
                 time.sleep(.5)
         raise BrowserError('岗位列表超出读取范围')
 
+    def list_contacts(self):
+        """读取招聘账号的联系人列表（近 30 天有会话的候选人）。
+
+        返回 [{ident, name, position_title, last_ts}]，按最后消息时间倒序。
+        filterByLabel 只返回 uid 和姓名、不返回岗位名，position_title 留空由绑定时手动填写。
+        """
+        cookies = self.cookie_loader()
+        with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
+                          timeout=20, follow_redirects=False,
+                          headers={'Referer': 'https://www.zhipin.com/web/chat/index'}) as client:
+            try:
+                response = client.post('https://www.zhipin.com/wapi/zprelation/friend/filterByLabel',
+                                       data={'labelId': '0', 'encJobId': '', 'sort': '', 'scene': '0'})
+                response.raise_for_status()
+                body = response.json()
+            except (httpx.HTTPError, ValueError):
+                raise BrowserError('后台联系人读取未完成；保留原记录，不自动重试') from None
+        if not isinstance(body, dict) or body.get('code') != 0:
+            raise BrowserError('BOSS 未接受联系人读取请求，请核实登录状态；未操作标签页')
+        data = body.get('zpData')
+        if not isinstance(data, dict) or not isinstance(data.get('result'), list):
+            raise BrowserError('联系人数据结构变化，停止本次同步')
+        contacts = []
+        for item in data['result']:
+            if not isinstance(item, dict):
+                continue
+            uid = item.get('friendId')
+            name = item.get('name')
+            if not uid or not isinstance(name, str) or not name.strip():
+                continue
+            contacts.append({
+                'ident': f'{uid}-0',
+                'name': name.strip(),
+                'position_title': '',  # 岗位名需绑定时手动填写
+                'last_ts': item.get('updateTime'),
+            })
+        contacts.sort(key=lambda c: c.get('last_ts') or 0, reverse=True)
+        return contacts
+
 
 # 渲染分辨率（DPI）：中文简历识别精度与耗时/内存之间的平衡点；需要更高精度可调到 300，但会更慢、更占内存。
 _OCR_RENDER_DPI = 200

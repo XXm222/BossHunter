@@ -34,14 +34,14 @@ class MessageContentTests(unittest.TestCase):
         self.assertTrue(system)
 
     def test_text_strips_copy_tag(self):
-        text, kind, system = self.parse(1, text='冷光友的微信号：&lt;copy&gt;lengguangyou666&lt;/copy&gt;', templateId=5)
-        self.assertEqual(text, '冷光友的微信号：lengguangyou666')
+        text, kind, system = self.parse(1, text='张三的微信号：&lt;copy&gt;zhangsan_wx&lt;/copy&gt;', templateId=5)
+        self.assertEqual(text, '张三的微信号：zhangsan_wx')
         self.assertEqual(kind, 'text')
         self.assertFalse(system)
 
     def test_text_strips_phone_tag(self):
-        text, kind, system = self.parse(1, text='冷光友的手机号：&lt;phone&gt;15770965598&lt;/phone&gt;', templateId=5)
-        self.assertEqual(text, '冷光友的手机号：15770965598')
+        text, kind, system = self.parse(1, text='张三的手机号：&lt;phone&gt;13800000000&lt;/phone&gt;', templateId=5)
+        self.assertEqual(text, '张三的手机号：13800000000')
         self.assertEqual(kind, 'text')
         self.assertFalse(system)
 

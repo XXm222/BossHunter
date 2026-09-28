@@ -68,7 +68,9 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaises(BrowserError) as e: LocalBossSession.extract_pdf(content)
             self.assertNotIn('secret', str(e.exception))
         writer = PdfWriter(); writer.add_blank_page(width=600, height=800); out = BytesIO(); writer.write(out)
-        with self.assertRaises(BrowserError): LocalBossSession.extract_pdf(out.getvalue())
+        # 未安装 OCR 依赖时，扫描版 PDF 应明确报错（不静默）；已装则走 OCR 兜底
+        with patch('bosshunter.recruiting.local_session._ocr_available', return_value=False):
+            with self.assertRaises(BrowserError): LocalBossSession.extract_pdf(out.getvalue())
 
     def test_service_replaces_partial_extraction_only_after_success(self):
         with TemporaryDirectory() as folder:

@@ -50,10 +50,10 @@ class RecruitingService:
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
                 "connection": self.connection, "monitor": self.monitor.copy(),
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
-                "pilot": {"max_conversations": 1, "max_outbound_per_action": 1,
+                "pilot": {"max_conversations": 20, "max_outbound_per_action": 1,
                           "invitation_sending": False, "automatic_sending": False,
                           "conversation_id": s.setting("pilot_conversation"),
-                          "message_identity": "platform_ids" if conversations and all(c['snapshot'].get('stable_message_ids') for c in conversations) else "snapshot_only", "coverage": "一个岗位关联会话，非全量同步"}}
+                          "message_identity": "platform_ids" if conversations and all(c['snapshot'].get('stable_message_ids') for c in conversations) else "snapshot_only", "coverage": "已同步多个候选人会话（非全量）"}}
 
     def sync_jobs(self):
         previous = self.store.setting("jobs_sync", {})
@@ -94,6 +94,10 @@ class RecruitingService:
             self.store.event("conversation_synced", result["id"], "读取当前一个会话；未发送消息")
             return result
 
+    def list_contacts(self):
+        """读取招聘账号的联系人列表，供绑定向导从列表选人。"""
+        return self.local_session.list_contacts()
+
     def preview_binding(self, conversation_id, name, position_title):
         """读取并核实一个候选会话，返回账号身份供用户确认；不写入绑定。
 
@@ -119,14 +123,19 @@ class RecruitingService:
             str(conversation_id).strip(), str(name).strip(), str(position_title).strip(),
             expected_account=str(expected_account).strip())
         result = self.store.import_conversation(snapshot)
+        self.store.select_conversation(result["id"])  # 新绑定的会话设为当前选中
         self.store.event("conversation_bound", result["id"], "已核实并绑定会话；未发送消息")
         return result
 
-    def sync(self):
+    def sync(self, cid=None, *, process=True):
+        """同步一个会话的消息；process=True 时同时读简历/评分。
+
+        cid 缺省时同步当前选中会话；process=False 只更新消息快照（监测同步所有会话时用）。
+        """
         with self.lock:
-            ident = self.store.setting("pilot_conversation")
+            ident = cid or self.store.setting("pilot_conversation")
             if not ident:
-                raise ValueError("请先从 Chrome 导入一个会话")
+                raise ValueError("请先绑定一个会话")
             if self.use_local_session:
                 current = self.store.row("conversations", ident)
                 position = self.store.row("positions", current['position_id'])
@@ -145,7 +154,8 @@ class RecruitingService:
                 self.store.event("conversation_synced", ident, f"后台同步绑定会话 {len(snapshot['messages'])} 条平台消息；未操作标签页或发送消息")
             else:
                 result = self.store.import_conversation(self.browser.open_conversation(ident))
-            self.process_received_resume(result)
+            if process:
+                self.process_received_resume(result)
             self.monitor["last_success"] = now()
             self.monitor["error"] = ""
             return result
@@ -199,8 +209,6 @@ class RecruitingService:
     def resume(self, cid):
         with self.lock:
             if self.use_local_session:
-                if cid != self.store.setting('pilot_conversation'):
-                    raise ValueError('只能读取当前绑定候选人的简历')
                 current = self.store.row('conversations', cid)
                 position = self.store.row('positions', current['position_id'])
                 snapshot = json.loads(current['snapshot'])
@@ -471,19 +479,28 @@ class RecruitingService:
 
     def monitor_once(self):
         cid = self.store.setting("pilot_conversation")
+        # 1. 同步所有会话的消息（只读，不读简历/评分/草稿）
+        changed = {}
+        for conv in self.store.rows("conversations"):
+            try:
+                result = self.sync(conv["id"], process=False)
+                changed[conv["id"]] = conv["context_hash"] != result["context_hash"]
+            except BrowserError as exc:
+                self.store.event("monitor_sync_failed", conv["id"], str(exc)[:200])
+        # 2. 只对当前选中会话处理（读简历/评分/草稿）
         if not cid:
-            raise ValueError("请先绑定一个会话")
-        before = self.store.row("conversations", cid)
-        after = self.sync()
-        if before["context_hash"] != after["context_hash"]:
+            return {"changed": False, "last_success": self.monitor["last_success"]}
+        current = self.store.row("conversations", cid)
+        self.process_received_resume(current)
+        if changed.get(cid):
             self.store.event("conversation_changed", cid, "会话发生变化，旧草稿已过期")
-            messages = json.loads(after["snapshot"])["messages"]
-            if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
+            messages = json.loads(current["snapshot"])["messages"]
+            if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not current["taken_over"] and not current["do_not_contact"]:
                 try:
                     self.prepare_reply(cid)
                 except ValueError as exc:
                     self.store.event("reply_needs_attention", cid, str(exc))
-        return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}
+        return {"changed": changed.get(cid, False), "last_success": self.monitor["last_success"]}
 
     def start_monitor(self):
         with self.lock:

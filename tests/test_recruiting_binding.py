@@ -59,13 +59,14 @@ class BindingTests(unittest.TestCase):
             service.confirm_binding('123456-0', '张三', '前端工程师', '98765')
         self.assertIsNone(service.store.setting('pilot_conversation'))
 
-    def test_confirm_rejects_rebinding_different_conversation(self):
-        # 绑定一个会话后，再绑另一个应被 import_conversation 拒绝（试点只允许一个会话）
+    def test_confirm_allows_binding_multiple_conversations(self):
+        # 多会话：绑定第二个会话应成功，且新绑定的成为当前选中
         read = Mock(side_effect=lambda ident, name, position_title, expected_account=None: snapshot(ident, name, position_title))
         service = self.make_service(read)
         service.confirm_binding('123456-0', '张三', '前端工程师', '98765')
-        with self.assertRaises(ValueError):
-            service.confirm_binding('999999-0', '李四', '后端工程师', '88888')
+        second = service.confirm_binding('999999-0', '李四', '后端工程师', '88888')
+        self.assertEqual(second['id'], '999999-0')
+        self.assertEqual(service.store.setting('pilot_conversation'), '999999-0')
 
 
 if __name__ == '__main__':

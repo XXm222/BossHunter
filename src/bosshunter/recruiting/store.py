@@ -126,9 +126,6 @@ class Store:
 
     def import_conversation(self, snapshot):
         ident = snapshot["id"]
-        pin = self.setting("pilot_conversation")
-        if pin and pin != ident:
-            raise ValueError("最小样本限制：已绑定一个会话，请勿导入其他候选人")
         if not snapshot.get("position_title") or not ident:
             raise ValueError("缺少会话标识或沟通职位")
         with self.db() as db:
@@ -146,8 +143,16 @@ class Store:
                 snapshot=excluded.snapshot,context_hash=excluded.context_hash,updated_at=excluded.updated_at""",
                        (ident, snapshot["name"], pid, encode(snapshot), context_hash, now()))
             db.execute("UPDATE outbox SET status='expired',updated_at=? WHERE conversation_id=? AND context_hash<>? AND status='draft'", (now(), ident, context_hash))
-            db.execute("INSERT OR REPLACE INTO settings VALUES ('pilot_conversation',?)", (encode(ident),))
+            # 首个导入的会话自动设为当前（保持向后兼容）；后续导入不改变当前，由 select_conversation 显式切换
+            if not db.execute("SELECT 1 FROM settings WHERE key='pilot_conversation'").fetchone():
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('pilot_conversation',?)", (encode(ident),))
         return self.row("conversations", ident)
+
+    def select_conversation(self, cid):
+        """切换当前选中的会话（回复/评分/读简历等操作都针对它）。"""
+        self.row("conversations", cid)  # 校验会话存在
+        self.set_setting("pilot_conversation", cid)
+        return self.row("conversations", cid)
 
     def save_document(self, cid, source, text, complete, meta):
         self.row("conversations", cid)
