@@ -53,7 +53,7 @@ npm --prefix src/bosshunter/web/frontend run build
 bosshunter web --no-open
 ```
 
-打开 `http://127.0.0.1:8686/recruiting`。模型接口和密钥在本地模型设置中配置。当前尚无完整新账号会话绑定向导；现有试运行依赖已经核实的本地会话绑定，不能把全新安装当作全流程就绪。
+打开 `http://127.0.0.1:8686/recruiting`。模型接口和密钥在本地模型设置中配置。已有会话绑定向导（手动填会话标识），可引导建立首次绑定；真实账号端到端绑定尚未验收，不能把全新安装当作全流程就绪。
 
 ```bash
 python -m unittest discover -s tests -p 'test_recruiting*.py'
