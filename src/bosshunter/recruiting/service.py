@@ -94,6 +94,34 @@ class RecruitingService:
             self.store.event("conversation_synced", result["id"], "读取当前一个会话；未发送消息")
             return result
 
+    def preview_binding(self, conversation_id, name, position_title):
+        """读取并核实一个候选会话，返回账号身份供用户确认；不写入绑定。
+
+        本地模式不操作 Chrome 标签页，只通过登录 Cookie 后台读取。
+        read_conversation 会校验候选人姓名、招聘账号唯一性，并返回 account_uid。
+        """
+        if not all(str(x).strip() for x in (conversation_id, name, position_title)):
+            raise ValueError("请填写会话标识、候选人姓名和沟通岗位")
+        snapshot = self.local_session.read_conversation(
+            str(conversation_id).strip(), str(name).strip(), str(position_title).strip())
+        return {"account_uid": snapshot["account_uid"], "name": snapshot["name"],
+                "position_title": snapshot["position_title"],
+                "message_count": len(snapshot["messages"]),
+                "coverage": snapshot.get("coverage", "")}
+
+    def confirm_binding(self, conversation_id, name, position_title, expected_account):
+        """核实后把会话写入 pilot_conversation（首次绑定的唯一入口）。
+
+        重新读取一次并带上预览时拿到的 account_uid 作 expected_account，
+        read_conversation 会校验当前登录账号未变化，再导入并绑定。
+        """
+        snapshot = self.local_session.read_conversation(
+            str(conversation_id).strip(), str(name).strip(), str(position_title).strip(),
+            expected_account=str(expected_account).strip())
+        result = self.store.import_conversation(snapshot)
+        self.store.event("conversation_bound", result["id"], "已核实并绑定会话；未发送消息")
+        return result
+
     def sync(self):
         with self.lock:
             ident = self.store.setting("pilot_conversation")

@@ -8,6 +8,7 @@ import { CandidateWorkspace } from './CandidateWorkspace'
 import { GreetingConsole } from './GreetingConsole'
 import { RecruitingOverview } from './RecruitingOverview'
 import { PublishedJobs, PublishedJobsState } from './PublishedJobs'
+import { BindingWizard } from './BindingWizard'
 
 type Message = { direction: string; kind: string; text: string; time: string }
 type Position = { id: string; title: string; jd: string; enabled: number; version: number; source: string }
@@ -65,6 +66,7 @@ export default function RecruitingPage() {
       {section === 'positions' && data.recruiting_jobs && <PublishedJobs data={data.recruiting_jobs} act={act} busy={busy} />}
       {section === 'candidates' && <CandidateWorkspace data={data} id={id} act={act} busy={busy} />}
       {section === 'company' && <><PageHeading title="公司说明与岗位 JD" description="只维护这两份内容，Agent 回复时会直接结合使用。" /><CompanyForm company={data.company || EMPTY_COMPANY} act={act} busy={busy} />{data.positions.length ? data.positions.map(p => <PositionForm key={p.id} p={p} act={act} busy={busy} />) : <div className="rc-panel rc-muted">导入招聘会话后，在这里填写该岗位 JD。</div>}</>}
+      {section === 'binding' && <BindingWizard data={data} act={act} busy={busy} />}
       {section === 'discover' && <GreetingConsole data={data} />}
       {section === 'monitor' && <><PageHeading title="运行记录" description="查看监测状态、回复结果和需要人工处理的异常。" /><Monitor data={data} act={act} busy={busy} /><Drafts drafts={data.outbox} act={act} busy={busy} /><section className="rc-panel"><h3>最近操作</h3>{data.events.map(e => <div className="rc-event" key={e.id}><time>{fmt(e.created_at)}</time><span>{e.detail || e.kind}</span></div>)}</section></>}
       {!['overview', 'positions', 'discover', 'candidates'].includes(section) && <p className="rc-footnote">当前为单候选人试运行 · 回复先核对再发送 · 面试邀约禁止发送</p>}

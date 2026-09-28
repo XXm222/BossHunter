@@ -45,6 +45,9 @@ def register(app, data_dir, config, respond):
                 "jobs/select": lambda: s.jobs.select(payload.get("ids")),
                 "jobs/budget": lambda: s.jobs.save_budget(payload.get("mode"), payload.get("limit")),
                 "import-current": lambda: s.import_current(),
+                # 绑定向导：先预览核实身份（不写入），再确认后写入 pilot_conversation
+                "binding/preview": lambda: s.preview_binding(payload["conversation_id"], payload["name"], payload["position_title"]),
+                "binding/confirm": lambda: s.confirm_binding(payload["conversation_id"], payload["name"], payload["position_title"], payload["expected_account"]),
                 "sync": lambda: s.sync(),
                 "discover": lambda: s.browser.discover(),
                 "position": lambda: s.position(payload),
