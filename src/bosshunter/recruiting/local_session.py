@@ -21,11 +21,11 @@ class LocalBossSession:
     def __init__(self, cookie_loader=None, transport=None, throttle=None):
         self.cookie_loader = cookie_loader or self.load_cookies
         self.transport = transport
-        # 后台读取节流：真实网络下每个操作间隔 2-5 秒降低风控；测试用 MockTransport 时不加延迟
+        # 后台读取节流：真实网络下每个操作间隔 10-30 秒降低风控；测试用 MockTransport 时不加延迟
         if throttle is not None:
             self.throttle = throttle
         elif transport is None:
-            self.throttle = PageThrottle(delay_min=2.0, delay_max=5.0)
+            self.throttle = PageThrottle(delay_min=10.0, delay_max=30.0)
         else:
             self.throttle = PageThrottle(delay_min=0.0, delay_max=0.0)
 

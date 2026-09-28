@@ -487,28 +487,19 @@ class RecruitingService:
 
     def monitor_once(self):
         cid = self.store.setting("pilot_conversation")
-        # 1. 同步所有会话的消息（只读，不读简历/评分/草稿）
-        changed = {}
-        for conv in self.store.rows("conversations"):
-            try:
-                result = self.sync(conv["id"], process=False)
-                changed[conv["id"]] = conv["context_hash"] != result["context_hash"]
-            except BrowserError as exc:
-                self.store.event("monitor_sync_failed", conv["id"], str(exc)[:200])
-        # 2. 只对当前选中会话处理（读简历/评分/草稿）
         if not cid:
             return {"changed": False, "last_success": self.monitor["last_success"]}
-        current = self.store.row("conversations", cid)
-        self.process_received_resume(current)
-        if changed.get(cid):
+        before = self.store.row("conversations", cid)
+        after = self.sync(cid, process=True)
+        if before["context_hash"] != after["context_hash"]:
             self.store.event("conversation_changed", cid, "会话发生变化，旧草稿已过期")
-            messages = json.loads(current["snapshot"])["messages"]
-            if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not current["taken_over"] and not current["do_not_contact"]:
+            messages = json.loads(after["snapshot"])["messages"]
+            if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
                 try:
                     self.prepare_reply(cid)
                 except ValueError as exc:
                     self.store.event("reply_needs_attention", cid, str(exc))
-        return {"changed": changed.get(cid, False), "last_success": self.monitor["last_success"]}
+        return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}
 
     def start_monitor(self):
         with self.lock:
