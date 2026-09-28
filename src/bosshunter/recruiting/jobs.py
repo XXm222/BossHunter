@@ -96,6 +96,7 @@ class RecruitingJobs:
         for job in jobs:
             job['details'] = json.loads(job['details'])
         config = self.config()
+        quota = self.store.setting('greeting_quota', {})
         used = sum(counts.values())
         selected = [j for j in jobs if j['selected']]
         blockers = []
@@ -103,13 +104,13 @@ class RecruitingJobs:
             blockers.append('请先勾选允许自动处理的开放岗位')
         if any(not j['platform_id'] for j in selected):
             blockers.append('已选岗位的平台唯一标识尚未核实')
-        blockers.append('平台每日剩余额度与主动招呼执行尚未完成实测接通')
+        blockers.append('主动招呼执行尚未完成实测接通')
         if unresolved:
             blockers.append('存在发送结果待核实的招呼，暂停继续外发')
         return {'jobs': jobs, 'sync': self.store.setting('jobs_sync', {}), 'budget': config,
                 'daily': {'date': day, 'timezone': 'Asia/Shanghai', 'attempted': used,
                           'sent': counts.get('sent', 0), 'uncertain': counts.get('uncertain', 0),
-                          'platform_remaining': None,
+                          'platform_remaining': quota.get('remaining'),
                           'custom_remaining': max(0, config['limit'] - used) if config['mode'] == 'custom' else None},
                 'attempts': attempts,
                 'selected_count': len(selected), 'running': False, 'blockers': blockers}

@@ -343,6 +343,43 @@ class LocalBossSession:
         contacts.sort(key=lambda c: c.get('last_ts') or 0, reverse=True)
         return contacts
 
+    def read_greeting_quota(self):
+        """读取招聘账号今日剩余打招呼权益（主动沟通额度）。
+
+        返回 {'limit': 总限额, 'used': 已用, 'remaining': 剩余}；
+        无限制（limitCount 为 -1）或结构异常时 limit/remaining 为 None。
+        """
+        self.throttle.wait()
+        cookies = self.cookie_loader()
+        with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
+                          timeout=20, follow_redirects=False,
+                          headers={'Referer': 'https://www.zhipin.com/web/chat/index'}) as client:
+            try:
+                response = client.get('https://www.zhipin.com/wapi/zpboss/h5/weeklyReportV3/recruitDataCenter/get.json',
+                                      params={'jobId': '0', 'platform': '1', 'date': ''})
+                response.raise_for_status()
+                body = response.json()
+            except (httpx.HTTPError, ValueError):
+                raise BrowserError('后台额度读取未完成；保留原记录，不自动重试') from None
+        if not isinstance(body, dict) or body.get('code') != 0:
+            raise BrowserError('BOSS 未接受额度读取请求，请核实登录状态；未操作标签页')
+        data = body.get('zpData')
+        if not isinstance(data, dict):
+            raise BrowserError('额度数据结构变化，停止本次同步')
+        chat_state = data.get('dailyRightStates')
+        if not isinstance(chat_state, dict) or not isinstance(chat_state.get('chatRightState'), dict):
+            raise BrowserError('额度数据结构变化，停止本次同步')
+        bars = chat_state['chatRightState'].get('progressBarList')
+        if not isinstance(bars, list) or not bars or not isinstance(bars[0], dict):
+            raise BrowserError('额度数据结构变化，停止本次同步')
+        bar = bars[0]
+        limit = bar.get('limitCount')
+        used = bar.get('usedCount')
+        if isinstance(limit, int) and isinstance(used, int) and limit >= 0:
+            return {'limit': limit, 'used': used, 'remaining': max(0, limit - used)}
+        # 无限制（limitCount 为 -1）或字段异常：无可用额度上限
+        return {'limit': None, 'used': used if isinstance(used, int) else 0, 'remaining': None}
+
 
 # 渲染分辨率（DPI）：中文简历识别精度与耗时/内存之间的平衡点；需要更高精度可调到 300，但会更慢、更占内存。
 _OCR_RENDER_DPI = 200

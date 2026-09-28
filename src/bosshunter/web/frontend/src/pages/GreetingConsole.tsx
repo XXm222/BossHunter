@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowRight, Ban, ChevronLeft, ChevronRight, Clock3, Info, Play, Search, Target } from 'lucide-react'
 import { RecruitIcon } from '../components/recruiting/RecruitIcon'
-import type { State } from './RecruitingPage'
+import type { Act, State } from './RecruitingPage'
 import './greeting-console.css'
 
 export type GreetingAttempt = { id: number; job_id: string; candidate_id: string; status: string; created_at: string }
@@ -11,7 +11,7 @@ const statusLabel = (status: string) => ({ sent: '已确认招呼', skipped: '�
 const matches = (status: string, filter: string) => filter === 'all' || (filter === 'review' ? !['sent', 'skipped'].includes(status) : status === filter)
 const time = (value: string) => new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
 
-export function GreetingConsole({ data }: { data: State }) {
+export function GreetingConsole({ data, act, busy = false }: { data: State; act?: Act; busy?: boolean }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
   const [page, setPage] = useState(1)
@@ -40,7 +40,7 @@ export function GreetingConsole({ data }: { data: State }) {
     <section className="rd-panel gc-target" aria-label="今日招呼额度">
       <div className="gc-target-label"><Target size={30} /><div><h3>今日目标</h3><p>{custom ? `每日最多 ${limit} 人` : '用完平台可用额度'}</p><Link to="/recruiting/positions">调整额度 <ChevronRight size={12} /></Link></div></div>
       <div className="gc-progress-block"><div className="gc-progress-label"><span>已确认 <strong>{jobs?.daily.sent ?? 0}</strong> / {limit ?? '—'}</span><span>{percent === null ? '平台总额度未读取' : `已尝试 ${attempted} 次`}</span></div><div className="rd-progress" role={percent !== null ? 'progressbar' : undefined} aria-label="今日招呼尝试次数" aria-valuemin={percent !== null ? 0 : undefined} aria-valuemax={limit ?? undefined} aria-valuenow={limit !== null ? Math.min(attempted, limit) : undefined}><span style={{ width: `${percent ?? 0}%` }} /></div><p className="rd-state"><i />{selectedJobs.length ? `已选 ${selectedJobs.length} 个岗位，等待执行能力接通` : '尚未选择自动处理的岗位'}</p></div>
-      <div className="gc-remaining"><strong>平台剩余 <b>{jobs?.daily.platform_remaining ?? '未读取'}</b></strong><p>账号额度，所有岗位共用</p>{custom && <small>自定义剩余 {jobs?.daily.custom_remaining ?? '—'} 次</small>}</div>
+      <div className="gc-remaining"><strong>平台剩余 <b>{jobs?.daily.platform_remaining ?? '未读取'}</b></strong><p>账号额度，所有岗位共用</p>{custom && <small>自定义剩余 {jobs?.daily.custom_remaining ?? '—'} 次</small>}<button className="rd-text-button" disabled={busy || !act} onClick={() => act?.('quota/read', {}, '额度已读取')}>读取额度</button></div>
       <div className="gc-cadence"><Clock3 size={20} /><span>低频执行<br />按岗位依次处理</span></div>
     </section>
 

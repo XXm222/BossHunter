@@ -47,6 +47,7 @@ def register(app, data_dir, config, respond):
                 "import-current": lambda: s.import_current(),
                 # 绑定向导：先预览核实身份（不写入），再确认后写入 pilot_conversation
                 "contacts/list": lambda: s.list_contacts(),
+                "quota/read": lambda: s.read_greeting_quota(),
                 "binding/preview": lambda: s.preview_binding(payload["conversation_id"], payload["name"], payload["position_title"]),
                 "binding/confirm": lambda: s.confirm_binding(payload["conversation_id"], payload["name"], payload["position_title"], payload["expected_account"]),
                 "sync": lambda: s.sync(payload.get("conversation_id")),

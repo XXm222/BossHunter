@@ -98,6 +98,14 @@ class RecruitingService:
         """读取招聘账号的联系人列表，供绑定向导从列表选人。"""
         return self.local_session.list_contacts()
 
+    def read_greeting_quota(self):
+        """读取今日剩余打招呼额度并缓存，返回结果。"""
+        quota = self.local_session.read_greeting_quota()
+        self.store.set_setting('greeting_quota', {**quota, 'updated_at': now()})
+        remaining = quota['remaining']
+        self.store.event('greeting_quota_read', '', f"今日打招呼额度：剩余 {remaining if remaining is not None else '不限'}")
+        return quota
+
     def preview_binding(self, conversation_id, name, position_title):
         """读取并核实一个候选会话，返回账号身份供用户确认；不写入绑定。
 
