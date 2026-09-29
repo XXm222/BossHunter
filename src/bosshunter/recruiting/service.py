@@ -1,6 +1,7 @@
 """One-account, one-conversation recruiting pilot with persistent outbound guards."""
 from datetime import date, datetime
 import json
+import random
 import time
 from threading import Event, RLock, Thread
 from uuid import uuid4
@@ -12,20 +13,24 @@ from .policy import check_reply
 from .jobs import RecruitingJobs
 from .local_session import LocalBossSession
 from bosshunter.browser.client import RuntimeClient
+from bosshunter.throttle import PageThrottle
 
 
 class RecruitingService:
-    def __init__(self, path, config_provider, browser=None, local_session=None):
+    def __init__(self, path, config_provider, browser=None, local_session=None, verifier=None):
         self.store = Store(path)
         self.jobs = RecruitingJobs(self.store)
         self.config_provider = config_provider
         self.browser = browser or BossBrowser(runtime=RuntimeClient(config_provider()),
                                               target_id=config_provider().get("browser", {}).get("recruiting_target_id"))
         self.local_session = local_session or LocalBossSession()
+        self.verifier = verifier
         self.use_local_session = browser is None or local_session is not None
         self.lock = RLock()
         self.stop_event = Event()
         self.worker = None
+        self.discovery_worker = None
+        self.discovery_stop = Event()
         saved_monitor = self.store.setting('monitor_state', {})
         self.monitor = {"running": False, "last_success": saved_monitor.get('last_success'),
                         "error": saved_monitor.get('error') or "", "interval_seconds": 120,
@@ -47,10 +52,14 @@ class RecruitingService:
         drafts = s.rows("outbox", "ORDER BY created_at DESC, rowid DESC")
         for d in drafts:
             d["refs"] = json.loads(d["refs"])
+        jobs_state = self.jobs.state()
+        discovery_running = bool(self.discovery_worker and self.discovery_worker.is_alive() and not self.discovery_stop.is_set())
+        jobs_state["running"] = discovery_running
         return {"positions": s.rows("positions"), "conversations": conversations,
-                "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": self.jobs.state(), "assessments": assessments,
+                "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
                 "connection": self.connection, "monitor": self.monitor.copy(),
+                "discovery": {"running": discovery_running},
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
                 "pilot": {"max_conversations": 20, "max_outbound_per_action": 1,
                           "invitation_sending": False, "automatic_sending": False,
@@ -107,6 +116,130 @@ class RecruitingService:
         remaining = quota['remaining']
         self.store.event('greeting_quota_read', '', f"今日打招呼额度：剩余 {remaining if remaining is not None else '不限'}")
         return quota
+
+    def verify_discover(self):
+        """刷新推荐页并读取、去重第一个候选人；只读，绝不外发。
+
+        返回 {verified, name, uid, duplicate, ready, reason}。verified 表示刷新后
+        读到了完整身份（name + data-geekid）；duplicate 表示该 geekid 已在
+        greeting_attempts 里（我们自己打过招呼）；ready = verified 且未重复。
+        """
+        if self.verifier is None:
+            from .recommend import RecommendVerifier
+            self.verifier = RecommendVerifier(self.config_provider)
+        candidate = self.verifier.verify()
+        if not candidate.get("verified"):
+            self.store.event("discover_unverified", "", candidate.get("reason", "跨刷新身份验证未通过"))
+            return {**candidate, "duplicate": False, "ready": False}
+        candidate["duplicate"] = self._is_duplicate(candidate["uid"])
+        candidate["ready"] = not candidate["duplicate"]
+        if candidate["duplicate"]:
+            candidate["reason"] = "该候选人已打过招呼，跳过"
+            self.store.event("discover_duplicate", candidate["uid"], f"推荐页候选人 {candidate['name']} 已打过招呼，去重跳过")
+        else:
+            candidate["reason"] = "已确认候选人身份且未重复，可进入主动打招呼"
+            self.store.event("discover_verified", candidate["uid"], f"推荐页候选人 {candidate['name']} 身份确认、未重复")
+        return candidate
+
+    def _is_duplicate(self, uid):
+        # 推荐卡的 data-geekid 与联系人列表的 friendId 不是同一 ID 空间，去重只
+        # 按我们自己记录的 greeting_attempts.candidate_id（发招呼时会把 geekid 存进去）。
+        with self.store.db() as db:
+            return bool(db.execute("SELECT 1 FROM greeting_attempts WHERE candidate_id=?", (uid,)).fetchone())
+
+    def greet_discovered(self, uid):
+        """对已通过跨刷新验证的候选人点「打招呼」（BOSS 自动发默认招呼语）。"""
+        if self._is_duplicate(uid):
+            raise ValueError("该候选人已打过招呼，跳过")
+        if self.verifier is None:
+            from .recommend import RecommendVerifier
+            self.verifier = RecommendVerifier(self.config_provider)
+        result = self.verifier.greet(uid)
+        job_id = result.get("job_id")
+        if not job_id:
+            raise ValueError("未读取到推荐页当前岗位")
+        stored_job_id = "boss-" + job_id
+        status = "sent" if result.get("sent") else "uncertain"
+        self.jobs.record_greeting(stored_job_id, uid, status)
+        return {**result, "status": status, "job_id": stored_job_id}
+
+    def _quota_exhausted_now(self):
+        daily = self.jobs.state()['daily']
+        config = self.jobs.config()
+        if config['mode'] == 'custom':
+            return daily['custom_remaining'] is not None and daily['custom_remaining'] <= 0
+        return daily['platform_remaining'] is not None and daily['platform_remaining'] <= 0
+
+    def run_discovery(self, per_job_min=5, per_job_max=10, throttle_delay=(10.0, 30.0)):
+        """循环勾选的开放岗位，每岗位招呼 5~10 个候选人（同步执行，节流防封号）。"""
+        state = self.jobs.state()
+        if state['blockers']:
+            raise ValueError('；'.join(state['blockers']))
+        selected = [j for j in state['jobs'] if j['selected'] and j['status'] == '开放中' and j['platform_id']]
+        if not selected:
+            raise ValueError('没有可处理的开放岗位')
+        config = self.jobs.config()
+        if config['mode'] == 'platform':
+            try:
+                self.read_greeting_quota()
+            except BrowserError as exc:
+                raise ValueError(f"无法读取平台剩余额度，停止执行：{exc}")
+        if self.verifier is None:
+            from .recommend import RecommendVerifier
+            self.verifier = RecommendVerifier(self.config_provider)
+        throttle = PageThrottle(delay_min=throttle_delay[0], delay_max=throttle_delay[1])
+        greeted = 0
+        for job in selected:
+            if self.discovery_stop.is_set() or self._quota_exhausted_now():
+                break
+            try:
+                self.verifier.select_job(job['platform_id'])
+                candidates = self.verifier.read_candidates()
+            except BrowserError as exc:
+                self.store.event('discovery_error', job['platform_id'], str(exc))
+                continue
+            per_job = random.randint(per_job_min, per_job_max)
+            done = 0
+            for cand in candidates:
+                if self.discovery_stop.is_set() or done >= per_job or self._quota_exhausted_now():
+                    break
+                if not cand.get('greetable') or self._is_duplicate(cand['uid']):
+                    continue
+                result = self.greet_discovered(cand['uid'])
+                if result.get('sent'):
+                    greeted += 1
+                    done += 1
+                throttle.wait()
+            throttle.wait()
+        stopped = self.discovery_stop.is_set()
+        return {'greeted': greeted, 'stopped': stopped,
+                'reason': '主动打招呼已手动停止' if stopped else f'本轮主动招呼 {greeted} 次'}
+
+    def start_discovery(self, per_job_min=5, per_job_max=10):
+        """后台启动「按额度持续主动打招呼」循环；立即返回，循环在线程内运行。"""
+        if self.discovery_worker and self.discovery_worker.is_alive():
+            return {'running': True, 'message': '主动打招呼循环已在运行'}
+        state = self.jobs.state()
+        if state['blockers']:
+            raise ValueError('；'.join(state['blockers']))
+        self.discovery_stop.clear()
+
+        def run():
+            try:
+                result = self.run_discovery(per_job_min, per_job_max)
+                self.store.event('discovery_done', '', result['reason'])
+            except Exception as exc:
+                self.store.event('discovery_stopped', '', str(exc)[:300])
+
+        self.discovery_worker = Thread(target=run, daemon=True, name='recruiting-discovery')
+        self.discovery_worker.start()
+        return {'running': True, 'message': '主动打招呼循环已启动'}
+
+    def stop_discovery(self):
+        """请求停止正在运行的主动打招呼循环；在下一个节流点生效（≤30 秒）。"""
+        self.discovery_stop.set()
+        return {'running': bool(self.discovery_worker and self.discovery_worker.is_alive()),
+                'message': '已请求停止主动打招呼循环'}
 
     def preview_binding(self, conversation_id, name, position_title):
         """读取并核实一个候选会话，返回账号身份供用户确认；不写入绑定。

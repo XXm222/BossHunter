@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowRight, Ban, ChevronLeft, ChevronRight, Clock3, Info, Play, Search, Target } from 'lucide-react'
+import { ArrowRight, Ban, ChevronLeft, ChevronRight, Clock3, Info, Play, Search, Square, Target } from 'lucide-react'
 import { RecruitIcon } from '../components/recruiting/RecruitIcon'
 import type { Act, State } from './RecruitingPage'
 import './greeting-console.css'
@@ -17,6 +17,9 @@ export function GreetingConsole({ data, act, busy = false }: { data: State; act?
   const [page, setPage] = useState(1)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const jobs = data.recruiting_jobs
+  const running = data.discovery?.running ?? false
+  const blockers = jobs?.blockers ?? []
+  const ready = !running && blockers.length === 0
   const attempts = jobs?.attempts ?? []
   const selectedJobs = jobs?.jobs.filter(job => job.selected) ?? []
   const jobMap = new Map(jobs?.jobs.map(job => [job.id, job]))
@@ -35,17 +38,17 @@ export function GreetingConsole({ data, act, busy = false }: { data: State; act?
   const attempted = jobs?.daily.attempted ?? 0
   const percent = limit ? Math.min(100, attempted / limit * 100) : null
   return <>
-    <div className="rd-page-heading gc-heading"><div><h2>主动打招呼</h2><p>按已选岗位持续找人，把每天的可用招呼额度用在合适的人身上。</p></div><div className="gc-heading-controls"><span className="rd-state"><i />待接通</span><button className="rd-button" disabled aria-describedby="greeting-readiness"><Play size={15} />开始执行</button><Link className="rd-text-button" to="/recruiting/positions">管理岗位与额度 <ChevronRight size={14} /></Link></div></div>
+    <div className="rd-page-heading gc-heading"><div><h2>主动打招呼</h2><p>按已选岗位持续找人，把每天的可用招呼额度用在合适的人身上。</p></div><div className="gc-heading-controls"><span className="rd-state"><i />{running ? '执行中' : ready ? '可执行' : '待接通'}</span><button className="rd-button" disabled={busy || (!ready && !running)} aria-describedby="greeting-readiness" onClick={() => running ? act?.('discover/stop', {}, '已请求停止主动打招呼') : act?.('discover/run', {}, '主动打招呼循环已启动')}>{running ? <Square size={15} /> : <Play size={15} />}{running ? '停止' : '开始执行'}</button><Link className="rd-text-button" to="/recruiting/positions">管理岗位与额度 <ChevronRight size={14} /></Link></div></div>
 
     <section className="rd-panel gc-target" aria-label="今日招呼额度">
       <div className="gc-target-label"><Target size={30} /><div><h3>今日目标</h3><p>{custom ? `每日最多 ${limit} 人` : '用完平台可用额度'}</p><Link to="/recruiting/positions">调整额度 <ChevronRight size={12} /></Link></div></div>
-      <div className="gc-progress-block"><div className="gc-progress-label"><span>已确认 <strong>{jobs?.daily.sent ?? 0}</strong> / {limit ?? '—'}</span><span>{percent === null ? '平台总额度未读取' : `已尝试 ${attempted} 次`}</span></div><div className="rd-progress" role={percent !== null ? 'progressbar' : undefined} aria-label="今日招呼尝试次数" aria-valuemin={percent !== null ? 0 : undefined} aria-valuemax={limit ?? undefined} aria-valuenow={limit !== null ? Math.min(attempted, limit) : undefined}><span style={{ width: `${percent ?? 0}%` }} /></div><p className="rd-state"><i />{selectedJobs.length ? `已选 ${selectedJobs.length} 个岗位，等待执行能力接通` : '尚未选择自动处理的岗位'}</p></div>
+      <div className="gc-progress-block"><div className="gc-progress-label"><span>已确认 <strong>{jobs?.daily.sent ?? 0}</strong> / {limit ?? '—'}</span><span>{percent === null ? '平台总额度未读取' : `已尝试 ${attempted} 次`}</span></div><div className="rd-progress" role={percent !== null ? 'progressbar' : undefined} aria-label="今日招呼尝试次数" aria-valuemin={percent !== null ? 0 : undefined} aria-valuemax={limit ?? undefined} aria-valuenow={limit !== null ? Math.min(attempted, limit) : undefined}><span style={{ width: `${percent ?? 0}%` }} /></div><p className="rd-state"><i />{selectedJobs.length ? `已选 ${selectedJobs.length} 个岗位${running ? '，执行中' : ready ? '，可执行' : ''}` : '尚未选择自动处理的岗位'}</p></div>
       <div className="gc-remaining"><strong>平台剩余 <b>{jobs?.daily.platform_remaining ?? '未读取'}</b></strong><p>账号额度，所有岗位共用</p>{custom && <small>自定义剩余 {jobs?.daily.custom_remaining ?? '—'} 次</small>}<button className="rd-text-button" disabled={busy || !act} onClick={() => act?.('quota/read', {}, '额度已读取')}>读取额度</button></div>
       <div className="gc-cadence"><Clock3 size={20} /><span>低频执行<br />按岗位依次处理</span></div>
     </section>
 
     <section className="rd-panel"><div className="rd-panel-heading"><h3>岗位执行 <span className="rd-count">{selectedJobs.length}</span></h3><Link to="/recruiting/positions">调整已选岗位 <ChevronRight size={13} /></Link></div>
-      <div className="rd-table-scroll"><table className="rd-table gc-jobs"><thead><tr><th>岗位</th><th>执行状态</th><th>今日已招呼</th><th>本轮进展</th><th>操作</th></tr></thead><tbody>{selectedJobs.map(job => <tr key={job.id}><td><strong>{job.title}</strong><small>{job.details.slice(0, 2).join(' · ')}</small></td><td><span className="rd-badge amber">待接通</span></td><td>{attempts.filter(record => record.job_id === job.id && record.status === 'sent').length}</td><td>尚未开始处理</td><td><Link to="/recruiting/positions">管理岗位 <ChevronRight size={12} /></Link></td></tr>)}</tbody></table></div>
+      <div className="rd-table-scroll"><table className="rd-table gc-jobs"><thead><tr><th>岗位</th><th>执行状态</th><th>今日已招呼</th><th>本轮进展</th><th>操作</th></tr></thead><tbody>{selectedJobs.map(job => <tr key={job.id}><td><strong>{job.title}</strong><small>{job.details.slice(0, 2).join(' · ')}</small></td><td><span className="rd-badge amber">{running ? '执行中' : ready ? '可执行' : '待接通'}</span></td><td>{attempts.filter(record => record.job_id === job.id && record.status === 'sent').length}</td><td>尚未开始处理</td><td><Link to="/recruiting/positions">管理岗位 <ChevronRight size={12} /></Link></td></tr>)}</tbody></table></div>
       {!selectedJobs.length && <div className="rd-empty gc-job-empty"><RecruitIcon name="jobs" size={34} /><strong>{jobs ? '先选择需要 Agent 处理的岗位' : '岗位数据暂不可用'}</strong><p>{jobs ? '已发布岗位不会自动启用。勾选并保存后，会出现在这里。' : '请前往岗位与额度查看同步状态。'}</p><Link className="rd-button" to="/recruiting/positions">选择招聘岗位 <ArrowRight size={14} /></Link></div>}
     </section>
 
@@ -58,6 +61,6 @@ export function GreetingConsole({ data, act, busy = false }: { data: State; act?
     </section>
 
     <aside className="rd-panel gc-detail" aria-label="触达详情"><h3>为什么联系这位候选人</h3>{current ? <><div className="gc-person"><span className="rd-person-avatar">{conversation?.name.slice(0, 1) || '?'}</span><div><strong>{candidateName(current)}</strong><p>{jobTitle(current)}</p></div></div><div className="gc-evidence"><Info size={17} /><p>这条历史记录未保存联系依据，无法还原当时的匹配判断。</p></div><p className="rd-small">完整简历和评分请在已关联的候选人沟通中查看。</p><div className="gc-result"><h4>执行结果</h4><span className={`rd-badge ${current.status === 'sent' ? 'gc-good' : 'amber'}`}>{statusLabel(current.status)}</span><p>时间：{time(current.created_at)}</p>{current.status !== 'sent' && current.status !== 'skipped' && <p>请先核实平台结果，避免重复联系。</p>}</div>{conversation ? <Link className="rd-button rd-wide" to={`/recruiting/candidates/${encodeURIComponent(conversation.id)}`}><RecruitIcon name="chat" size={21} />进入候选人沟通 <ChevronRight size={14} /></Link> : <p className="rd-small">尚未关联会话，不能直接进入该候选人的沟通。</p>}</> : <div className="gc-detail-empty"><RecruitIcon name="resume" size={46} /><strong>选一条记录，查看触达详情</strong><p>核对联系结果和岗位，再进入候选人沟通，连续查看对话、简历与评估。</p><span>没有已记录的依据时，不生成推测结论。</span><Link className="rd-button" to="/recruiting/candidates"><RecruitIcon name="chat" size={20} />打开候选人沟通 <ChevronRight size={14} /></Link></div>}</aside></div>
-    <section className="gc-readiness" id="greeting-readiness"><Info size={18} /><div><strong>自动打招呼尚未接通</strong><p>{jobs?.blockers.join('；') || '执行能力接通后，才能按所选岗位和额度开始处理。'}</p></div><span><Ban size={15} />面试邀约发送已禁用</span></section>
+    <section className="gc-readiness" id="greeting-readiness"><Info size={18} /><div><strong>{running ? '主动打招呼执行中' : ready ? '可开始主动打招呼' : '自动打招呼尚未就绪'}</strong><p>{blockers.join('；') || (running ? '循环已启动，按岗位依次处理，每个动作间隔随机 10–30 秒。' : '已选岗位和额度就绪，点击「开始执行」按额度持续招呼。')}</p></div><span><Ban size={15} />面试邀约发送已禁用</span></section>
   </>
 }

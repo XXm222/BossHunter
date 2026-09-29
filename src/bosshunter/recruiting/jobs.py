@@ -33,6 +33,13 @@ class RecruitingJobs:
     def config(self):
         return self.store.setting('greeting_budget', {'mode': 'platform', 'limit': 100})
 
+    @staticmethod
+    def _quota_exhausted(config, quota, used):
+        if config['mode'] == 'custom':
+            return used >= config['limit']
+        remaining = quota.get('remaining')
+        return remaining is not None and remaining <= 0
+
     def save_budget(self, mode, limit):
         if mode not in {'platform', 'custom'}:
             raise ValueError('额度模式必须是平台额度或自定义')
@@ -86,6 +93,17 @@ class RecruitingJobs:
         self.store.event('jobs_selected', '', f'人工选择 {len(identifiers)} 个岗位；未勾选岗位不进入自动任务')
         return self.state()
 
+    def record_greeting(self, job_id, candidate_id, status):
+        """记录一次主动招呼（候选人在推荐页已点「打招呼」）。candidate_id 用推荐卡
+        的 data-geekid，job_id 用 'boss-<jobid>' 与 published_jobs.id 对齐。"""
+        if status not in {'sent', 'uncertain'}:
+            raise ValueError('招呼状态必须是 sent 或 uncertain')
+        with self.store.db() as db:
+            db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, status, created_at) VALUES (?,?,?,?,?)',
+                       (day_key(), job_id, candidate_id, status, now()))
+        self.store.event('greeting_recorded', candidate_id, f'岗位 {job_id} 招呼记录：{status}')
+        return self.state()
+
     def state(self):
         day = day_key()
         with self.store.db() as db:
@@ -104,9 +122,10 @@ class RecruitingJobs:
             blockers.append('请先勾选允许自动处理的开放岗位')
         if any(not j['platform_id'] for j in selected):
             blockers.append('已选岗位的平台唯一标识尚未核实')
-        blockers.append('主动招呼执行尚未完成实测接通')
         if unresolved:
             blockers.append('存在发送结果待核实的招呼，暂停继续外发')
+        if selected and self._quota_exhausted(config, quota, used):
+            blockers.append('今日招呼额度已用完')
         return {'jobs': jobs, 'sync': self.store.setting('jobs_sync', {}), 'budget': config,
                 'daily': {'date': day, 'timezone': 'Asia/Shanghai', 'attempted': used,
                           'sent': counts.get('sent', 0), 'uncertain': counts.get('uncertain', 0),
