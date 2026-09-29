@@ -17,10 +17,16 @@ import html
 from bosshunter.throttle import PageThrottle
 
 
+# 后台读取单日上限：达到后当天停止后台读取，降低风控风险
+_DAILY_REQUEST_LIMIT = 100
+
+
 class LocalBossSession:
     def __init__(self, cookie_loader=None, transport=None, throttle=None):
         self.cookie_loader = cookie_loader or self.load_cookies
         self.transport = transport
+        self._request_day = None
+        self._request_count = 0
         # 后台读取节流：真实网络下每个操作间隔 10-30 秒降低风控；测试用 MockTransport 时不加延迟
         if throttle is not None:
             self.throttle = throttle
@@ -29,6 +35,18 @@ class LocalBossSession:
         else:
             self.throttle = PageThrottle(delay_min=0.0, delay_max=0.0)
 
+    def _wait(self):
+        """节流：单日上限 + 操作间隔；达到单日上限则当天停止后台读取。"""
+        today = time.strftime('%Y-%m-%d')
+        if self._request_day != today:
+            self._request_day = today
+            self._request_count = 0
+        if self._request_count >= _DAILY_REQUEST_LIMIT:
+            raise BrowserError(f'后台请求达到单日上限 {_DAILY_REQUEST_LIMIT} 次，请明日再试')
+        self._request_count += 1
+        throttle = self.throttle
+        throttle.wait()
+
     def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False):
         """Read one already-bound conversation. Never mark read or operate a tab.
 
@@ -36,7 +54,7 @@ class LocalBossSession:
         All returned messages must belong to this exact peer and one employer.
         Unknown payloads remain explicit system records, not guessed dialogue.
         """
-        self.throttle.wait()
+        self._wait()
         match = re.fullmatch(r'([1-9][0-9]*)-([01])', ident)
         if not match:
             raise BrowserError('绑定会话的标识不支持后台读取，请先核对会话身份')
@@ -134,7 +152,7 @@ class LocalBossSession:
             raise BrowserError('附件地址不属于已验证的 BOSS 简历预览接口，停止读取')
         limit = 20 * 1024 * 1024
         content = bytearray()
-        self.throttle.wait()
+        self._wait()
         try:
             with httpx.Client(cookies=self.cookie_loader(), transport=self.transport, trust_env=False,
                               timeout=30, follow_redirects=False,
@@ -259,7 +277,7 @@ class LocalBossSession:
 
     def read_jobs(self):
         # Each explicit sync refreshes the local login state; secrets stay in memory.
-        self.throttle.wait()
+        self._wait()
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,
@@ -309,7 +327,7 @@ class LocalBossSession:
         返回 [{ident, name, position_title, last_ts}]，按最后消息时间倒序。
         filterByLabel 只返回 uid 和姓名、不返回岗位名，position_title 留空由绑定时手动填写。
         """
-        self.throttle.wait()
+        self._wait()
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,
@@ -349,7 +367,7 @@ class LocalBossSession:
         返回 {'limit': 总限额, 'used': 已用, 'remaining': 剩余}；
         无限制（limitCount 为 -1）或结构异常时 limit/remaining 为 None。
         """
-        self.throttle.wait()
+        self._wait()
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,
