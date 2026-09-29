@@ -12,12 +12,12 @@ import { BindingWizard } from './BindingWizard'
 
 type Message = { direction: string; kind: string; text: string; time: string }
 type Position = { id: string; title: string; jd: string; enabled: number; version: number; source: string }
-type Conversation = { id: string; name: string; position_id: string; updated_at: string; taken_over: number; do_not_contact: number; snapshot: { messages: Message[]; coverage: string } }
+type Conversation = { id: string; name: string; position_id: string; updated_at: string; taken_over: number; do_not_contact: number; auto_send?: number; snapshot: { messages: Message[]; coverage: string } }
 type Resume = { id: string; conversation_id: string; text: string; complete: number; source: string; meta?: { page_count?: number; note?: string; filename?: string } }
 type Company = { text: string; version: number; updated_at: string | null }
 type Draft = { id: string; conversation_id: string; kind: string; content: string; status: string; result: string; refs: { source?: string; needs_human?: boolean; message_count?: number; basis?: string[]; missing?: string[] } }
 type Assessment = { id: string; conversation_id: string; result: { score: number | null; earned: number; assessed_weight: number; coverage: number; document_id: string; position_version: number; questions: string[]; components: Record<string, { score: number | null; reason: string; quotes: string[] }> } }
-export type State = { resume_processing?: Record<string, { status: string; message: string }>; recruiting_jobs?: PublishedJobsState; positions: Position[]; conversations: Conversation[]; documents: Resume[]; company?: Company; outbox: Draft[]; assessments: Assessment[]; events: { id: number; detail: string; kind: string; created_at: string }[]; connection: { connected: boolean; message: string }; monitor: { running: boolean; error: string; last_success: string | null; interval_seconds: number }; discovery?: { running: boolean }; model_ready: boolean }
+export type State = { resume_processing?: Record<string, { status: string; message: string }>; recruiting_jobs?: PublishedJobsState; positions: Position[]; conversations: Conversation[]; documents: Resume[]; company?: Company; outbox: Draft[]; assessments: Assessment[]; events: { id: number; detail: string; kind: string; created_at: string }[]; connection: { connected: boolean; message: string }; monitor: { running: boolean; error: string; last_success: string | null; interval_seconds: number }; discovery?: { running: boolean }; auto_send?: { daily_limit: number; sent_today: number }; model_ready: boolean }
 export type Act = (operation: string, payload?: object, success?: string) => Promise<boolean>
 const EMPTY_COMPANY: Company = { text: '', version: 0, updated_at: null }
 const fmt = (value?: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未同步'

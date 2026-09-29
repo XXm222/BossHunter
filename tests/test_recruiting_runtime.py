@@ -13,6 +13,9 @@ def target(ident='boss', url='https://www.zhipin.com/web/chat/index', kind='page
 
 class RuntimeAdapterTests(unittest.TestCase):
     def setUp(self):
+        self.ensure_patch = patch('bosshunter.recruiting.browser.ensure_runtime', return_value=True)
+        self.ensure_patch.start()
+        self.addCleanup(self.ensure_patch.stop)
         self.runtime = Mock(spec=RuntimeClient)
         self.runtime.health.return_value = {'runtime': 'bosshunter', 'connected': True}
         self.runtime.targets.return_value = [target('other', 'https://example.org'), target()]

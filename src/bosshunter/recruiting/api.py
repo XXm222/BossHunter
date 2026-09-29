@@ -70,6 +70,7 @@ def register(app, data_dir, config, respond):
                 "invitations/draft": lambda: s.invitation(payload),
                 "conversation/select": lambda: s.store.select_conversation(payload["conversation_id"]),
                 "conversation/control": lambda: s.control(payload["conversation_id"], payload["taken_over"], payload["do_not_contact"]),
+                "conversation/auto-send": lambda: s.set_auto_send(payload["conversation_id"], payload["enabled"]),
                 "monitor/once": lambda: s.monitor_once(),
                 "monitor/start": lambda: s.start_monitor(),
                 "monitor/stop": lambda: s.stop_monitor(),

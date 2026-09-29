@@ -1,5 +1,6 @@
 """One-account, one-conversation recruiting pilot with persistent outbound guards."""
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 import json
 import random
 import time
@@ -23,7 +24,12 @@ class RecruitingService:
         self.config_provider = config_provider
         self.browser = browser or BossBrowser(runtime=RuntimeClient(config_provider()),
                                               target_id=config_provider().get("browser", {}).get("recruiting_target_id"))
-        self.local_session = local_session or LocalBossSession()
+        cfg = self._recruiting_cfg()
+        self.local_session = local_session or LocalBossSession(
+            user_data_dir=config_provider().get("browser", {}).get("recruiting_user_data_dir"),
+            read_delay=(cfg.get("read_delay_min", 20.0), cfg.get("read_delay_max", 40.0)),
+            daily_limit=cfg.get("read_daily_limit", 50),
+            page_delay=cfg.get("read_page_delay", 3.0))
         self.verifier = verifier
         self.use_local_session = browser is None or local_session is not None
         self.lock = RLock()
@@ -37,6 +43,10 @@ class RecruitingService:
                         "mode": "read_assess_and_draft", "note": "监测绑定会话，收到简历自动读取和评分；不会自动外发"}
         self.connection = {"connected": False, "message": "尚未核实本地 BOSS 登录状态", "transport": "local_cookie_http"}
         self.store.recover_outbox()
+
+    def _recruiting_cfg(self):
+        config = self.config_provider() or {}
+        return config.get("recruiting") or {}
 
     def state(self):
         s = self.store
@@ -60,6 +70,8 @@ class RecruitingService:
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
                 "connection": self.connection, "monitor": self.monitor.copy(),
                 "discovery": {"running": discovery_running},
+                "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10)),
+                              "sent_today": self._reply_sent_today()},
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
                 "pilot": {"max_conversations": 20, "max_outbound_per_action": 1,
                           "invitation_sending": False, "automatic_sending": False,
@@ -170,8 +182,12 @@ class RecruitingService:
             return daily['custom_remaining'] is not None and daily['custom_remaining'] <= 0
         return daily['platform_remaining'] is not None and daily['platform_remaining'] <= 0
 
-    def run_discovery(self, per_job_min=5, per_job_max=10, throttle_delay=(10.0, 30.0)):
-        """循环勾选的开放岗位，每岗位招呼 5~10 个候选人（同步执行，节流防封号）。"""
+    def run_discovery(self, per_job_min=None, per_job_max=None, throttle_delay=None):
+        """循环勾选的开放岗位，每岗位招呼若干个候选人（同步执行，节流防封号）。"""
+        cfg = self._recruiting_cfg()
+        per_job_min = per_job_min if per_job_min is not None else cfg.get("greet_per_job_min", 1)
+        per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 2)
+        throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 30.0), cfg.get("greet_delay_max", 60.0))
         state = self.jobs.state()
         if state['blockers']:
             raise ValueError('；'.join(state['blockers']))
@@ -215,7 +231,7 @@ class RecruitingService:
         return {'greeted': greeted, 'stopped': stopped,
                 'reason': '主动打招呼已手动停止' if stopped else f'本轮主动招呼 {greeted} 次'}
 
-    def start_discovery(self, per_job_min=5, per_job_max=10):
+    def start_discovery(self, per_job_min=None, per_job_max=None):
         """后台启动「按额度持续主动打招呼」循环；立即返回，循环在线程内运行。"""
         if self.discovery_worker and self.discovery_worker.is_alive():
             return {'running': True, 'message': '主动打招呼循环已在运行'}
@@ -303,15 +319,30 @@ class RecruitingService:
             self.monitor["error"] = ""
             return result
 
-    def control(self, cid, taken_over, do_not_contact):
+    def control(self, cid, taken_over, do_not_contact, auto_send=None):
         if type(taken_over) is not bool or type(do_not_contact) is not bool:
             raise ValueError("开关必须是布尔值")
+        if auto_send is not None and type(auto_send) is not bool:
+            raise ValueError("自动外发开关必须是布尔值")
         self.store.row("conversations", cid)
         with self.lock, self.store.db() as db:
-            db.execute("UPDATE conversations SET taken_over=?,do_not_contact=? WHERE id=?", (taken_over, do_not_contact, cid))
+            if auto_send is None:
+                db.execute("UPDATE conversations SET taken_over=?,do_not_contact=? WHERE id=?", (taken_over, do_not_contact, cid))
+            else:
+                db.execute("UPDATE conversations SET taken_over=?,do_not_contact=?,auto_send=? WHERE id=?", (taken_over, do_not_contact, auto_send, cid))
             if taken_over or do_not_contact:
                 db.execute("UPDATE outbox SET status='cancelled',updated_at=? WHERE conversation_id=? AND status='draft'", (now(), cid))
         self.store.event("contact_control", cid, "已更新人工接管／停止联系设置")
+
+    def set_auto_send(self, cid, enabled):
+        """切换单个会话的自动外发开关（不改变人工接管/停止联系）。"""
+        if type(enabled) is not bool:
+            raise ValueError("自动外发开关必须是布尔值")
+        self.store.row("conversations", cid)
+        with self.lock, self.store.db() as db:
+            db.execute("UPDATE conversations SET auto_send=? WHERE id=?", (int(enabled), cid))
+        self.store.event("auto_send_toggled", cid, f"会话自动外发已{'开启' if enabled else '关闭'}")
+        return self.store.row("conversations", cid)
 
     def position(self, payload):
         old = self.store.row("positions", payload["id"])
@@ -587,6 +618,8 @@ class RecruitingService:
             refs = json.loads(draft["refs"])
             if refs.get("needs_human") or refs.get("position_version") != p["version"]:
                 raise ValueError("草稿需要人工处理或岗位版本变化，请重新准备")
+            if draft["kind"] == "reply" and self._reply_quota_exhausted():
+                raise ValueError("今日自动回复已达上限，请人工处理")
             for kid, version in refs.get("knowledge", {}).items():
                 fact = self.store.row("knowledge", kid)
                 if fact["version"] != version or not fact["approved"] or not fact["public"] or (fact["valid_until"] and fact["valid_until"] < date.today().isoformat()):
@@ -627,6 +660,47 @@ class RecruitingService:
             'error': self.monitor['error'],
         })
 
+    def _auto_send_enabled(self, cid):
+        """该会话的自动外发开关开启时才允许自动外发。"""
+        c = self.store.row("conversations", cid)
+        return bool(c.get("auto_send"))
+
+    def _reply_sent_today(self):
+        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        count = 0
+        with self.store.db() as db:
+            for r in db.execute("SELECT updated_at FROM outbox WHERE kind='reply' AND status IN ('sending','sent','uncertain')").fetchall():
+                if r['updated_at']:
+                    d = datetime.fromisoformat(r['updated_at']).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
+                    if d == day:
+                        count += 1
+        return count
+
+    def _reply_quota_exhausted(self):
+        limit = self.store.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10))
+        if not limit:
+            return False
+        return self._reply_sent_today() >= limit
+
+    def _auto_send_if_allowed(self, draft):
+        """按条件自动发送一条回复草稿；不满足则留草稿给人工。"""
+        refs = json.loads(draft["refs"])
+        if refs.get("needs_human"):
+            return False
+        cid = draft["conversation_id"]
+        if not self._auto_send_enabled(cid):
+            return False
+        if self._reply_quota_exhausted():
+            self.store.event("auto_send_skipped", cid, "今日自动回复已达上限")
+            return False
+        try:
+            self.execute(draft["id"])
+            self.store.event("auto_sent", cid, "已自动发送回复")
+            return True
+        except (ValueError, BrowserError) as exc:
+            self.store.event("auto_send_skipped", cid, str(exc))
+            return False
+
     def monitor_once(self):
         cid = self.store.setting("pilot_conversation")
         if not cid:
@@ -640,7 +714,8 @@ class RecruitingService:
                 messages = json.loads(after["snapshot"])["messages"]
                 if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
                     try:
-                        self.prepare_reply(cid)
+                        draft = self.prepare_reply(cid)
+                        self._auto_send_if_allowed(draft)
                     except ValueError as exc:
                         self.store.event("reply_needs_attention", cid, str(exc))
             return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}

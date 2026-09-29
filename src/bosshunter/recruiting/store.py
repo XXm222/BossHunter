@@ -35,6 +35,7 @@ class Store:
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, position_id TEXT NOT NULL,
                 snapshot TEXT NOT NULL, context_hash TEXT NOT NULL,
                 taken_over INTEGER NOT NULL DEFAULT 0, do_not_contact INTEGER NOT NULL DEFAULT 0,
+                auto_send INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS documents (
@@ -67,6 +68,9 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            cols = [r[1] for r in db.execute("PRAGMA table_info(conversations)").fetchall()]
+            if 'auto_send' not in cols:
+                db.execute("ALTER TABLE conversations ADD COLUMN auto_send INTEGER NOT NULL DEFAULT 0")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -189,10 +193,6 @@ class Store:
                 raise ValueError("动作已处理或结果待核实，不能重复执行")
             if row["kind"] == "invitation":
                 raise ValueError("本次测试禁止发送面试邀约（执行层锁定）")
-            # One externally effective attempt for each action type in this pilot.
-            attempts = db.execute("SELECT count(*) FROM outbox WHERE kind=? AND status IN ('sending','sent','uncertain')", (row["kind"],)).fetchone()[0]
-            if attempts:
-                raise ValueError("该动作已达到最小样本测试上限：1 次；不会再次外发")
             db.execute("UPDATE outbox SET status='sending',updated_at=? WHERE id=?", (now(), ident))
             return dict(row)
 

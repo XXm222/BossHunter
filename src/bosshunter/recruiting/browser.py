@@ -8,6 +8,7 @@ import json
 import time
 from urllib.parse import urlsplit
 from bosshunter.browser.client import RuntimeClient
+from bosshunter.browser.runtime import ensure_runtime
 from .policy import check_reply
 
 
@@ -58,6 +59,7 @@ class BossBrowser:
             return False
 
     def bound_target(self):
+        ensure_runtime()  # 确保原项目 Node Browser Runtime 已启动（发送消息走它）
         health = self.runtime.health()
         if not isinstance(health, dict) or health.get("runtime") != "bosshunter":
             raise BrowserError("BossHunter Browser Runtime 未连接，请检查原项目浏览器服务及 Chrome 调试连接")

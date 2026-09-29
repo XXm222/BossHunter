@@ -98,8 +98,32 @@ class RecruitingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.execute(draft["id"])
         other = self.service.prepare_reply(self.cid, "另一回复")
+        self.assertEqual(self.service.execute(other["id"])["status"], "sent")
+        self.assertEqual(self.browser.calls, 2)
+
+    def test_daily_reply_quota(self):
+        self.service.store.set_setting('auto_reply_daily_limit', 1)
+        draft = self.service.prepare_reply(self.cid, "测试回复")
+        self.assertEqual(self.service.execute(draft["id"])["status"], "sent")
+        other = self.service.prepare_reply(self.cid, "另一回复")
         with self.assertRaisesRegex(ValueError, "上限"):
             self.service.execute(other["id"])
+        self.assertEqual(self.browser.calls, 1)
+
+    def test_auto_send_per_conversation_switch(self):
+        self.assertFalse(self.service._auto_send_enabled(self.cid))
+        self.service.set_auto_send(self.cid, True)
+        self.assertTrue(self.service._auto_send_enabled(self.cid))
+        self.service.set_auto_send(self.cid, False)
+        self.assertFalse(self.service._auto_send_enabled(self.cid))
+
+    def test_auto_send_if_allowed_sends_and_skips(self):
+        self.service.set_auto_send(self.cid, True)
+        ok = self.service.prepare_reply(self.cid, "你好")
+        self.assertTrue(self.service._auto_send_if_allowed(ok))
+        self.assertEqual(self.browser.calls, 1)
+        nh = self.service.store.draft(self.cid, "reply", "需要确认", {"source": "ai_draft", "needs_human": True})
+        self.assertFalse(self.service._auto_send_if_allowed(nh))
         self.assertEqual(self.browser.calls, 1)
 
     def test_invitation_cannot_use_reply_channel(self):
