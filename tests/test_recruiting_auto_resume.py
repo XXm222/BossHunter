@@ -31,7 +31,7 @@ class AutoResumeTests(TestCase):
         return RecruitingService(Path(self.temp.name) / 'db', lambda: self.config, self.browser, self.session)
 
     def tearDown(self):
-        self.service.stop_monitor(); self.score.stop(); self.model_key.stop(); self.temp.cleanup()
+        self.score.stop(); self.model_key.stop(); self.temp.cleanup()
 
     def status(self):
         return self.service.state()['resume_processing'][self.cid]['status']

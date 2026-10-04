@@ -52,7 +52,6 @@ class RecruitingTests(unittest.TestCase):
         self.cid = self.c["id"]
 
     def tearDown(self):
-        self.service.stop_monitor()
         self.temp.cleanup()
 
     def fact(self, **overrides):
@@ -125,6 +124,64 @@ class RecruitingTests(unittest.TestCase):
         nh = self.service.store.draft(self.cid, "reply", "需要确认", {"source": "ai_draft", "needs_human": True})
         self.assertFalse(self.service._auto_send_if_allowed(nh))
         self.assertEqual(self.browser.calls, 1)
+
+    def test_set_monitor_enabled(self):
+        self.assertTrue(self.service.set_monitor_enabled(True)["monitor_enabled"])
+        self.assertTrue(self.service.store.setting("monitor_enabled"))
+        self.service.set_monitor_enabled(False)
+        self.assertFalse(self.service.store.setting("monitor_enabled"))
+
+    def test_worker_alive_and_monitor_running(self):
+        self.assertFalse(self.service._worker_alive())
+        self.assertFalse(self.service.state()["monitor"]["running"])
+        self.service.set_monitor_enabled(True)
+        self.assertFalse(self.service.state()["monitor"]["running"])  # worker 未存活
+        self.service._write_heartbeat()
+        self.assertTrue(self.service._worker_alive())
+        self.assertTrue(self.service.state()["monitor"]["running"])
+        self.assertTrue(self.service.state()["worker"]["alive"])
+
+    def test_list_contacts_uses_browser(self):
+        self.browser.read_contact_list = lambda: [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+        ]
+        result = self.service.list_contacts()
+        self.assertEqual(result, [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师", "last_ts": None},
+        ])
+
+    def test_sync_all_contacts_imports_and_skips_existing(self):
+        self.browser.read_contact_list = lambda: [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+            {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
+        ]
+        first = self.service.sync_all_contacts()
+        self.assertEqual(first["imported"], 2)
+        self.assertEqual(first["total"], 2)
+        ids = {c["id"] for c in self.service.store.rows("conversations")}
+        self.assertIn("96429428-0", ids)
+        self.assertIn("84519593-0", ids)
+        # 再次同步：跳过已存在的，imported 为 0
+        second = self.service.sync_all_contacts()
+        self.assertEqual(second["imported"], 0)
+        self.assertEqual(second["total"], 2)
+
+    def test_sync_all_contacts_shares_same_title_position(self):
+        self.browser.read_contact_list = lambda: [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+            {"ident": "84519593-0", "name": "李四", "position_title": "电子工程师"},
+            {"ident": "81667022-0", "name": "王五", "position_title": "产品经理"},
+        ]
+        self.service.sync_all_contacts()
+        a = self.service.store.row("conversations", "96429428-0")
+        b = self.service.store.row("conversations", "84519593-0")
+        c = self.service.store.row("conversations", "81667022-0")
+        # 同名岗位共享同一条 position
+        self.assertEqual(a["position_id"], b["position_id"])
+        # 不同岗位各一条 position
+        self.assertNotEqual(a["position_id"], c["position_id"])
+        titles = sorted(p["title"] for p in self.service.store.rows("positions") if p["title"] in {"电子工程师", "产品经理"})
+        self.assertEqual(titles, ["产品经理", "电子工程师"])
 
     def test_invitation_cannot_use_reply_channel(self):
         with self.assertRaises(PermissionError):

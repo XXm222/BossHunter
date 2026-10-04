@@ -1,5 +1,5 @@
 """One-account, one-conversation recruiting pilot with persistent outbound guards."""
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 import json
 import random
@@ -33,8 +33,6 @@ class RecruitingService:
         self.verifier = verifier
         self.use_local_session = browser is None or local_session is not None
         self.lock = RLock()
-        self.stop_event = Event()
-        self.worker = None
         self.discovery_worker = None
         self.discovery_stop = Event()
         saved_monitor = self.store.setting('monitor_state', {})
@@ -65,16 +63,20 @@ class RecruitingService:
         jobs_state = self.jobs.state()
         discovery_running = bool(self.discovery_worker and self.discovery_worker.is_alive() and not self.discovery_stop.is_set())
         jobs_state["running"] = discovery_running
+        worker_alive = self._worker_alive()
+        monitor_enabled = bool(s.setting('monitor_enabled', False))
+        monitor_state = self.monitor.copy()
+        monitor_state["running"] = worker_alive and monitor_enabled
         return {"positions": s.rows("positions"), "conversations": conversations,
                 "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
-                "connection": self.connection, "monitor": self.monitor.copy(),
+                "connection": self.connection, "monitor": monitor_state,
+                "worker": {"alive": worker_alive, "monitor_enabled": monitor_enabled},
                 "discovery": {"running": discovery_running},
                 "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10)),
                               "sent_today": self._reply_sent_today()},
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
-                "pilot": {"max_conversations": 20, "max_outbound_per_action": 1,
-                          "invitation_sending": False, "automatic_sending": False,
+                "pilot": {"max_conversations": 20, "invitation_sending": False,
                           "conversation_id": s.setting("pilot_conversation"),
                           "message_identity": "platform_ids" if conversations and all(c['snapshot'].get('stable_message_ids') for c in conversations) else "snapshot_only", "coverage": "已同步多个候选人会话（非全量）"}}
 
@@ -83,8 +85,8 @@ class RecruitingService:
         try:
             result = self.jobs.import_snapshot(self.local_session.read_jobs())
             self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
-                               "message": "已通过本地登录状态核实 BOSS 岗位读取；自动外发未接通",
-                               "read_jobs": True, "read_bound_conversation": False, "automatic_sending": False}
+                               "message": "已通过本地登录状态核实 BOSS 岗位读取",
+                               "read_jobs": True, "read_bound_conversation": False}
             return result
         except Exception as exc:
             self.store.set_setting("jobs_sync", {**previous, "attempted_at": now(), "error": str(exc)[:300]})
@@ -118,8 +120,38 @@ class RecruitingService:
             return result
 
     def list_contacts(self):
-        """读取招聘账号的联系人列表，供绑定向导从列表选人。"""
-        return self.local_session.list_contacts()
+        """读取聊天页左侧联系人列表（含岗位名），供绑定向导从列表选人。"""
+        contacts = self.browser.read_contact_list()
+        return [{"ident": c.get("ident"), "name": c.get("name"),
+                 "position_title": c.get("position_title", ""), "last_ts": None}
+                for c in contacts]
+
+    def sync_all_contacts(self):
+        """批量导入联系人列表里的所有会话（姓名+岗位，不读消息、不调接口）。
+
+        导入为最小快照，让所有候选人都进入「候选人沟通」列表；消息历史在选中该
+        会话后由 sync()/monitor 按需读取并核对归属。已导入的会话跳过。
+        """
+        contacts = self.browser.read_contact_list()
+        existing = {c["id"] for c in self.store.rows("conversations")}
+        imported = 0
+        for c in contacts:
+            ident = c.get("ident")
+            name = c.get("name")
+            if not ident or not name:
+                continue
+            if ident in existing:
+                continue
+            snapshot = {
+                "id": ident, "name": name,
+                "position_title": c.get("position_title", "").strip() or "待关联岗位",
+                "messages": [], "editor_empty": True, "stable_message_ids": False,
+                "coverage": "尚未同步消息；选中该会话后自动读取",
+            }
+            self.store.import_conversation(snapshot)
+            imported += 1
+        self.store.event("contacts_synced", "", f"全账号导入 {imported} 个会话（共 {len(contacts)} 个联系人）")
+        return {"imported": imported, "total": len(contacts)}
 
     def read_greeting_quota(self):
         """读取今日剩余打招呼额度并缓存，返回结果。"""
@@ -128,30 +160,6 @@ class RecruitingService:
         remaining = quota['remaining']
         self.store.event('greeting_quota_read', '', f"今日打招呼额度：剩余 {remaining if remaining is not None else '不限'}")
         return quota
-
-    def verify_discover(self):
-        """刷新推荐页并读取、去重第一个候选人；只读，绝不外发。
-
-        返回 {verified, name, uid, duplicate, ready, reason}。verified 表示刷新后
-        读到了完整身份（name + data-geekid）；duplicate 表示该 geekid 已在
-        greeting_attempts 里（我们自己打过招呼）；ready = verified 且未重复。
-        """
-        if self.verifier is None:
-            from .recommend import RecommendVerifier
-            self.verifier = RecommendVerifier(self.config_provider)
-        candidate = self.verifier.verify()
-        if not candidate.get("verified"):
-            self.store.event("discover_unverified", "", candidate.get("reason", "跨刷新身份验证未通过"))
-            return {**candidate, "duplicate": False, "ready": False}
-        candidate["duplicate"] = self._is_duplicate(candidate["uid"])
-        candidate["ready"] = not candidate["duplicate"]
-        if candidate["duplicate"]:
-            candidate["reason"] = "该候选人已打过招呼，跳过"
-            self.store.event("discover_duplicate", candidate["uid"], f"推荐页候选人 {candidate['name']} 已打过招呼，去重跳过")
-        else:
-            candidate["reason"] = "已确认候选人身份且未重复，可进入主动打招呼"
-            self.store.event("discover_verified", candidate["uid"], f"推荐页候选人 {candidate['name']} 身份确认、未重复")
-        return candidate
 
     def _is_duplicate(self, uid):
         # 推荐卡的 data-geekid 与联系人列表的 friendId 不是同一 ID 空间，去重只
@@ -309,7 +317,7 @@ class RecruitingService:
                 self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                    "message": "已连接 BOSS：本地登录会话，只读同步绑定候选人的消息",
                                    "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),
-                                   "read_bound_conversation": True, "automatic_sending": False}
+                                   "read_bound_conversation": True}
                 self.store.event("conversation_synced", ident, f"后台同步绑定会话 {len(snapshot['messages'])} 条平台消息；未操作标签页或发送消息")
             else:
                 result = self.store.import_conversation(self.browser.open_conversation(ident))
@@ -343,6 +351,14 @@ class RecruitingService:
             db.execute("UPDATE conversations SET auto_send=? WHERE id=?", (int(enabled), cid))
         self.store.event("auto_send_toggled", cid, f"会话自动外发已{'开启' if enabled else '关闭'}")
         return self.store.row("conversations", cid)
+
+    def set_monitor_enabled(self, enabled):
+        """开启/停止回复监测：写入控制标志，由独立 worker 进程轮询执行。"""
+        if type(enabled) is not bool:
+            raise ValueError("开关必须是布尔值")
+        self.store.set_setting('monitor_enabled', enabled)
+        self.store.event('monitor_control', '', f"回复监测已{'开启' if enabled else '停止'}")
+        return {'monitor_enabled': enabled}
 
     def position(self, payload):
         old = self.store.row("positions", payload["id"])
@@ -653,6 +669,38 @@ class RecruitingService:
             self.store.event("outbound_" + status, ident, message)
             return self.store.row("outbox", ident)
 
+    def _worker_alive(self):
+        """独立 worker 进程是否存活（通过心跳时间戳判断）。"""
+        hb = self.store.setting('worker_heartbeat')
+        if not hb:
+            return False
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(hb)).total_seconds()
+            return 0 <= age < 30
+        except (ValueError, TypeError):
+            return False
+
+    def _write_heartbeat(self):
+        self.store.set_setting('worker_heartbeat', now())
+
+    def worker_loop(self, stop_event):
+        """独立进程主循环：写心跳、轮询 monitor_enabled 标志、定期跑 monitor_once。"""
+        self.store.event('worker_started', '', '独立监测进程已启动')
+        last_run = 0.0
+        try:
+            while not stop_event.is_set():
+                self._write_heartbeat()
+                if self.store.setting('monitor_enabled', False):
+                    if time.time() - last_run >= self.monitor['interval_seconds']:
+                        try:
+                            self.monitor_once()
+                            last_run = time.time()
+                        except Exception as exc:
+                            self.store.event('monitor_paused', '', str(exc)[:250])
+                stop_event.wait(10)  # 每 10 秒轮询一次标志 + 心跳
+        finally:
+            self.store.event('worker_stopped', '', '独立监测进程已停止')
+
     def _persist_monitor_state(self):
         """把监测状态写回 DB，供服务重启后恢复显示。"""
         self.store.set_setting('monitor_state', {
@@ -721,34 +769,3 @@ class RecruitingService:
             return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}
         finally:
             self._persist_monitor_state()
-
-    def start_monitor(self):
-        with self.lock:
-            if self.worker and self.worker.is_alive():
-                return self.monitor.copy()
-            self.sync()  # Baseline only: never answer historical messages on startup.
-            self.stop_event.clear()
-            self.monitor.update(running=True, error="")
-            self._persist_monitor_state()
-
-            def run():
-                try:
-                    while not self.stop_event.wait(self.monitor["interval_seconds"]):
-                        try:
-                            with self.lock:
-                                self.monitor_once()
-                        except Exception as exc:
-                            self.monitor["error"] = str(exc)[:250]
-                            self.store.event("monitor_paused", "", "读取／生成失败，监测已暂停")
-                            break
-                finally:
-                    self.monitor["running"] = False
-
-            self.worker = Thread(target=run, daemon=True, name="recruiting-monitor")
-            self.worker.start()
-            return self.monitor.copy()
-
-    def stop_monitor(self):
-        self.stop_event.set()
-        self.monitor["running"] = False
-        return self.monitor.copy()

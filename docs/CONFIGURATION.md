@@ -59,3 +59,27 @@ bosshunter ai-status
 - 限定 `send_windows`，避免长时间连续运行。
 - 不关闭人工确认。
 - 不提高默认访问频率，也不要尝试绕过验证码、登录墙或平台限制。
+
+## 招聘端配置
+
+招聘端（雇主侧）的节流与自动外发配置，默认较保守以降低风控/封号风险：
+
+```yaml
+browser:
+  # 招聘端后台 Cookie 读取与自动化浏览器共用的 Chrome 用户数据目录。
+  # 用独立 Chrome（--user-data-dir="$HOME/boss-chrome"）时填该目录，留空用 macOS 默认配置。
+  recruiting_user_data_dir: "~/boss-chrome"
+
+recruiting:
+  read_delay_min: 20        # 后台读取间隔（秒）下限
+  read_delay_max: 40        # 上限
+  read_page_delay: 3        # 分页读取每页间隔（秒）
+  read_daily_limit: 50      # 单日后台请求上限
+  greet_delay_min: 30       # 主动打招呼间隔（秒）下限
+  greet_delay_max: 60       # 上限
+  greet_per_job_min: 1      # 每岗位每轮最少招呼数
+  greet_per_job_max: 2      # 最多招呼数
+  auto_reply_daily_limit: 10  # 每日自动回复上限
+```
+
+回复监测可跑在独立进程：`bosshunter recruiting-worker`（App 关闭后仍持续运行）。

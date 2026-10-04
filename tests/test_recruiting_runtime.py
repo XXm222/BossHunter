@@ -66,6 +66,17 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.runtime.evaluate.assert_not_called()
         self.runtime.navigate.assert_not_called()
 
+    def test_read_contact_list(self):
+        self.runtime.evaluate.return_value = json.dumps({"contacts": [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+            {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
+        ]})
+        result = self.browser.read_contact_list()
+        self.assertEqual(result, [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+            {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
+        ])
+
     def test_actual_client_contract_uses_configured_builtin_runtime(self):
         calls = []
         def get(url, **kwargs):

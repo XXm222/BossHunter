@@ -1,10 +1,8 @@
-"""Recommend-page refresh verification: patchright chain + dedup boundary."""
+"""Recommend-page patchright automation: greet, select job, read candidates."""
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-
-import httpx
 
 from bosshunter.recruiting.browser import BrowserError
 from bosshunter.recruiting.recommend import RecommendVerifier
@@ -68,106 +66,12 @@ class SyncPlaywright:
         return self._pw
 
 
-def verify(frame_result, page_url=RECOMMEND_PAGE, frame_url=FRAME_URL, wait_timeout=0.05):
-    frames = [Frame(frame_url, frame_result)] if frame_result is not None else []
-    page = Page(page_url, frames)
-    pw = PW(Browser(Context([page])))
-    verifier = RecommendVerifier(lambda: {}, cdp_url="http://127.0.0.1:9222", wait_timeout=wait_timeout)
-    with patch("bosshunter.recruiting.recommend.sync_playwright", return_value=SyncPlaywright(pw)):
-        result = verifier.verify()
-    return result, pw, page
-
-
-class RecommendVerifierTests(unittest.TestCase):
-    def test_verify_reloads_and_reads_fresh_candidate(self):
-        result, pw, page = verify({"name": "丁SH", "uid": "geek123"})
-        self.assertTrue(result["verified"])
-        self.assertEqual(result["name"], "丁SH")
-        self.assertEqual(result["uid"], "geek123")
-        self.assertEqual(page.reload_calls, 1)
-        self.assertTrue(pw.stopped)
-
-    def test_verify_fails_closed_when_identity_incomplete(self):
-        for bad in ({"name": "", "uid": "geek123"}, {"name": "丁SH", "uid": ""}, {"name": "", "uid": ""}):
-            result, _, _ = verify(bad)
-            self.assertFalse(result["verified"], bad)
-
-    def test_verify_fails_when_no_frame_or_card(self):
-        for frames in (None, {"name": None, "uid": None}):
-            result, _, _ = verify(frames)
-            self.assertFalse(result["verified"])
-
-    def test_verify_requires_recommend_page(self):
-        with patch("bosshunter.recruiting.recommend.sync_playwright",
-                   return_value=SyncPlaywright(PW(Browser(Context([Page("https://www.zhipin.com/web/chat/index", [Frame(FRAME_URL, {"name": "丁SH", "uid": "g"})])]))))):
-            verifier = RecommendVerifier(lambda: {}, cdp_url="http://127.0.0.1:9222")
-            with self.assertRaisesRegex(BrowserError, "推荐页"):
-                verifier.verify()
-
-    def test_verify_cdp_not_found_raises(self):
-        verifier = RecommendVerifier(lambda: {}, cdp_url=None)
-        with patch("bosshunter.recruiting.recommend.httpx.get", return_value=Mock(status_code=404)):
-            with self.assertRaisesRegex(BrowserError, "调试端口"):
-                verifier.verify()
-
-
-class FakeVerifier:
-    def __init__(self, result):
-        self.result = result
-
-    def verify(self):
-        return self.result
-
-
 class FakeLocalSession:
     def __init__(self, contacts=None):
         self._contacts = contacts or []
 
     def list_contacts(self):
         return self._contacts
-
-
-class VerifyDiscoverTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def service(self, verifier, contacts=None):
-        return RecruitingService(Path(self.temp.name) / "recruiting.db", lambda: {}, Mock(),
-                                 FakeLocalSession(contacts), verifier)
-
-    def test_ready_when_not_duplicate(self):
-        service = self.service(FakeVerifier({"verified": True, "name": "丁SH", "uid": "geek123"}))
-        result = service.verify_discover()
-        self.assertTrue(result["verified"])
-        self.assertFalse(result["duplicate"])
-        self.assertTrue(result["ready"])
-
-    def test_dedupes_by_greeting_attempts(self):
-        service = self.service(FakeVerifier({"verified": True, "name": "丁SH", "uid": "geek123"}))
-        with service.store.db() as db:
-            db.execute("INSERT INTO greeting_attempts(day, job_id, candidate_id, status, created_at) VALUES (?,?,?,?,?)",
-                       ("2026-09-29", "job1", "geek123", "sent", "2026-09-29T00:00:00"))
-        result = service.verify_discover()
-        self.assertTrue(result["duplicate"])
-        self.assertFalse(result["ready"])
-
-    def test_contact_list_friendid_is_not_used_for_dedup(self):
-        # 推荐卡 data-geekid 与联系人列表 friendId 不是同一 ID 空间，去重不应比对联系人。
-        service = self.service(FakeVerifier({"verified": True, "name": "丁SH", "uid": "geek123"}),
-                               [{"ident": "other-friend-id-0", "name": "别人"}])
-        result = service.verify_discover()
-        self.assertFalse(result["duplicate"])
-        self.assertTrue(result["ready"])
-
-    def test_unverified_is_never_ready(self):
-        service = self.service(FakeVerifier({"verified": False, "name": None, "uid": None, "reason": "身份不完整"}))
-        result = service.verify_discover()
-        self.assertFalse(result["verified"])
-        self.assertFalse(result["ready"])
-        self.assertFalse(result["duplicate"])
 
 
 class GreetFrame:

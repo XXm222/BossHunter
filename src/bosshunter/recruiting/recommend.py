@@ -24,19 +24,7 @@ DEFAULT_CHROME_PORTS = [9222, 9229, 9333]
 #   li.card-item > .candidate-card-wrap > .card-inner（data-geek / data-geekid 为
 #   稳定唯一 ID）> ... 姓名在 span.name（img.avatar 的 alt 兜底）。
 # 列表里混有非候选卡片（如 .quick-top-item「职位升级曝光」），因此用 .btn-greet
-# 锁定「有打招呼按钮的才是候选卡」。任一字段读取不到就判验证失败（fail-closed）。
-READ_FIRST_CANDIDATE = r"""
-() => {
-    const btn = [...document.querySelectorAll('.btn-greet')].find(e => e.getClientRects().length > 0);
-    if (!btn) return null;
-    const card = btn.closest('li.card-item');
-    if (!card) return null;
-    const inner = card.querySelector('.card-inner');
-    const name = (card.querySelector('.name')?.innerText || card.querySelector('.avatar')?.getAttribute('alt') || '').trim();
-    const uid = (inner?.getAttribute('data-geekid') || inner?.getAttribute('data-geek') || '').trim();
-    return { name, uid };
-}
-"""
+# 锁定「有打招呼按钮的才是候选卡」。
 
 # 点击指定 geekid 卡片的「打招呼」按钮。BOSS 会自动发默认招呼语，随后按钮变为
 # 「继续沟通」，所以这里只需点一次，不需要填任何文字。
@@ -152,44 +140,6 @@ class RecommendVerifier:
             if frame.url and RECOMMEND_FRAME_PATH in frame.url:
                 return frame
         return None
-
-    @classmethod
-    def _read_first_candidate(cls, page):
-        frame = cls._recommend_frame(page)
-        if not frame:
-            return None
-        value = frame.evaluate(READ_FIRST_CANDIDATE)
-        if not isinstance(value, dict):
-            return None
-        return {"name": str(value.get("name") or "").strip(), "uid": str(value.get("uid") or "").strip()}
-
-    def _wait_for_candidate(self, page):
-        deadline = time.time() + self._wait_timeout
-        while time.time() < deadline:
-            candidate = self._read_first_candidate(page)
-            if candidate and candidate["name"] and candidate["uid"]:
-                return candidate
-            time.sleep(0.5)
-        return None
-
-    def verify(self):
-        cdp_url = self._find_cdp_url()
-        pw = None
-        try:
-            pw = sync_playwright().start()
-            browser = pw.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0]
-            page = self._recommend_page(context)
-            page.reload(wait_until="domcontentloaded")
-            candidate = self._wait_for_candidate(page)
-            if not candidate:
-                return {"verified": False, "name": None, "uid": None,
-                        "reason": "刷新后未能读取到完整候选人身份（姓名或稳定 ID 缺失），不会自动开聊"}
-            return {"verified": True, "name": candidate["name"], "uid": candidate["uid"],
-                    "reason": "已通过刷新拿到当前推荐候选人并读取到完整身份"}
-        finally:
-            if pw is not None:
-                pw.stop()
 
     @staticmethod
     def _job_id_from_frame(frame):

@@ -134,7 +134,12 @@ class Store:
             raise ValueError("缺少会话标识或沟通职位")
         with self.db() as db:
             old = db.execute("SELECT position_id FROM conversations WHERE id=?", (ident,)).fetchone()
-            pid = old[0] if old else "context-" + fingerprint([ident, snapshot["position_title"]])[:16]
+            if old:
+                pid = old[0]
+            else:
+                # 同名岗位共享一条 position：按 title 查已存在的，避免每个会话各建一条
+                existing = db.execute("SELECT id FROM positions WHERE title=?", (snapshot["position_title"],)).fetchone()
+                pid = existing[0] if existing else "context-" + fingerprint([snapshot["position_title"]])[:16]
             pos = db.execute("SELECT title FROM positions WHERE id=?", (pid,)).fetchone()
             if pos and pos[0] != snapshot["position_title"]:
                 raise ValueError("会话关联职位已变化，请先人工核对")
