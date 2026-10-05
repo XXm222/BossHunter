@@ -45,8 +45,16 @@ def register(app, data_dir, config, respond):
                 "jobs/select": lambda: s.jobs.select(payload.get("ids")),
                 "jobs/budget": lambda: s.jobs.save_budget(payload.get("mode"), payload.get("limit")),
                 "import-current": lambda: s.import_current(),
-                "sync": lambda: s.sync(),
-                "discover": lambda: s.browser.discover(),
+                # 绑定向导：先预览核实身份（不写入），再确认后写入 pilot_conversation
+                "contacts/list": lambda: s.list_contacts(),
+                "contacts/sync": lambda: s.sync_all_contacts(),
+                "quota/read": lambda: s.read_greeting_quota(),
+                "binding/preview": lambda: s.preview_binding(payload["conversation_id"], payload["name"], payload["position_title"]),
+                "binding/confirm": lambda: s.confirm_binding(payload["conversation_id"], payload["name"], payload["position_title"], payload["expected_account"]),
+                "sync": lambda: s.sync(payload.get("conversation_id")),
+                "discover/greet": lambda: s.greet_discovered(payload["uid"]),
+                "discover/run": lambda: s.start_discovery(),
+                "discover/stop": lambda: s.stop_discovery(),
                 "position": lambda: s.position(payload),
                 "position/read": lambda: s.read_position(payload["id"]),
                 "company": lambda: s.save_company(payload.get("text")),
@@ -59,10 +67,12 @@ def register(app, data_dir, config, respond):
                 "outbox/execute": lambda: s.execute(payload["id"]),
                 "outbox/cancel": lambda: s.store.finish(payload["id"], "cancelled", "本地用户取消草稿") if s.store.row("outbox", payload["id"])["status"] == "draft" else (_ for _ in ()).throw(ValueError("只能取消未执行草稿")),
                 "invitations/draft": lambda: s.invitation(payload),
+                "conversation/select": lambda: s.store.select_conversation(payload["conversation_id"]),
                 "conversation/control": lambda: s.control(payload["conversation_id"], payload["taken_over"], payload["do_not_contact"]),
+                "conversation/auto-send": lambda: s.set_auto_send(payload["conversation_id"], payload["enabled"]),
                 "monitor/once": lambda: s.monitor_once(),
-                "monitor/start": lambda: s.start_monitor(),
-                "monitor/stop": lambda: s.stop_monitor(),
+                "monitor/start": lambda: s.set_monitor_enabled(True),
+                "monitor/stop": lambda: s.set_monitor_enabled(False),
             }
             if operation not in actions:
                 return respond({"error": "未知招聘操作"}, 404)

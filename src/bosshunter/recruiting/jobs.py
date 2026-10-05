@@ -25,13 +25,24 @@ class RecruitingJobs:
                 CREATE TABLE IF NOT EXISTS greeting_attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL,
                     job_id TEXT NOT NULL, candidate_id TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL, created_at TEXT NOT NULL
                 );
             ''')
+            cols = [r[1] for r in db.execute("PRAGMA table_info(greeting_attempts)").fetchall()]
+            if 'name' not in cols:
+                db.execute("ALTER TABLE greeting_attempts ADD COLUMN name TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE greeting_attempts SET status='uncertain' WHERE status='sending'")
 
     def config(self):
         return self.store.setting('greeting_budget', {'mode': 'platform', 'limit': 100})
+
+    @staticmethod
+    def _quota_exhausted(config, quota, used):
+        if config['mode'] == 'custom':
+            return used >= config['limit']
+        remaining = quota.get('remaining')
+        return remaining is not None and remaining <= 0
 
     def save_budget(self, mode, limit):
         if mode not in {'platform', 'custom'}:
@@ -86,16 +97,29 @@ class RecruitingJobs:
         self.store.event('jobs_selected', '', f'人工选择 {len(identifiers)} 个岗位；未勾选岗位不进入自动任务')
         return self.state()
 
+    def record_greeting(self, job_id, candidate_id, status, name=""):
+        """记录一次主动招呼（候选人在推荐页已点「打招呼」）。candidate_id 用推荐卡
+        的 data-geekid，job_id 用 'boss-<jobid>' 与 published_jobs.id 对齐。name 为
+        推荐卡读到的候选人姓名，仅用于触达记录展示，不参与身份匹配或去重。"""
+        if status not in {'sent', 'uncertain'}:
+            raise ValueError('招呼状态必须是 sent 或 uncertain')
+        with self.store.db() as db:
+            db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, name, status, created_at) VALUES (?,?,?,?,?,?)',
+                       (day_key(), job_id, candidate_id, name, status, now()))
+        self.store.event('greeting_recorded', candidate_id, f'岗位 {job_id} 招呼记录：{status}')
+        return self.state()
+
     def state(self):
         day = day_key()
         with self.store.db() as db:
             jobs = [dict(r) for r in db.execute("SELECT * FROM published_jobs ORDER BY CASE status WHEN '开放中' THEN 0 ELSE 1 END,title")]
             counts = dict(db.execute('SELECT status,count(*) FROM greeting_attempts WHERE day=? GROUP BY status', (day,)).fetchall())
-            attempts = [dict(r) for r in db.execute('SELECT id,job_id,candidate_id,status,created_at FROM greeting_attempts WHERE day=? ORDER BY id DESC', (day,))]
+            attempts = [dict(r) for r in db.execute('SELECT id,job_id,candidate_id,name,status,created_at FROM greeting_attempts WHERE day=? ORDER BY id DESC', (day,))]
             unresolved = db.execute("SELECT count(*) FROM greeting_attempts WHERE status IN ('sending','uncertain')").fetchone()[0]
         for job in jobs:
             job['details'] = json.loads(job['details'])
         config = self.config()
+        quota = self.store.setting('greeting_quota', {})
         used = sum(counts.values())
         selected = [j for j in jobs if j['selected']]
         blockers = []
@@ -103,13 +127,14 @@ class RecruitingJobs:
             blockers.append('请先勾选允许自动处理的开放岗位')
         if any(not j['platform_id'] for j in selected):
             blockers.append('已选岗位的平台唯一标识尚未核实')
-        blockers.append('平台每日剩余额度与主动招呼执行尚未完成实测接通')
         if unresolved:
             blockers.append('存在发送结果待核实的招呼，暂停继续外发')
+        if selected and self._quota_exhausted(config, quota, used):
+            blockers.append('今日招呼额度已用完')
         return {'jobs': jobs, 'sync': self.store.setting('jobs_sync', {}), 'budget': config,
                 'daily': {'date': day, 'timezone': 'Asia/Shanghai', 'attempted': used,
                           'sent': counts.get('sent', 0), 'uncertain': counts.get('uncertain', 0),
-                          'platform_remaining': None,
+                          'platform_remaining': quota.get('remaining'),
                           'custom_remaining': max(0, config['limit'] - used) if config['mode'] == 'custom' else None},
                 'attempts': attempts,
                 'selected_count': len(selected), 'running': False, 'blockers': blockers}

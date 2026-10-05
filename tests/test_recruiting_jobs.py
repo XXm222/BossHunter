@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import httpx
-from bosshunter.recruiting.browser import BossBrowser, BrowserError
+from bosshunter.recruiting.browser import BrowserError
 from bosshunter.recruiting.jobs import RecruitingJobs
 from bosshunter.recruiting.local_session import LocalBossSession
 from bosshunter.recruiting.store import Store
@@ -65,12 +65,6 @@ class CookieTransportTests(unittest.TestCase):
             self.session(lambda r: httpx.Response(200, json=page([raw(), raw()]))).read_jobs()
         result = self.session(lambda r: httpx.Response(200, json=page([raw(status=99)]))).read_jobs()
         self.assertEqual(result['jobs'][0]['status'], '状态待核实')
-
-    def test_browser_resume_preview_is_disabled_before_transport(self):
-        with patch.object(BossBrowser, 'evaluate') as evaluate:
-            with self.assertRaises(BrowserError):
-                BossBrowser().read_resume('test')
-            evaluate.assert_not_called()
 
 
 class JobSelectionTests(unittest.TestCase):

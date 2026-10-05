@@ -13,6 +13,9 @@ def target(ident='boss', url='https://www.zhipin.com/web/chat/index', kind='page
 
 class RuntimeAdapterTests(unittest.TestCase):
     def setUp(self):
+        self.ensure_patch = patch('bosshunter.recruiting.browser.ensure_runtime', return_value=True)
+        self.ensure_patch.start()
+        self.addCleanup(self.ensure_patch.stop)
         self.runtime = Mock(spec=RuntimeClient)
         self.runtime.health.return_value = {'runtime': 'bosshunter', 'connected': True}
         self.runtime.targets.return_value = [target('other', 'https://example.org'), target()]
@@ -62,6 +65,17 @@ class RuntimeAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(BrowserError, '仍在变化'): self.browser.open_conversation('bound')
         self.runtime.evaluate.assert_not_called()
         self.runtime.navigate.assert_not_called()
+
+    def test_read_contact_list(self):
+        self.runtime.evaluate.return_value = json.dumps({"contacts": [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+            {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
+        ]})
+        result = self.browser.read_contact_list()
+        self.assertEqual(result, [
+            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
+            {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
+        ])
 
     def test_actual_client_contract_uses_configured_builtin_runtime(self):
         calls = []

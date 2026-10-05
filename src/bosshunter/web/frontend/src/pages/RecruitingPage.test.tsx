@@ -4,7 +4,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import RecruitingPage from './RecruitingPage'
 import { Sidebar } from '../components/layout/Sidebar'
 const c = { id: 'sample', name: '测试候选人', position_id: 'p', updated_at: '2026-01-01', taken_over: 0, do_not_contact: 0, snapshot: { messages: [{ direction: 'out', kind: 'text', text: '你有电商经验吗？', time: '' }, { direction: 'in', kind: 'text', text: '有的，做过三年。', time: '' }], coverage: '当前已加载消息' } }
-const state = { positions: [{ id: 'p', title: '财务', jd: '电商财务经验', enabled: 1, version: 1 }], conversations: [c], documents: [], company: { text: '公司说明原文', version: 1, updated_at: null }, assessments: [], events: [], outbox: [], connection: { connected: false, message: '尚未检查浏览器连接' }, monitor: { running: false, error: '', last_success: null, interval_seconds: 120 }, model_ready: false }
+const state = { positions: [{ id: 'p', title: '财务', jd: '电商财务经验', enabled: 1, version: 1 }], conversations: [c], documents: [], company: { text: '公司说明原文', version: 1, updated_at: null }, assessments: [], events: [], outbox: [], connection: { connected: false, message: '尚未检查浏览器连接' }, monitor: { running: false, error: '', last_success: null, interval_seconds: 120 }, worker: { alive: true, monitor_enabled: false }, model_ready: false }
 function show(path: string) { render(<MemoryRouter initialEntries={[path]}><Sidebar /><Routes><Route path="/recruiting" element={<RecruitingPage />} /><Route path="/recruiting/:section" element={<RecruitingPage />} /><Route path="/recruiting/candidates/:id" element={<RecruitingPage />} /></Routes></MemoryRouter>) }
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 const seed = (value = state) => vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(value))))

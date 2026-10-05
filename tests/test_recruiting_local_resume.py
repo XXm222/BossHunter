@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 from urllib.parse import urlencode
+import os
 import unittest
 import httpx
 from pypdf import PdfWriter
@@ -68,7 +69,9 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaises(BrowserError) as e: LocalBossSession.extract_pdf(content)
             self.assertNotIn('secret', str(e.exception))
         writer = PdfWriter(); writer.add_blank_page(width=600, height=800); out = BytesIO(); writer.write(out)
-        with self.assertRaises(BrowserError): LocalBossSession.extract_pdf(out.getvalue())
+        # 未安装 OCR 依赖时，扫描版 PDF 应明确报错（不静默）；已装则走 OCR 兜底
+        with patch('bosshunter.recruiting.local_session._ocr_available', return_value=False):
+            with self.assertRaises(BrowserError): LocalBossSession.extract_pdf(out.getvalue())
 
     def test_service_replaces_partial_extraction_only_after_success(self):
         with TemporaryDirectory() as folder:
@@ -99,6 +102,30 @@ class ResumeTests(unittest.TestCase):
             self.read(session)
         self.assertEqual(len(calls), 1)
         self.assertNotIn('secret', str(error.exception))
+
+
+class ChromeUserDataDirTests(unittest.TestCase):
+    """默认 Chrome 用户数据目录按操作系统分支，换机器时 Cookie 读取不失效。"""
+
+    def _default(self):
+        from bosshunter.recruiting.local_session import _default_chrome_user_data_dir
+        return _default_chrome_user_data_dir()
+
+    def test_macos(self):
+        with patch('sys.platform', 'darwin'):
+            self.assertEqual(self._default(), Path.home() / 'Library/Application Support/Google/Chrome')
+
+    def test_windows_uses_localappdata(self):
+        with patch('sys.platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': '/tmp/AppData/Local'}):
+            self.assertEqual(self._default(), Path('/tmp/AppData/Local') / 'Google/Chrome/User Data')
+
+    def test_windows_falls_back_to_home_appdata(self):
+        with patch('sys.platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': ''}):
+            self.assertEqual(self._default(), Path.home() / 'AppData/Local/Google/Chrome/User Data')
+
+    def test_linux(self):
+        with patch('sys.platform', 'linux'):
+            self.assertEqual(self._default(), Path.home() / '.config/google-chrome')
 
 
 if __name__ == '__main__': unittest.main()

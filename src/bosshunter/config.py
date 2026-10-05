@@ -207,6 +207,18 @@ DEFAULTS: dict[str, Any] = {
         "auto_start_proxy": True,
         "enable_port_guard": True,
         "site_patterns": True,
+        "recruiting_user_data_dir": "",
+    },
+    "recruiting": {
+        "read_delay_min": 20.0,
+        "read_delay_max": 40.0,
+        "read_page_delay": 3.0,
+        "read_daily_limit": 50,
+        "greet_delay_min": 30.0,
+        "greet_delay_max": 60.0,
+        "greet_per_job_min": 1,
+        "greet_per_job_max": 2,
+        "auto_reply_daily_limit": 10,
     },
 }
 

@@ -8,15 +8,16 @@ import { CandidateWorkspace } from './CandidateWorkspace'
 import { GreetingConsole } from './GreetingConsole'
 import { RecruitingOverview } from './RecruitingOverview'
 import { PublishedJobs, PublishedJobsState } from './PublishedJobs'
+import { BindingWizard } from './BindingWizard'
 
 type Message = { direction: string; kind: string; text: string; time: string }
 type Position = { id: string; title: string; jd: string; enabled: number; version: number; source: string }
-type Conversation = { id: string; name: string; position_id: string; updated_at: string; taken_over: number; do_not_contact: number; snapshot: { messages: Message[]; coverage: string } }
+type Conversation = { id: string; name: string; position_id: string; updated_at: string; taken_over: number; do_not_contact: number; auto_send?: number; snapshot: { messages: Message[]; coverage: string } }
 type Resume = { id: string; conversation_id: string; text: string; complete: number; source: string; meta?: { page_count?: number; note?: string; filename?: string } }
 type Company = { text: string; version: number; updated_at: string | null }
 type Draft = { id: string; conversation_id: string; kind: string; content: string; status: string; result: string; refs: { source?: string; needs_human?: boolean; message_count?: number; basis?: string[]; missing?: string[] } }
 type Assessment = { id: string; conversation_id: string; result: { score: number | null; earned: number; assessed_weight: number; coverage: number; document_id: string; position_version: number; questions: string[]; components: Record<string, { score: number | null; reason: string; quotes: string[] }> } }
-export type State = { resume_processing?: Record<string, { status: string; message: string }>; recruiting_jobs?: PublishedJobsState; positions: Position[]; conversations: Conversation[]; documents: Resume[]; company?: Company; outbox: Draft[]; assessments: Assessment[]; events: { id: number; detail: string; kind: string; created_at: string }[]; connection: { connected: boolean; message: string }; monitor: { running: boolean; error: string; last_success: string | null; interval_seconds: number }; model_ready: boolean }
+export type State = { resume_processing?: Record<string, { status: string; message: string }>; recruiting_jobs?: PublishedJobsState; positions: Position[]; conversations: Conversation[]; documents: Resume[]; company?: Company; outbox: Draft[]; assessments: Assessment[]; events: { id: number; detail: string; kind: string; created_at: string }[]; connection: { connected: boolean; message: string }; monitor: { running: boolean; error: string; last_success: string | null; interval_seconds: number }; discovery?: { running: boolean }; auto_send?: { daily_limit: number; sent_today: number }; worker?: { alive: boolean; monitor_enabled: boolean }; model_ready: boolean }
 export type Act = (operation: string, payload?: object, success?: string) => Promise<boolean>
 const EMPTY_COMPANY: Company = { text: '', version: 0, updated_at: null }
 const fmt = (value?: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未同步'
@@ -65,7 +66,8 @@ export default function RecruitingPage() {
       {section === 'positions' && data.recruiting_jobs && <PublishedJobs data={data.recruiting_jobs} act={act} busy={busy} />}
       {section === 'candidates' && <CandidateWorkspace data={data} id={id} act={act} busy={busy} />}
       {section === 'company' && <><PageHeading title="公司说明与岗位 JD" description="只维护这两份内容，Agent 回复时会直接结合使用。" /><CompanyForm company={data.company || EMPTY_COMPANY} act={act} busy={busy} />{data.positions.length ? data.positions.map(p => <PositionForm key={p.id} p={p} act={act} busy={busy} />) : <div className="rc-panel rc-muted">导入招聘会话后，在这里填写该岗位 JD。</div>}</>}
-      {section === 'discover' && <GreetingConsole data={data} />}
+      {section === 'binding' && <BindingWizard data={data} act={act} busy={busy} />}
+      {section === 'discover' && <GreetingConsole data={data} act={act} busy={busy} />}
       {section === 'monitor' && <><PageHeading title="运行记录" description="查看监测状态、回复结果和需要人工处理的异常。" /><Monitor data={data} act={act} busy={busy} /><Drafts drafts={data.outbox} act={act} busy={busy} /><section className="rc-panel"><h3>最近操作</h3>{data.events.map(e => <div className="rc-event" key={e.id}><time>{fmt(e.created_at)}</time><span>{e.detail || e.kind}</span></div>)}</section></>}
       {!['overview', 'positions', 'discover', 'candidates'].includes(section) && <p className="rc-footnote">当前为单候选人试运行 · 回复先核对再发送 · 面试邀约禁止发送</p>}
     </>}

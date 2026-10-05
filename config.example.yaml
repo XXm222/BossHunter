@@ -157,3 +157,22 @@ browser:
   auto_start_proxy: true
   enable_port_guard: true
   site_patterns: true
+  # 招聘端后台 Cookie 读取与自动化浏览器共用的 Chrome 用户数据目录。
+  # 用独立 Chrome（--user-data-dir="$HOME/boss-chrome"）时填该目录（如 "~/boss-chrome"），
+  # 留空则用 macOS 默认配置目录（~/Library/Application Support/Google/Chrome/Default）。
+  recruiting_user_data_dir: ""
+
+# 招聘端节流与自动外发配置（默认较保守以降低风控/封号风险；真机确认安全后再放宽）
+recruiting:
+  # 后台 HTTP 读取节流（同步消息/岗位/联系人/额度）
+  read_delay_min: 20        # 每次读取间隔（秒）下限
+  read_delay_max: 40        # 上限
+  read_daily_limit: 50      # 单日后台请求上限
+  read_page_delay: 3        # 分页读取时每页间隔（秒）
+  # 主动打招呼循环节流
+  greet_delay_min: 30       # 每个招呼动作间隔（秒）下限
+  greet_delay_max: 60       # 上限
+  greet_per_job_min: 1      # 每岗位每轮最少招呼数
+  greet_per_job_max: 2      # 最多招呼数
+  # 自动回复
+  auto_reply_daily_limit: 10  # 每日自动回复上限

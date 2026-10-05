@@ -318,5 +318,34 @@ def web(ctx: click.Context, port: int, no_open: bool) -> None:
     run_server(host="127.0.0.1", port=port, open_browser=not no_open)
 
 
+@cli.command(name="recruiting-worker")
+@click.pass_context
+def recruiting_worker(ctx: click.Context) -> None:
+    """独立进程运行招聘端回复监测（需先启动 Chrome 并完成配置）"""
+    import signal
+    import threading
+
+    from bosshunter.recruiting.service import RecruitingService
+
+    base_dir = ctx.obj["base_dir"]
+    config = ctx.obj["config"]
+    data_dir = Path(base_dir) / "data"
+
+    service = RecruitingService(data_dir / "recruiting.db", lambda: config)
+
+    stop = threading.Event()
+
+    def handle(signum, frame):
+        stop.set()
+
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+
+    console.print("[bold cyan]招聘端独立监测进程已启动[/bold cyan]")
+    console.print(f"[dim]数据目录：{data_dir}[/dim]")
+    console.print("[dim]回复监测开关在 App 界面「开启/停止」，本进程按 Ctrl+C 退出[/dim]")
+    service.worker_loop(stop)
+
+
 if __name__ == "__main__":
     cli()

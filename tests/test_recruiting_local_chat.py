@@ -97,4 +97,14 @@ class LocalChatTests(unittest.TestCase):
             self.assertFalse(service.connection['connected'])
 
 
+    def test_daily_request_limit_stops_background_reads(self):
+        import time
+        # MockTransport 让节流间隔为 0，但每日上限仍生效
+        session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(lambda r: httpx.Response(200, json={'code': 0})))
+        session._request_day = time.strftime('%Y-%m-%d')
+        session._request_count = 10000  # 远超单日上限
+        with self.assertRaises(BrowserError):
+            session._wait()
+
+
 if __name__ == '__main__': unittest.main()

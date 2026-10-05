@@ -48,6 +48,14 @@ bosshunter web --port 8686
 bosshunter web --no-open
 ```
 
+## 招聘端独立监测
+
+```bash
+bosshunter recruiting-worker        # 独立进程运行招聘端回复监测
+```
+
+该命令加载配置与招聘数据库，持续轮询「消息与简历监测」开关（由 App 界面控制）并执行回复监测；App 关闭后仍持续运行，用 `Ctrl+C` 退出。
+
 如需查看当前版本的完整参数，以本地帮助为准：
 
 ```bash

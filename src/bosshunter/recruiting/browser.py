@@ -8,6 +8,7 @@ import json
 import time
 from urllib.parse import urlsplit
 from bosshunter.browser.client import RuntimeClient
+from bosshunter.browser.runtime import ensure_runtime
 from .policy import check_reply
 
 
@@ -40,6 +41,16 @@ if(!snapshot.id || !snapshot.position_title) throw Error('无法核实会话或�
 """
 
 
+READ_CONTACT_LIST = r"""
+const contacts = [...document.querySelectorAll('.geek-item')].map(item => {
+    const ident = item.getAttribute('data-id') || '';
+    const name = (item.querySelector('.geek-name')?.innerText || item.querySelector('.geek-name')?.getAttribute('title') || '').trim();
+    const position_title = (item.querySelector('.source-job')?.innerText || item.querySelector('.source-job')?.getAttribute('title') || '').trim();
+    return {ident, name, position_title};
+}).filter(c => c.ident && c.name);
+"""
+
+
 class BossBrowser:
     def __init__(self, runtime=None, target_id=None):
         self.runtime = runtime or RuntimeClient()
@@ -58,6 +69,7 @@ class BossBrowser:
             return False
 
     def bound_target(self):
+        ensure_runtime()  # 确保原项目 Node Browser Runtime 已启动（发送消息走它）
         health = self.runtime.health()
         if not isinstance(health, dict) or health.get("runtime") != "bosshunter":
             raise BrowserError("BossHunter Browser Runtime 未连接，请检查原项目浏览器服务及 Chrome 调试连接")
@@ -105,18 +117,10 @@ class BossBrowser:
             raise BrowserError("当前会话仍在变化，请核对后重试；未执行发送")
         return snapshot
 
-    def discover(self):
-        """Read exactly one recommendation card, no contact or scrolling."""
-        return self.evaluate(r"""
-            if(location.hostname!=='www.zhipin.com'||location.pathname!=='/web/chat/recommend') throw Error('请先在招聘端打开推荐牛人并选择岗位');
-            const f=[...document.querySelectorAll('iframe')].find(e=>new URL(e.src,location.href).pathname==='/web/frame/recommend/');
-            const d=f?.contentDocument;
-            const button=[...d?.querySelectorAll('.btn-greet')||[]].find(e=>e.getClientRects().length);
-            const card=button?.closest('li') || button?.closest('.geek-card');
-            if(!card) throw Error('推荐卡片结构未适配，已停止读取');
-            return JSON.stringify({text:card.innerText.slice(0,5000),source:'推荐页当前首张卡片',
-                complete:false,contact_enabled:false,reason:'候选人身份尚未通过跨刷新验证，暂不自动开聊'});
-        """)
+    def read_contact_list(self):
+        """读取聊天页左侧联系人列表（含岗位名）；只读，不点选、不导航、不发消息。"""
+        value = self.evaluate(READ_CONTACT_LIST + "return JSON.stringify({contacts});")
+        return value.get("contacts") if isinstance(value, dict) else []
 
     def read_position(self, expected_title):
         return self.evaluate(r"""
@@ -128,9 +132,6 @@ class BossBrowser:
             if(title!==EXPECTED || !jd) throw Error('当前平台岗位与绑定会话不一致，已停止读取');
             return JSON.stringify({title,jd,source:'boss_job_form'});
         """.replace("EXPECTED", json.dumps(expected_title, ensure_ascii=False)))
-
-    def read_resume(self, ident):
-        raise BrowserError("附件简历请使用本地登录状态后台读取，不再操作页面预览器")
 
     def execute(self, kind, before, content=""):
         if kind == "invitation":

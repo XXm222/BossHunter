@@ -35,6 +35,7 @@ class Store:
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, position_id TEXT NOT NULL,
                 snapshot TEXT NOT NULL, context_hash TEXT NOT NULL,
                 taken_over INTEGER NOT NULL DEFAULT 0, do_not_contact INTEGER NOT NULL DEFAULT 0,
+                auto_send INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS documents (
@@ -67,6 +68,9 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            cols = [r[1] for r in db.execute("PRAGMA table_info(conversations)").fetchall()]
+            if 'auto_send' not in cols:
+                db.execute("ALTER TABLE conversations ADD COLUMN auto_send INTEGER NOT NULL DEFAULT 0")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -126,14 +130,16 @@ class Store:
 
     def import_conversation(self, snapshot):
         ident = snapshot["id"]
-        pin = self.setting("pilot_conversation")
-        if pin and pin != ident:
-            raise ValueError("最小样本限制：已绑定一个会话，请勿导入其他候选人")
         if not snapshot.get("position_title") or not ident:
             raise ValueError("缺少会话标识或沟通职位")
         with self.db() as db:
             old = db.execute("SELECT position_id FROM conversations WHERE id=?", (ident,)).fetchone()
-            pid = old[0] if old else "context-" + fingerprint([ident, snapshot["position_title"]])[:16]
+            if old:
+                pid = old[0]
+            else:
+                # 同名岗位共享一条 position：按 title 查已存在的，避免每个会话各建一条
+                existing = db.execute("SELECT id FROM positions WHERE title=?", (snapshot["position_title"],)).fetchone()
+                pid = existing[0] if existing else "context-" + fingerprint([snapshot["position_title"]])[:16]
             pos = db.execute("SELECT title FROM positions WHERE id=?", (pid,)).fetchone()
             if pos and pos[0] != snapshot["position_title"]:
                 raise ValueError("会话关联职位已变化，请先人工核对")
@@ -146,8 +152,16 @@ class Store:
                 snapshot=excluded.snapshot,context_hash=excluded.context_hash,updated_at=excluded.updated_at""",
                        (ident, snapshot["name"], pid, encode(snapshot), context_hash, now()))
             db.execute("UPDATE outbox SET status='expired',updated_at=? WHERE conversation_id=? AND context_hash<>? AND status='draft'", (now(), ident, context_hash))
-            db.execute("INSERT OR REPLACE INTO settings VALUES ('pilot_conversation',?)", (encode(ident),))
+            # 首个导入的会话自动设为当前（保持向后兼容）；后续导入不改变当前，由 select_conversation 显式切换
+            if not db.execute("SELECT 1 FROM settings WHERE key='pilot_conversation'").fetchone():
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('pilot_conversation',?)", (encode(ident),))
         return self.row("conversations", ident)
+
+    def select_conversation(self, cid):
+        """切换当前选中的会话（回复/评分/读简历等操作都针对它）。"""
+        self.row("conversations", cid)  # 校验会话存在
+        self.set_setting("pilot_conversation", cid)
+        return self.row("conversations", cid)
 
     def save_document(self, cid, source, text, complete, meta):
         self.row("conversations", cid)
@@ -184,10 +198,6 @@ class Store:
                 raise ValueError("动作已处理或结果待核实，不能重复执行")
             if row["kind"] == "invitation":
                 raise ValueError("本次测试禁止发送面试邀约（执行层锁定）")
-            # One externally effective attempt for each action type in this pilot.
-            attempts = db.execute("SELECT count(*) FROM outbox WHERE kind=? AND status IN ('sending','sent','uncertain')", (row["kind"],)).fetchone()[0]
-            if attempts:
-                raise ValueError("该动作已达到最小样本测试上限：1 次；不会再次外发")
             db.execute("UPDATE outbox SET status='sending',updated_at=? WHERE id=?", (now(), ident))
             return dict(row)
 
