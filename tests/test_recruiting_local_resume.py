@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 from urllib.parse import urlencode
+import os
 import unittest
 import httpx
 from pypdf import PdfWriter
@@ -101,6 +102,30 @@ class ResumeTests(unittest.TestCase):
             self.read(session)
         self.assertEqual(len(calls), 1)
         self.assertNotIn('secret', str(error.exception))
+
+
+class ChromeUserDataDirTests(unittest.TestCase):
+    """默认 Chrome 用户数据目录按操作系统分支，换机器时 Cookie 读取不失效。"""
+
+    def _default(self):
+        from bosshunter.recruiting.local_session import _default_chrome_user_data_dir
+        return _default_chrome_user_data_dir()
+
+    def test_macos(self):
+        with patch('sys.platform', 'darwin'):
+            self.assertEqual(self._default(), Path.home() / 'Library/Application Support/Google/Chrome')
+
+    def test_windows_uses_localappdata(self):
+        with patch('sys.platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': '/tmp/AppData/Local'}):
+            self.assertEqual(self._default(), Path('/tmp/AppData/Local') / 'Google/Chrome/User Data')
+
+    def test_windows_falls_back_to_home_appdata(self):
+        with patch('sys.platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': ''}):
+            self.assertEqual(self._default(), Path.home() / 'AppData/Local/Google/Chrome/User Data')
+
+    def test_linux(self):
+        with patch('sys.platform', 'linux'):
+            self.assertEqual(self._default(), Path.home() / '.config/google-chrome')
 
 
 if __name__ == '__main__': unittest.main()

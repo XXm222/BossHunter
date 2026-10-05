@@ -5,7 +5,7 @@ import { RecruitIcon } from '../components/recruiting/RecruitIcon'
 import type { Act, State } from './RecruitingPage'
 import './greeting-console.css'
 
-export type GreetingAttempt = { id: number; job_id: string; candidate_id: string; status: string; created_at: string }
+export type GreetingAttempt = { id: number; job_id: string; candidate_id: string; name?: string; status: string; created_at: string }
 const filters = [{ id: 'all', label: '全部' }, { id: 'sent', label: '已招呼' }, { id: 'skipped', label: '已跳过' }, { id: 'review', label: '待核实' }]
 const statusLabel = (status: string) => ({ sent: '已确认招呼', skipped: '已跳过', uncertain: '结果待核实', sending: '结果待核实', failed: '发送失败' }[status] || '状态待核实')
 const matches = (status: string, filter: string) => filter === 'all' || (filter === 'review' ? !['sent', 'skipped'].includes(status) : status === filter)
@@ -25,7 +25,7 @@ export function GreetingConsole({ data, act, busy = false }: { data: State; act?
   const jobMap = new Map(jobs?.jobs.map(job => [job.id, job]))
   // Only use an exact conversation ID match; names or row order cannot identify a person.
   const conversations = new Map(data.conversations.map(c => [c.id, c]))
-  const candidateName = (record: GreetingAttempt) => conversations.get(record.candidate_id)?.name || '候选人资料未关联'
+  const candidateName = (record: GreetingAttempt) => record.name || conversations.get(record.candidate_id)?.name || '候选人资料未关联'
   const jobTitle = (record: GreetingAttempt) => jobMap.get(record.job_id)?.title || '岗位资料未关联'
   const visible = attempts.filter(record => matches(record.status, filter) && `${candidateName(record)} ${jobTitle(record)}`.toLowerCase().includes(query.trim().toLowerCase()))
   const pages = Math.max(1, Math.ceil(visible.length / 6))
@@ -60,7 +60,7 @@ export function GreetingConsole({ data, act, busy = false }: { data: State; act?
       <div className="gc-pagination"><span>共 {visible.length} 条记录</span><div><button className="rd-button" aria-label="上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={14} /></button><span>{currentPage} / {pages}</span><button className="rd-button" aria-label="下一页" disabled={currentPage >= pages} onClick={() => setPage(currentPage + 1)}><ChevronRight size={14} /></button></div></div>
     </section>
 
-    <aside className="rd-panel gc-detail" aria-label="触达详情"><h3>为什么联系这位候选人</h3>{current ? <><div className="gc-person"><span className="rd-person-avatar">{conversation?.name.slice(0, 1) || '?'}</span><div><strong>{candidateName(current)}</strong><p>{jobTitle(current)}</p></div></div><div className="gc-evidence"><Info size={17} /><p>这条历史记录未保存联系依据，无法还原当时的匹配判断。</p></div><p className="rd-small">完整简历和评分请在已关联的候选人沟通中查看。</p><div className="gc-result"><h4>执行结果</h4><span className={`rd-badge ${current.status === 'sent' ? 'gc-good' : 'amber'}`}>{statusLabel(current.status)}</span><p>时间：{time(current.created_at)}</p>{current.status !== 'sent' && current.status !== 'skipped' && <p>请先核实平台结果，避免重复联系。</p>}</div>{conversation ? <Link className="rd-button rd-wide" to={`/recruiting/candidates/${encodeURIComponent(conversation.id)}`}><RecruitIcon name="chat" size={21} />进入候选人沟通 <ChevronRight size={14} /></Link> : <p className="rd-small">尚未关联会话，不能直接进入该候选人的沟通。</p>}</> : <div className="gc-detail-empty"><RecruitIcon name="resume" size={46} /><strong>选一条记录，查看触达详情</strong><p>核对联系结果和岗位，再进入候选人沟通，连续查看对话、简历与评估。</p><span>没有已记录的依据时，不生成推测结论。</span><Link className="rd-button" to="/recruiting/candidates"><RecruitIcon name="chat" size={20} />打开候选人沟通 <ChevronRight size={14} /></Link></div>}</aside></div>
+    <aside className="rd-panel gc-detail" aria-label="触达详情"><h3>为什么联系这位候选人</h3>{current ? <><div className="gc-person"><span className="rd-person-avatar">{(current.name || conversation?.name || '?').slice(0, 1)}</span><div><strong>{candidateName(current)}</strong><p>{jobTitle(current)}</p></div></div><div className="gc-evidence"><Info size={17} /><p>这条历史记录未保存联系依据，无法还原当时的匹配判断。</p></div><p className="rd-small">完整简历和评分请在已关联的候选人沟通中查看。</p><div className="gc-result"><h4>执行结果</h4><span className={`rd-badge ${current.status === 'sent' ? 'gc-good' : 'amber'}`}>{statusLabel(current.status)}</span><p>时间：{time(current.created_at)}</p>{current.status !== 'sent' && current.status !== 'skipped' && <p>请先核实平台结果，避免重复联系。</p>}</div>{conversation ? <Link className="rd-button rd-wide" to={`/recruiting/candidates/${encodeURIComponent(conversation.id)}`}><RecruitIcon name="chat" size={21} />进入候选人沟通 <ChevronRight size={14} /></Link> : <p className="rd-small">尚未关联会话，不能直接进入该候选人的沟通。</p>}</> : <div className="gc-detail-empty"><RecruitIcon name="resume" size={46} /><strong>选一条记录，查看触达详情</strong><p>核对联系结果和岗位，再进入候选人沟通，连续查看对话、简历与评估。</p><span>没有已记录的依据时，不生成推测结论。</span><Link className="rd-button" to="/recruiting/candidates"><RecruitIcon name="chat" size={20} />打开候选人沟通 <ChevronRight size={14} /></Link></div>}</aside></div>
     <section className="gc-readiness" id="greeting-readiness"><Info size={18} /><div><strong>{running ? '主动打招呼执行中' : ready ? '可开始主动打招呼' : '自动打招呼尚未就绪'}</strong><p>{blockers.join('；') || (running ? '循环已启动，按岗位依次处理，每个动作间隔随机 10–30 秒。' : '已选岗位和额度就绪，点击「开始执行」按额度持续招呼。')}</p></div><span><Ban size={15} />面试邀约发送已禁用</span></section>
   </>
 }

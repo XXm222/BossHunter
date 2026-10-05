@@ -32,6 +32,7 @@ data/
 *.db
 *.db-shm
 *.db-wal
+.star_hint_*
 
 # Node
 node_modules/

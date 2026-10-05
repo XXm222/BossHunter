@@ -9,12 +9,28 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, parse_qs
 from io import BytesIO
 from hashlib import sha256
+import os
 import re
+import sys
 import time
 import httpx
 from .browser import BrowserError
 import html
 from bosshunter.throttle import PageThrottle
+
+
+def _default_chrome_user_data_dir() -> Path:
+    """按当前操作系统返回 Chrome 用户数据目录（不含 Default 子目录）。
+
+    仅在未配置 browser.recruiting_user_data_dir 时用作默认值；Windows/Linux 的
+    Chrome 默认目录与 macOS 不同，这里显式分支，避免换机器后 Cookie 读取失效。
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/Google/Chrome"
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData/Local")
+        return Path(base) / "Google/Chrome/User Data"
+    return Path.home() / ".config/google-chrome"
 
 
 class LocalBossSession:
@@ -186,27 +202,24 @@ class LocalBossSession:
                 raise BrowserError('简历页数超过读取范围，请人工核对')
             pages = []
             for index, page in enumerate(reader.pages, 1):
-                value = (page.extract_text() or '').strip()
-                pages.append({'page': index, 'text': value})
-                # 没有文字层时（扫描版简历）尝试 OCR 兜底；失败或未安装则抛错。
-                ocr_used = False
-                if not any(page['text'] for page in pages):
-                    _ocr_pdf_or_raise(content, pages)
-                    ocr_used = True
-
-                text = '\n\n'.join(
-                    f"第 {page['page']} / {count} 页\n{page['text'] or '（本页没有可提取文字，需核对图片或扫描内容）'}" for
-                    page in pages)
-                if len(text) > 100000:
-                    raise BrowserError('简历文字超过读取上限，保留原记录，不能静默截断')
-
-                empty = [page['page'] for page in pages if not page['text']]
-                if ocr_used:
-                    note = f'已通过 OCR 识别 PDF 全部 {count} 页；识别结果与文字顺序需人工核对。'
-                else:
-                    note = f'已读取 PDF 全部 {count} 页的文字层；图片、表格及文字顺序仍需核对。'
-                if empty:
-                    note += ' 第 ' + '、'.join(map(str, empty)) + ' 页没有可提取文字。'
+                pages.append({'page': index, 'text': (page.extract_text() or '').strip()})
+            # 没有文字层时（扫描版简历）尝试 OCR 兜底；失败或未安装则抛错。
+            ocr_used = False
+            if not any(page['text'] for page in pages):
+                _ocr_pdf_or_raise(content, pages)
+                ocr_used = True
+            text = '\n\n'.join(
+                f"第 {page['page']} / {count} 页\n{page['text'] or '（本页没有可提取文字，需核对图片或扫描内容）'}" for
+                page in pages)
+            if len(text) > 100000:
+                raise BrowserError('简历文字超过读取上限，保留原记录，不能静默截断')
+            empty = [page['page'] for page in pages if not page['text']]
+            if ocr_used:
+                note = f'已通过 OCR 识别 PDF 全部 {count} 页；识别结果与文字顺序需人工核对。'
+            else:
+                note = f'已读取 PDF 全部 {count} 页的文字层；图片、表格及文字顺序仍需核对。'
+            if empty:
+                note += ' 第 ' + '、'.join(map(str, empty)) + ' 页没有可提取文字。'
             return {'source': 'boss_attachment_pdf_http', 'text': text, 'complete': False,
                     'meta': {'page_count': count, 'pages': [p['page'] for p in pages],
                              'page_characters': [len(p['text']) for p in pages], 'empty_pages': empty,
@@ -261,14 +274,14 @@ class LocalBossSession:
         if self._user_data_dir:
             root = Path(self._user_data_dir).expanduser() / 'Default'
         else:
-            root = Path.home() / 'Library/Application Support/Google/Chrome/Default'
+            root = _default_chrome_user_data_dir() / 'Default'
         cookie_file = next((p for p in [root / 'Cookies', root / 'Network/Cookies'] if p.is_file()), None)
         if cookie_file is None:
             raise BrowserError('未找到 Chrome 的 BOSS 登录 Cookie；独立 Chrome 请配置 browser.recruiting_user_data_dir')
         try:
             raw = browser_cookie3.chrome(cookie_file=str(cookie_file), domain_name='.zhipin.com')
         except Exception:
-            raise BrowserError('无法读取 Chrome 中的 BOSS 登录状态，请检查钥匙串访问权限') from None
+            raise BrowserError('无法读取 Chrome 中的 BOSS 登录状态，请检查系统凭证访问权限或关闭 Chrome 后重试') from None
         scoped = CookieJar()
         for cookie in raw:
             if cookie.domain.lstrip('.') in {'zhipin.com', 'www.zhipin.com'} and not cookie.is_expired():

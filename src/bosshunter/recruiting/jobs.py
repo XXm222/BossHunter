@@ -25,9 +25,13 @@ class RecruitingJobs:
                 CREATE TABLE IF NOT EXISTS greeting_attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL,
                     job_id TEXT NOT NULL, candidate_id TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL, created_at TEXT NOT NULL
                 );
             ''')
+            cols = [r[1] for r in db.execute("PRAGMA table_info(greeting_attempts)").fetchall()]
+            if 'name' not in cols:
+                db.execute("ALTER TABLE greeting_attempts ADD COLUMN name TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE greeting_attempts SET status='uncertain' WHERE status='sending'")
 
     def config(self):
@@ -93,14 +97,15 @@ class RecruitingJobs:
         self.store.event('jobs_selected', '', f'人工选择 {len(identifiers)} 个岗位；未勾选岗位不进入自动任务')
         return self.state()
 
-    def record_greeting(self, job_id, candidate_id, status):
+    def record_greeting(self, job_id, candidate_id, status, name=""):
         """记录一次主动招呼（候选人在推荐页已点「打招呼」）。candidate_id 用推荐卡
-        的 data-geekid，job_id 用 'boss-<jobid>' 与 published_jobs.id 对齐。"""
+        的 data-geekid，job_id 用 'boss-<jobid>' 与 published_jobs.id 对齐。name 为
+        推荐卡读到的候选人姓名，仅用于触达记录展示，不参与身份匹配或去重。"""
         if status not in {'sent', 'uncertain'}:
             raise ValueError('招呼状态必须是 sent 或 uncertain')
         with self.store.db() as db:
-            db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, status, created_at) VALUES (?,?,?,?,?)',
-                       (day_key(), job_id, candidate_id, status, now()))
+            db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, name, status, created_at) VALUES (?,?,?,?,?,?)',
+                       (day_key(), job_id, candidate_id, name, status, now()))
         self.store.event('greeting_recorded', candidate_id, f'岗位 {job_id} 招呼记录：{status}')
         return self.state()
 
@@ -109,7 +114,7 @@ class RecruitingJobs:
         with self.store.db() as db:
             jobs = [dict(r) for r in db.execute("SELECT * FROM published_jobs ORDER BY CASE status WHEN '开放中' THEN 0 ELSE 1 END,title")]
             counts = dict(db.execute('SELECT status,count(*) FROM greeting_attempts WHERE day=? GROUP BY status', (day,)).fetchall())
-            attempts = [dict(r) for r in db.execute('SELECT id,job_id,candidate_id,status,created_at FROM greeting_attempts WHERE day=? ORDER BY id DESC', (day,))]
+            attempts = [dict(r) for r in db.execute('SELECT id,job_id,candidate_id,name,status,created_at FROM greeting_attempts WHERE day=? ORDER BY id DESC', (day,))]
             unresolved = db.execute("SELECT count(*) FROM greeting_attempts WHERE status IN ('sending','uncertain')").fetchone()[0]
         for job in jobs:
             job['details'] = json.loads(job['details'])

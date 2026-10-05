@@ -251,6 +251,12 @@ class RunDiscoveryTests(unittest.TestCase):
         self.assertEqual(verifier.selected_jobs, ["job1"])
         self.assertEqual(verifier.greeted, ["geek1"])
 
+    def test_run_discovery_records_candidate_name(self):
+        verifier = FakeDiscoveryVerifier([{"name": "张三", "uid": "geek1", "greetable": True}])
+        service = self._service(verifier)
+        service.run_discovery(per_job_min=1, per_job_max=1, throttle_delay=(0, 0))
+        self.assertEqual(service.jobs.state()["attempts"][0]["name"], "张三")
+
     def test_run_discovery_skips_duplicate(self):
         verifier = FakeDiscoveryVerifier([{"name": "A", "uid": "geek1", "greetable": True}])
         service = self._service(verifier)
@@ -266,6 +272,11 @@ class RunDiscoveryTests(unittest.TestCase):
         service.jobs.save_budget("custom", 100)
         with self.assertRaisesRegex(ValueError, "开放岗位"):
             service.run_discovery(per_job_min=1, per_job_max=1, throttle_delay=(0, 0))
+
+    def test_run_discovery_rejects_invalid_per_job_range(self):
+        service = self._service(FakeDiscoveryVerifier([]))
+        with self.assertRaisesRegex(ValueError, "招呼"):
+            service.run_discovery(per_job_min=3, per_job_max=1, throttle_delay=(0, 0))
 
     def test_run_discovery_stops_when_requested(self):
         verifier = FakeDiscoveryVerifier([{"name": "A", "uid": "geek1", "greetable": True}])

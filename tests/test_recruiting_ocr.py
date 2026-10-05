@@ -143,6 +143,19 @@ class ExtractPdfOcrTests(unittest.TestCase):
                 LocalBossSession.extract_pdf(blank_pdf())  # 1 页，OCR 却返回 2 页
         self.assertIn('页数不一致', str(ctx.exception))
 
+    def test_multi_page_scanned_pdf_is_ocrd(self):
+        """多页扫描件应一次性 OCR 全部页，而不是在首个空页就误判页数不一致。"""
+        with patch('bosshunter.recruiting.local_session._ocr_available', return_value=True), \
+             patch('bosshunter.recruiting.local_session._ocr_pdf_pages', return_value=['第一页识别', '第二页识别']):
+            result = LocalBossSession.extract_pdf(blank_pdf(2))
+
+        self.assertEqual(result['meta']['page_count'], 2)
+        self.assertIn('第一页识别', result['text'])
+        self.assertIn('第二页识别', result['text'])
+        self.assertEqual(result['meta']['empty_pages'], [])
+        self.assertEqual(result['meta']['page_characters'], [len('第一页识别'), len('第二页识别')])
+        self.assertIn('已通过 OCR 识别', result['meta']['note'])
+
 
 if __name__ == '__main__':
     unittest.main()

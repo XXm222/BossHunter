@@ -167,7 +167,7 @@ class RecruitingService:
         with self.store.db() as db:
             return bool(db.execute("SELECT 1 FROM greeting_attempts WHERE candidate_id=?", (uid,)).fetchone())
 
-    def greet_discovered(self, uid):
+    def greet_discovered(self, uid, name=""):
         """对已通过跨刷新验证的候选人点「打招呼」（BOSS 自动发默认招呼语）。"""
         if self._is_duplicate(uid):
             raise ValueError("该候选人已打过招呼，跳过")
@@ -180,7 +180,7 @@ class RecruitingService:
             raise ValueError("未读取到推荐页当前岗位")
         stored_job_id = "boss-" + job_id
         status = "sent" if result.get("sent") else "uncertain"
-        self.jobs.record_greeting(stored_job_id, uid, status)
+        self.jobs.record_greeting(stored_job_id, uid, status, name)
         return {**result, "status": status, "job_id": stored_job_id}
 
     def _quota_exhausted_now(self):
@@ -196,6 +196,8 @@ class RecruitingService:
         per_job_min = per_job_min if per_job_min is not None else cfg.get("greet_per_job_min", 1)
         per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 2)
         throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 30.0), cfg.get("greet_delay_max", 60.0))
+        if not isinstance(per_job_min, int) or not isinstance(per_job_max, int) or not 1 <= per_job_min <= per_job_max:
+            raise ValueError("每岗位招呼数需为整数且满足 1 ≤ 下限 ≤ 上限")
         state = self.jobs.state()
         if state['blockers']:
             raise ValueError('；'.join(state['blockers']))
@@ -229,7 +231,7 @@ class RecruitingService:
                     break
                 if not cand.get('greetable') or self._is_duplicate(cand['uid']):
                     continue
-                result = self.greet_discovered(cand['uid'])
+                result = self.greet_discovered(cand['uid'], cand.get('name') or '')
                 if result.get('sent'):
                     greeted += 1
                     done += 1
@@ -694,9 +696,11 @@ class RecruitingService:
                     if time.time() - last_run >= self.monitor['interval_seconds']:
                         try:
                             self.monitor_once()
-                            last_run = time.time()
                         except Exception as exc:
                             self.store.event('monitor_paused', '', str(exc)[:250])
+                        finally:
+                            # 失败也推进 last_run：持续出错时仍按 interval 重试，而不是每 10 秒紧循环。
+                            last_run = time.time()
                 stop_event.wait(10)  # 每 10 秒轮询一次标志 + 心跳
         finally:
             self.store.event('worker_stopped', '', '独立监测进程已停止')
