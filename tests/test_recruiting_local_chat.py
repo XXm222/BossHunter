@@ -104,7 +104,7 @@ class LocalChatTests(unittest.TestCase):
         session._request_day = time.strftime('%Y-%m-%d')
         session._request_count = 10000  # 远超单日上限
         with self.assertRaises(BrowserError):
-            session._wait()
+            session._count('conversation')
 
 
 if __name__ == '__main__': unittest.main()

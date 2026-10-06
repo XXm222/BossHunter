@@ -103,6 +103,54 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn('secret', str(error.exception))
 
+    def test_verification_raises_account_pause(self):
+        # B：账号验证应抛 AccountPauseError（暂停等人工），而不是普通 BrowserError（自动重试）
+        from bosshunter.recruiting.browser import AccountPauseError
+        session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(
+            lambda r: httpx.Response(302, headers={'Location': '/web/passport/zp/verify.html'})))
+        with self.assertRaises(AccountPauseError):
+            self.read(session)
+
+    def test_stop_event_halts_pagination(self):
+        # 问题 9：第一页返回后请求停止，第二页请求不应发出
+        import threading
+        calls = []
+        stop = threading.Event()
+
+        def handle(request):
+            calls.append(request)
+            page = int(request.url.params.get('page', '1'))
+            if page == 1:
+                stop.set()
+            msg = {'mid': page, 'time': 1700000000000 + page,
+                   'from': {'uid': 123, 'name': '测试候选人', 'source': 0}, 'to': {'uid': 456},
+                   'body': {'type': 1, 'text': f'消息{page}'}}
+            return httpx.Response(200, json={'code': 0, 'zpData': {'hasMore': page == 1, 'minMsgId': 10 - page, 'messages': [msg]}})
+
+        session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(handle), stop_event=stop)
+        with self.assertRaisesRegex(BrowserError, '停止'):
+            session.read_conversation('123-0', '测试候选人', '测试岗位')
+        self.assertEqual(len(calls), 1)
+
+    def test_request_counter_counts_every_page(self):
+        # A：分页的每一页 HTTP 请求都应计数（入口 + 每页），不能只在方法入口计一次
+        calls = []
+        kinds = []
+
+        def handle(request):
+            calls.append(request)
+            page = int(request.url.params.get('page', '1'))
+            msg = {'mid': page, 'time': 1700000000000 + page,
+                   'from': {'uid': 123, 'name': '测试候选人', 'source': 0}, 'to': {'uid': 456},
+                   'body': {'type': 1, 'text': f'消息{page}'}}
+            return httpx.Response(200, json={'code': 0, 'zpData': {'hasMore': page == 1, 'minMsgId': 10 - page, 'messages': [msg]}})
+
+        session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(handle), page_delay=0,
+                                   request_counter=lambda kind: kinds.append(kind))
+        session.read_conversation('123-0', '测试候选人', '测试岗位')
+        self.assertEqual(kinds, ['conversation', 'conversation'])
+        self.assertEqual(len(calls), 2)
+
 
 class ChromeUserDataDirTests(unittest.TestCase):
     """默认 Chrome 用户数据目录按操作系统分支，换机器时 Cookie 读取不失效。"""

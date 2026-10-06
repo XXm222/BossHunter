@@ -14,7 +14,7 @@ import re
 import sys
 import time
 import httpx
-from .browser import BrowserError
+from .browser import AccountPauseError, BrowserError
 import html
 from bosshunter.throttle import PageThrottle
 
@@ -35,7 +35,8 @@ def _default_chrome_user_data_dir() -> Path:
 
 class LocalBossSession:
     def __init__(self, cookie_loader=None, transport=None, throttle=None, user_data_dir=None,
-                 read_delay=(20.0, 40.0), daily_limit=50, page_delay=3.0, stop_event=None):
+                 read_delay=(20.0, 40.0), daily_limit=50, page_delay=3.0, stop_event=None,
+                 request_counter=None):
         self._user_data_dir = user_data_dir
         self.cookie_loader = cookie_loader or self.load_cookies
         self.transport = transport
@@ -44,6 +45,7 @@ class LocalBossSession:
         self._daily_limit = daily_limit
         self._page_delay = page_delay
         self._stop_event = stop_event
+        self._request_counter = request_counter
         # 后台读取节流：真实网络下每个操作间隔 read_delay 秒降低风控；测试用 MockTransport 时不加延迟
         if throttle is not None:
             self.throttle = throttle
@@ -58,12 +60,16 @@ class LocalBossSession:
 
     def _interruptible_sleep(self, seconds):
         if self._stop_event is not None:
-            self._stop_event.wait(seconds)
+            if self._stop_event.wait(seconds):
+                raise BrowserError("已请求停止，中断当前等待")
         else:
             time.sleep(seconds)
 
-    def _wait(self):
-        """节流：单日上限 + 操作间隔；达到单日上限则当天停止后台读取。"""
+    def _count(self, kind):
+        """计数一次后台 HTTP 请求；超限抛异常。request_counter 非 None 时走 DB 计数，否则内存兜底。"""
+        if self._request_counter is not None:
+            self._request_counter(kind)
+            return
         today = time.strftime('%Y-%m-%d')
         if self._request_day != today:
             self._request_day = today
@@ -71,7 +77,11 @@ class LocalBossSession:
         if self._request_count >= self._daily_limit:
             raise BrowserError(f'后台请求达到单日上限 {self._daily_limit} 次，请明日再试')
         self._request_count += 1
-        self.throttle.wait(self._stop_event)
+
+    def _wait(self):
+        """节流等待（不计数）；收到停止信号时抛 BrowserError。"""
+        if self.throttle.wait(self._stop_event):
+            raise BrowserError("已请求停止，中断当前操作")
 
     def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False):
         """Read one already-bound conversation. Never mark read or operate a tab.
@@ -92,17 +102,18 @@ class LocalBossSession:
                           timeout=20, follow_redirects=False,
                           headers={'Referer': 'https://www.zhipin.com/web/chat/index'}) as client:
             for page in range(1, 11):
+                self._count('conversation')
                 try:
                     response = client.get('https://www.zhipin.com/wapi/zpchat/boss/historyMsg',
                                           params={'src': int(source), 'gid': gid, 'maxMsgId': cursor, 'c': 20, 'page': page})
                     if response.is_redirect and urlparse(response.headers.get('location', '')).path == '/web/passport/zp/verify.html':
-                        raise BrowserError('BOSS 要求账号验证，请在现有 Chrome 招聘端页面完成验证后重新读取；已有记录已保留')
+                        raise AccountPauseError('BOSS 要求账号验证，请在现有 Chrome 招聘端页面完成验证后重新读取；已有记录已保留')
                     response.raise_for_status()
                     body = response.json()
                 except (httpx.HTTPError, ValueError):
                     raise BrowserError('后台会话读取未完成；保留原记录，不自动重试') from None
                 if not isinstance(body, dict) or body.get('code') != 0:
-                    raise BrowserError('BOSS 未接受会话读取请求，请核实登录状态；未操作标签页')
+                    raise AccountPauseError('BOSS 未接受会话读取请求，请核实登录状态；未操作标签页')
                 data = body.get('zpData')
                 if not isinstance(data, dict) or not isinstance(data.get('messages'), list) or type(data.get('hasMore')) is not bool:
                     raise BrowserError('会话数据结构变化，保留原记录')
@@ -115,10 +126,10 @@ class LocalBossSession:
                     incoming = str(sender.get('uid')) == gid
                     outgoing = str(receiver.get('uid')) == gid
                     if incoming == outgoing:
-                        raise BrowserError('消息不属于绑定候选人，停止同步')
+                        raise AccountPauseError('消息不属于绑定候选人，停止同步')
                     peer, employer = (sender, receiver) if incoming else (receiver, sender)
                     if str(peer.get('source')) != source or not employer.get('uid'):
-                        raise BrowserError('消息来源或招聘账号身份不一致，停止同步')
+                        raise AccountPauseError('消息来源或招聘账号身份不一致，停止同步')
                     account_ids.add(str(employer['uid']))
                     if peer.get('name'):
                         names.add(peer['name'])
@@ -149,10 +160,10 @@ class LocalBossSession:
             else:
                 raise BrowserError('单会话超过最小样本读取上限，保留原记录')
         if not messages or len(account_ids) != 1 or names != {name}:
-            raise BrowserError('候选人或招聘账号未能准确核实，保留原记录')
+            raise AccountPauseError('候选人或招聘账号未能准确核实，保留原记录')
         account = next(iter(account_ids))
         if expected_account and account != expected_account:
-            raise BrowserError('当前登录招聘账号与绑定会话不一致，停止同步')
+            raise AccountPauseError('当前登录招聘账号与绑定会话不一致，停止同步')
         messages.sort(key=lambda m: (m['timestamp'], int(m['id'])))
         result = {'id': ident, 'name': name, 'position_title': position_title, 'messages': messages,
                 'account_uid': account, 'editor_empty': False, 'stable_message_ids': True,
@@ -179,6 +190,7 @@ class LocalBossSession:
         limit = 20 * 1024 * 1024
         content = bytearray()
         self._wait()
+        self._count('resume')
         try:
             with httpx.Client(cookies=self.cookie_loader(), transport=self.transport, trust_env=False,
                               timeout=30, follow_redirects=False,
@@ -291,13 +303,13 @@ class LocalBossSession:
         try:
             raw = browser_cookie3.chrome(cookie_file=str(cookie_file), domain_name='.zhipin.com')
         except Exception:
-            raise BrowserError('无法读取 Chrome 中的 BOSS 登录状态，请检查系统凭证访问权限或关闭 Chrome 后重试') from None
+            raise AccountPauseError('无法读取 Chrome 中的 BOSS 登录状态，请检查系统凭证访问权限或关闭 Chrome 后重试') from None
         scoped = CookieJar()
         for cookie in raw:
             if cookie.domain.lstrip('.') in {'zhipin.com', 'www.zhipin.com'} and not cookie.is_expired():
                 scoped.set_cookie(cookie)
         if not any(c.name in {'wt2', 'zp_at'} for c in scoped):
-            raise BrowserError('本地未找到有效期内的 BOSS 登录 Cookie，请在 Chrome 中登录招聘端')
+            raise AccountPauseError('本地未找到有效期内的 BOSS 登录 Cookie，请在 Chrome 中登录招聘端')
         return scoped
 
     def read_jobs(self):
@@ -309,6 +321,7 @@ class LocalBossSession:
                           headers={'Referer': 'https://www.zhipin.com/web/chat/job/list'}) as client:
             jobs, seen, total = [], set(), None
             for page in range(1, 101):
+                self._count('jobs')
                 try:
                     response = client.get('https://www.zhipin.com/wapi/zpjob/job/data/list',
                                           params={'page': page, 'pageSize': 20})
@@ -317,7 +330,7 @@ class LocalBossSession:
                 except (httpx.HTTPError, ValueError):
                     raise BrowserError('后台岗位读取未完成；保留已有岗位，不自动重试或操作标签页') from None
                 if not isinstance(body, dict) or body.get('code') != 0:
-                    raise BrowserError('BOSS 未接受本地登录状态或需要验证，请在 Chrome 中核实；没有操作标签页')
+                    raise AccountPauseError('BOSS 未接受本地登录状态或需要验证，请在 Chrome 中核实；没有操作标签页')
                 data = body.get('zpData')
                 if not isinstance(data, dict) or not isinstance(data.get('data'), list):
                     raise BrowserError('平台岗位数据结构变化，停止本次同步')
@@ -349,10 +362,12 @@ class LocalBossSession:
     def read_greeting_quota(self):
         """读取招聘账号今日剩余打招呼权益（主动沟通额度）。
 
-        返回 {'limit': 总限额, 'used': 已用, 'remaining': 剩余}；
-        无限制（limitCount 为 -1）或结构异常时 limit/remaining 为 None。
+        返回 {'limit': 总限额, 'used': 已用, 'remaining': 剩余, 'unlimited': 是否不限}；
+        无限制（limitCount 为 -1）时 remaining/limit 为 None 且 unlimited=True；
+        limit/used 不是可信整数时抛 BrowserError（不能当作不限继续）。
         """
         self._wait()
+        self._count('quota')
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,
@@ -365,7 +380,7 @@ class LocalBossSession:
             except (httpx.HTTPError, ValueError):
                 raise BrowserError('后台额度读取未完成；保留原记录，不自动重试') from None
         if not isinstance(body, dict) or body.get('code') != 0:
-            raise BrowserError('BOSS 未接受额度读取请求，请核实登录状态；未操作标签页')
+            raise AccountPauseError('BOSS 未接受额度读取请求，请核实登录状态；未操作标签页')
         data = body.get('zpData')
         if not isinstance(data, dict):
             raise BrowserError('额度数据结构变化，停止本次同步')
@@ -379,9 +394,13 @@ class LocalBossSession:
         limit = bar.get('limitCount')
         used = bar.get('usedCount')
         if isinstance(limit, int) and isinstance(used, int) and limit >= 0:
-            return {'limit': limit, 'used': used, 'remaining': max(0, limit - used)}
-        # 无限制（limitCount 为 -1）或字段异常：无可用额度上限
-        return {'limit': None, 'used': used if isinstance(used, int) else 0, 'remaining': None}
+            return {'limit': limit, 'used': used, 'remaining': max(0, limit - used), 'unlimited': False}
+        if limit == -1:
+            # 平台明确表示不限（limitCount 为 -1）
+            return {'limit': None, 'used': used if isinstance(used, int) else 0,
+                    'remaining': None, 'unlimited': True}
+        # limit/used 不是可信整数：额度未知，不能当作不限继续
+        raise BrowserError('平台额度字段不可信，无法确定剩余额度，停止本次读取')
 
 
 # 渲染分辨率（DPI）：中文简历识别精度与耗时/内存之间的平衡点；需要更高精度可调到 300，但会更慢、更占内存。

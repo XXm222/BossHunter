@@ -127,12 +127,42 @@ class RecommendVerifier:
                 continue
         raise BrowserError("未找到可连接的 Chrome 调试端口，请确认 Chrome 已用调试端口启动")
 
-    @staticmethod
-    def _recommend_page(context):
-        for page in context.pages:
-            if page.url and page.url.startswith(RECOMMEND_URL_PREFIX):
-                return page
-        raise BrowserError("请先在 Chrome 打开 BOSS 牛人推荐页（/web/chat/recommend）")
+    def _bound_target_id(self):
+        config = self.config_provider() or {}
+        browser = config.get("browser", {}) if isinstance(config, dict) else {}
+        return browser.get("recruiting_target_id") or None
+
+    def _cdp_page_targets(self):
+        """通过 CDP /json/list 读取当前调试实例的所有 page target（含 id 与 url）。"""
+        cdp_url = self._find_cdp_url()
+        try:
+            response = httpx.get(f"{cdp_url}/json/list", timeout=2, trust_env=False)
+            response.raise_for_status()
+            return [t for t in response.json() if isinstance(t, dict) and t.get("type") == "page"]
+        except (httpx.HTTPError, ValueError):
+            return []
+
+    def _recommend_page(self, context):
+        """确定唯一要操作的推荐页：优先用绑定的 recruiting_target_id，否则要求唯一。
+
+        多窗口/多推荐页/多账号时不再「取第一个」，避免连错页面；目标失效或出现
+        多个可选页面就停止，不自动换另一页。
+        """
+        pages = [p for p in context.pages if p.url and p.url.startswith(RECOMMEND_URL_PREFIX)]
+        target_id = self._bound_target_id()
+        if target_id:
+            target = next((t for t in self._cdp_page_targets() if t.get("id") == target_id), None)
+            if not target or not str(target.get("url", "")).startswith(RECOMMEND_URL_PREFIX):
+                raise BrowserError("绑定的招聘标签页不是推荐页或已关闭，停止操作；不会切换到其他标签页")
+            page = next((p for p in context.pages if p.url == target["url"]), None)
+            if not page:
+                raise BrowserError("绑定的推荐页当前不可用，请刷新后重试；不会切换到其他标签页")
+            return page
+        if len(pages) == 1:
+            return pages[0]
+        if not pages:
+            raise BrowserError("请先在 Chrome 打开 BOSS 牛人推荐页（/web/chat/recommend）")
+        raise BrowserError("发现多个推荐页，无法唯一确定；请关闭多余页面或配置 browser.recruiting_target_id")
 
     @staticmethod
     def _recommend_frame(page):
@@ -151,19 +181,21 @@ class RecommendVerifier:
         return None
 
     def _wait_greet_text(self, frame, uid):
+        """等待按钮文案明确变为「继续沟通」，才视为发送成功。"""
         deadline = time.time() + self._wait_timeout
         while time.time() < deadline:
             text = frame.evaluate(READ_GREET_TEXT.replace("__UID__", json.dumps(uid)))
-            if isinstance(text, str) and bool(text) and "打招呼" not in text:
+            if isinstance(text, str) and "继续沟通" in text:
                 return text
             time.sleep(0.5)
         return frame.evaluate(READ_GREET_TEXT.replace("__UID__", json.dumps(uid)))
 
-    def greet(self, uid):
+    def greet(self, uid, expected_job_id=None):
         """对已通过跨刷新验证的候选人点「打招呼」，BOSS 自动发默认招呼语。
 
         返回 {sent, job_id, reason}。先读 jobid（读不到就不点，避免发了却无法记录），
-        再定位该 geekid 的卡片点击按钮，最后确认按钮文案不再是「打招呼」。
+        若传了 expected_job_id 则点击前核对其与页面当前岗位一致（不一致就不点，避免
+        误点错误岗位的候选人），再点击，最后确认按钮文案明确变为「继续沟通」。
         """
         cdp_url = self._find_cdp_url()
         pw = None
@@ -178,13 +210,15 @@ class RecommendVerifier:
             job_id = self._job_id_from_frame(frame)
             if not job_id:
                 raise BrowserError("推荐页未选择岗位，无法记录招呼；请先在下拉框选择岗位")
+            if expected_job_id and str(job_id) != str(expected_job_id):
+                raise BrowserError("推荐页当前岗位与任务岗位不一致，已停止招呼")
             state = frame.evaluate(CLICK_GREET.replace("__UID__", json.dumps(uid)))
             if state == "missing":
                 raise BrowserError("未找到该候选人的卡片，页面可能已刷新，请重新验证")
             if state == "already":
                 return {"sent": True, "job_id": job_id, "reason": "该候选人已打过招呼（按钮已不是「打招呼」）"}
             text = self._wait_greet_text(frame, uid)
-            sent = isinstance(text, str) and bool(text) and "打招呼" not in text
+            sent = isinstance(text, str) and "继续沟通" in text
             return {"sent": sent, "job_id": job_id,
                     "reason": "已发出招呼，按钮变为「继续沟通」" if sent else "点击后未确认按钮变化，结果待核实"}
         finally:

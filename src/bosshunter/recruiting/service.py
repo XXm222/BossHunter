@@ -8,13 +8,17 @@ from threading import Event, RLock, Thread
 from uuid import uuid4
 
 from . import agent
-from .browser import BossBrowser, BrowserError
+from .browser import AccountPauseError, BossBrowser, BrowserError
 from .store import Store, encode, fingerprint, now
 from .policy import check_reply
 from .jobs import RecruitingJobs
 from .local_session import LocalBossSession
 from bosshunter.browser.client import RuntimeClient
 from bosshunter.throttle import PageThrottle
+
+# 平台额度缓存有效期（秒）：超过视为过期，主动打招呼循环里重新读取，以覆盖
+# 「人工直接在 BOSS 打招呼」导致平台剩余变化、本地缓存失真的情况。
+QUOTA_TTL_SECONDS = 300
 
 
 class RecruitingService:
@@ -29,12 +33,14 @@ class RecruitingService:
             user_data_dir=config_provider().get("browser", {}).get("recruiting_user_data_dir"),
             read_delay=(cfg.get("read_delay_min", 20.0), cfg.get("read_delay_max", 40.0)),
             daily_limit=cfg.get("read_daily_limit", 50),
-            page_delay=cfg.get("read_page_delay", 3.0))
+            page_delay=cfg.get("read_page_delay", 3.0),
+            request_counter=self._count_request)
         self.verifier = verifier
         self.use_local_session = browser is None or local_session is not None
         self.lock = RLock()
         self.discovery_worker = None
         self.discovery_stop = Event()
+        self._stop_event = None
         saved_monitor = self.store.setting('monitor_state', {})
         self.monitor = {"running": False, "last_success": saved_monitor.get('last_success'),
                         "error": saved_monitor.get('error') or "", "interval_seconds": 120,
@@ -45,6 +51,13 @@ class RecruitingService:
     def _recruiting_cfg(self):
         config = self.config_provider() or {}
         return config.get("recruiting") or {}
+
+    def _count_request(self, kind):
+        """LocalBossSession 每次后台请求前的计数回调：按账号存 DB，超限抛 BrowserError。"""
+        try:
+            self.store.count_request(kind, self._recruiting_cfg().get("read_daily_limit", 50))
+        except ValueError as exc:
+            raise BrowserError(str(exc)) from None
 
     def state(self):
         s = self.store
@@ -65,8 +78,18 @@ class RecruitingService:
         jobs_state["running"] = discovery_running
         worker_alive = self._worker_alive()
         monitor_enabled = bool(s.setting('monitor_enabled', False))
-        monitor_state = self.monitor.copy()
-        monitor_state["running"] = worker_alive and monitor_enabled
+        # 读 DB 里的 monitor_state：worker 独立进程写入的最新成功时间/错误，本进程内存不会自动刷新
+        saved_monitor = s.setting('monitor_state', {})
+        monitor_state = {
+            "running": worker_alive and monitor_enabled,
+            "paused": worker_alive and not monitor_enabled,
+            "disconnected": not worker_alive,
+            "last_success": saved_monitor.get('last_success'),
+            "error": saved_monitor.get('error') or "",
+            "interval_seconds": self.monitor['interval_seconds'],
+            "mode": self.monitor['mode'],
+            "note": self.monitor['note'],
+        }
         return {"positions": s.rows("positions"), "conversations": conversations,
                 "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
@@ -156,9 +179,16 @@ class RecruitingService:
     def read_greeting_quota(self):
         """读取今日剩余打招呼额度并缓存，返回结果。"""
         quota = self.local_session.read_greeting_quota()
-        self.store.set_setting('greeting_quota', {**quota, 'updated_at': now()})
-        remaining = quota['remaining']
-        self.store.event('greeting_quota_read', '', f"今日打招呼额度：剩余 {remaining if remaining is not None else '不限'}")
+        daily = self.jobs.state()['daily']
+        # 记录日期和读取时的本地发送数，供 state() 计算「读取之后新增的发送占用」。
+        self.store.set_setting('greeting_quota', {**quota, 'date': daily['date'],
+                                                  'updated_at': now(), 'local_used_at_read': daily['attempted']})
+        if quota.get('unlimited'):
+            label = '不限'
+        else:
+            remaining = quota.get('remaining')
+            label = remaining if remaining is not None else '未知'
+        self.store.event('greeting_quota_read', '', f"今日打招呼额度：剩余 {label}")
         return quota
 
     def _is_duplicate(self, uid):
@@ -167,27 +197,86 @@ class RecruitingService:
         with self.store.db() as db:
             return bool(db.execute("SELECT 1 FROM greeting_attempts WHERE candidate_id=?", (uid,)).fetchone())
 
-    def greet_discovered(self, uid, name=""):
-        """对已通过跨刷新验证的候选人点「打招呼」（BOSS 自动发默认招呼语）。"""
+    def _check_greeting_allowed(self, job_id=None):
+        """校验主动打招呼前置条件：岗位已勾选开放、额度可用、无待核实招呼。
+
+        job_id 为预期的平台岗位 ID（encryptJobId，不带 boss- 前缀）；传 None 时
+        只做全局检查。单次招呼（discover/greet）与后台循环（run_discovery）共用，
+        避免绕过勾选/额度/待核实检查。
+        """
+        state = self.jobs.state()
+        if state['blockers']:
+            raise ValueError('；'.join(state['blockers']))
+        if job_id:
+            stored = "boss-" + str(job_id)
+            job = next((j for j in state['jobs'] if j['id'] == stored), None)
+            if not job:
+                raise ValueError('岗位不在已同步列表，请先同步岗位')
+            if not job['selected']:
+                raise ValueError('该岗位未人工勾选，不能主动招呼')
+            if job['status'] != '开放中':
+                raise ValueError('该岗位当前不是开放中，不能主动招呼')
+
+    def greet_discovered(self, uid, name="", job_id=None):
+        """对已通过跨刷新验证的候选人点「打招呼」（BOSS 自动发默认招呼语）。
+
+        job_id 为预期的平台岗位 ID；点击前先记录 sending 占用，点击后能确认成功改
+        sent，报错或回执不明确保留 uncertain，核实前不会重试或继续联系下一人。
+        """
         if self._is_duplicate(uid):
             raise ValueError("该候选人已打过招呼，跳过")
+        self._check_greeting_allowed(job_id)
+        reserved = False
+        if job_id:
+            self.jobs.reserve_greeting("boss-" + str(job_id), uid, name)
+            reserved = True
         if self.verifier is None:
             from .recommend import RecommendVerifier
             self.verifier = RecommendVerifier(self.config_provider)
-        result = self.verifier.greet(uid)
-        job_id = result.get("job_id")
-        if not job_id:
+        try:
+            result = self.verifier.greet(uid, job_id)
+        except Exception:
+            # 点击后异常：结果不确定，保留 uncertain 并暂停，不自动重试
+            if reserved:
+                self.jobs.finish_greeting(uid, 'uncertain')
+            raise
+        actual_job_id = result.get("job_id")
+        if not actual_job_id:
+            if reserved:
+                self.jobs.finish_greeting(uid, 'uncertain')
             raise ValueError("未读取到推荐页当前岗位")
-        stored_job_id = "boss-" + job_id
+        if job_id and str(actual_job_id) != str(job_id):
+            self.jobs.finish_greeting(uid, 'uncertain')
+            raise ValueError("推荐页当前岗位与任务岗位不一致，已停止招呼")
+        stored_job_id = "boss-" + str(actual_job_id)
         status = "sent" if result.get("sent") else "uncertain"
-        self.jobs.record_greeting(stored_job_id, uid, status, name)
+        if reserved:
+            self.jobs.finish_greeting(uid, status)
+        else:
+            self.jobs.record_greeting(stored_job_id, uid, status, name)
         return {**result, "status": status, "job_id": stored_job_id}
+
+    def _quota_stale(self):
+        """平台额度缓存是否过期（跨日或超过 TTL），需重新读取。"""
+        from .jobs import day_key
+        quota = self.store.setting('greeting_quota', {})
+        if quota.get('date') != day_key():
+            return True
+        updated_at = quota.get('updated_at')
+        if not updated_at:
+            return True
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds()
+            return age > QUOTA_TTL_SECONDS
+        except (ValueError, TypeError):
+            return True
 
     def _quota_exhausted_now(self):
         daily = self.jobs.state()['daily']
         config = self.jobs.config()
-        if config['mode'] == 'custom':
-            return daily['custom_remaining'] is not None and daily['custom_remaining'] <= 0
+        if config['mode'] == 'custom' and daily['custom_remaining'] is not None and daily['custom_remaining'] <= 0:
+            return True
+        # 自定义额度也受已知平台剩余额度约束，不能只看本地上限
         return daily['platform_remaining'] is not None and daily['platform_remaining'] <= 0
 
     def run_discovery(self, per_job_min=None, per_job_max=None, throttle_delay=None):
@@ -198,25 +287,35 @@ class RecruitingService:
         throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 30.0), cfg.get("greet_delay_max", 60.0))
         if not isinstance(per_job_min, int) or not isinstance(per_job_max, int) or not 1 <= per_job_min <= per_job_max:
             raise ValueError("每岗位招呼数需为整数且满足 1 ≤ 下限 ≤ 上限")
+        config = self.jobs.config()
+        if config['mode'] == 'platform':
+            # 先读平台额度，再检查 blockers，否则「未读取额度」会先于读取把任务拦住
+            try:
+                self.read_greeting_quota()
+            except BrowserError as exc:
+                raise ValueError(f"无法读取平台剩余额度，停止执行：{exc}")
         state = self.jobs.state()
         if state['blockers']:
             raise ValueError('；'.join(state['blockers']))
         selected = [j for j in state['jobs'] if j['selected'] and j['status'] == '开放中' and j['platform_id']]
         if not selected:
             raise ValueError('没有可处理的开放岗位')
-        config = self.jobs.config()
-        if config['mode'] == 'platform':
-            try:
-                self.read_greeting_quota()
-            except BrowserError as exc:
-                raise ValueError(f"无法读取平台剩余额度，停止执行：{exc}")
         if self.verifier is None:
             from .recommend import RecommendVerifier
             self.verifier = RecommendVerifier(self.config_provider)
         throttle = PageThrottle(delay_min=throttle_delay[0], delay_max=throttle_delay[1])
         greeted = 0
         for job in selected:
-            if self.discovery_stop.is_set() or self._quota_exhausted_now():
+            if self.discovery_stop.is_set():
+                break
+            if config['mode'] == 'platform' and self._quota_stale():
+                # 额度缓存过期（可能人工打了招呼）：重新读平台额度，覆盖人工打招呼导致的失真
+                try:
+                    self.read_greeting_quota()
+                except BrowserError as exc:
+                    self.store.event('discovery_error', job['platform_id'], str(exc))
+                    break
+            if self._quota_exhausted_now():
                 break
             try:
                 self.verifier.select_job(job['platform_id'])
@@ -231,7 +330,7 @@ class RecruitingService:
                     break
                 if not cand.get('greetable') or self._is_duplicate(cand['uid']):
                     continue
-                result = self.greet_discovered(cand['uid'], cand.get('name') or '')
+                result = self.greet_discovered(cand['uid'], cand.get('name') or '', job['platform_id'])
                 if result.get('sent'):
                     greeted += 1
                     done += 1
@@ -242,7 +341,12 @@ class RecruitingService:
                 'reason': '主动打招呼已手动停止' if stopped else f'本轮主动招呼 {greeted} 次'}
 
     def start_discovery(self, per_job_min=None, per_job_max=None):
-        """后台启动「按额度持续主动打招呼」循环；立即返回，循环在线程内运行。"""
+        """后台启动「按额度持续主动打招呼」循环；立即返回，循环在线程内运行。
+
+        每轮 run_discovery 结束后，若额度未用完、未手动停止、且本轮有成功招呼，
+        继续下一轮；否则记录累计次数与停止原因并结束。无候选人或结果待核实时不
+        为用完额度而继续发送。
+        """
         if self.discovery_worker and self.discovery_worker.is_alive():
             return {'running': True, 'message': '主动打招呼循环已在运行'}
         state = self.jobs.state()
@@ -251,9 +355,20 @@ class RecruitingService:
         self.discovery_stop.clear()
 
         def run():
+            total = 0
             try:
-                result = self.run_discovery(per_job_min, per_job_max)
-                self.store.event('discovery_done', '', result['reason'])
+                while not self.discovery_stop.is_set():
+                    result = self.run_discovery(per_job_min, per_job_max)
+                    total += result.get('greeted', 0)
+                    if result.get('stopped'):
+                        self.store.event('discovery_done', '', f'主动打招呼已手动停止，累计 {total} 次')
+                        return
+                    if self._quota_exhausted_now():
+                        self.store.event('discovery_done', '', f'今日招呼额度已用完，累计 {total} 次')
+                        return
+                    if not result.get('greeted'):
+                        self.store.event('discovery_done', '', f'没有更多可招呼的候选人，累计 {total} 次')
+                        return
             except Exception as exc:
                 self.store.event('discovery_stopped', '', str(exc)[:300])
 
@@ -565,16 +680,17 @@ class RecruitingService:
             refs["source"] = "human_draft"
         else:
             with self.lock:
-                self.sync()
+                self.sync(cid)
                 context = self.reply_context(cid)
                 messages = context["conversation"]["messages"]
                 if not messages or messages[-1]["direction"] != "in":
                     raise ValueError("最新消息不是候选人发来的消息，请核对会话后处理")
                 if question and question != messages[-1]["text"]:
                     raise ValueError("问题与实际会话不一致，不使用脱离上下文的问题生成回复")
+                self._check_stopped()
                 result = agent.reply(context, self.config_provider())
                 # Human messages can change the live browser even while our queue is locked.
-                self.sync()
+                self.sync(cid)
                 fresh = self.reply_context(cid)
                 if self.reply_context_signature(fresh) != self.reply_context_signature(context):
                     raise ValueError("生成期间会话或资料发生变化，本次回复未保存，请基于新上下文重新生成")
@@ -644,6 +760,7 @@ class RecruitingService:
                     raise ValueError("知识已变更／过期，请重新生成回复")
             if refs.get("source") == "ai_draft" and refs.get("context_signature") != self.reply_context_signature(self.reply_context(c["id"])):
                 raise ValueError("回复依据已变化，请使用最新公司说明、JD、简历和会话重新生成")
+            self._check_stopped()
             before = self.browser.open_conversation(c["id"])
             updated = self.store.import_conversation(before)
             if updated["context_hash"] != draft["context_hash"] or not before["editor_empty"]:
@@ -685,9 +802,23 @@ class RecruitingService:
     def _write_heartbeat(self):
         self.store.set_setting('worker_heartbeat', now())
 
+    def _check_stopped(self):
+        """收到停止信号时抛异常，让当前自动任务统一退出（不再发请求/调模型/发送）。"""
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise BrowserError("已请求停止，中断当前任务")
+
+    def _check_monitor_enabled(self):
+        """worker 监测流程中检查「关闭监测」标志，及时退出当前任务而非只阻止下一轮。
+
+        仅 worker（设置了 stop_event）时检查；Web 的「手动检查一次」不受监测开关约束。
+        """
+        if self._stop_event is not None and not self.store.setting('monitor_enabled', True):
+            raise BrowserError("监测已停止，中断当前任务")
+
     def worker_loop(self, stop_event):
         """独立进程主循环：独立心跳线程 + 轮询 monitor_enabled 标志、定期跑 monitor_once。"""
         self.store.event('worker_started', '', '独立监测进程已启动')
+        self._stop_event = stop_event
         if hasattr(self.local_session, 'set_stop_event'):
             self.local_session.set_stop_event(stop_event)
 
@@ -702,14 +833,24 @@ class RecruitingService:
 
         Thread(target=heartbeat, daemon=True, name='recruiting-heartbeat').start()
         last_run = 0.0
+        consecutive_errors = 0
         try:
             while not stop_event.is_set():
                 if self.store.setting('monitor_enabled', False):
                     if time.time() - last_run >= self.monitor['interval_seconds']:
                         try:
                             self.monitor_once()
+                            consecutive_errors = 0
+                        except AccountPauseError as exc:
+                            # 验证码/登录失效/身份不一致：暂停等人工，不自动重试
+                            self.set_monitor_enabled(False)
+                            self.store.event('monitor_paused', '', f"已暂停，需人工处理：{exc}")
                         except Exception as exc:
+                            consecutive_errors += 1
                             self.store.event('monitor_paused', '', str(exc)[:250])
+                            if consecutive_errors >= 3:
+                                self.set_monitor_enabled(False)
+                                self.store.event('monitor_paused', '', f"连续失败 {consecutive_errors} 次，已暂停，请人工处理")
                         finally:
                             # 失败也推进 last_run：持续出错时仍按 interval 重试，而不是每 10 秒紧循环。
                             last_run = time.time()
@@ -765,15 +906,44 @@ class RecruitingService:
             self.store.event("auto_send_skipped", cid, str(exc))
             return False
 
+    def _allowed_conversations(self):
+        """返回允许自动处理的会话 id（非接管、非停止联系、岗位启用）。"""
+        allowed = []
+        for c in self.store.rows("conversations"):
+            if c["taken_over"] or c["do_not_contact"]:
+                continue
+            p = self.store.row("positions", c["position_id"])
+            if not p["enabled"]:
+                continue
+            allowed.append(c["id"])
+        return allowed
+
+    def _next_monitor_cid(self, allowed):
+        """按轮询游标从允许处理的会话里选下一个，分散到多轮而非每轮读全部。"""
+        cursor = self.store.setting("monitor_cursor")
+        if cursor and cursor in allowed:
+            return allowed[(allowed.index(cursor) + 1) % len(allowed)]
+        return allowed[0]
+
     def monitor_once(self):
-        cid = self.store.setting("pilot_conversation")
-        if not cid:
+        """轮询式监测：每轮只处理一个允许的会话（round-robin），而非每轮读全部。
+
+        候选人越多越不能每轮把所有历史各拉一遍；用 monitor_cursor 记录上次处理到
+        谁，下一轮处理下一个。人工接管/停止联系/岗位暂停的会话自动跳过。
+        """
+        allowed = self._allowed_conversations()
+        if not allowed:
             self._persist_monitor_state()
             return {"changed": False, "last_success": self.monitor["last_success"]}
+        cid = self._next_monitor_cid(allowed)
+        self._check_stopped()
+        self._check_monitor_enabled()
+        self.store.set_setting("monitor_cursor", cid)
         try:
             before = self.store.row("conversations", cid)
             after = self.sync(cid, process=True)
             if before["context_hash"] != after["context_hash"]:
+                self._check_monitor_enabled()
                 self.store.event("conversation_changed", cid, "会话发生变化，旧草稿已过期")
                 messages = json.loads(after["snapshot"])["messages"]
                 if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
@@ -782,6 +952,7 @@ class RecruitingService:
                         self._auto_send_if_allowed(draft)
                     except ValueError as exc:
                         self.store.event("reply_needs_attention", cid, str(exc))
-            return {"changed": before["context_hash"] != after["context_hash"], "last_success": self.monitor["last_success"]}
+            return {"changed": before["context_hash"] != after["context_hash"],
+                    "conversation_id": cid, "last_success": self.monitor["last_success"]}
         finally:
             self._persist_monitor_state()

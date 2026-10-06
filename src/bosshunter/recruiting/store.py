@@ -96,6 +96,35 @@ class Store:
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))
 
+    def request_budget(self):
+        """读取当日请求预算；跨日返回全新预算。"""
+        from zoneinfo import ZoneInfo
+        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        budget = self.setting('request_budget', {})
+        if budget.get('date') != day:
+            return {'date': day, 'count': 0, 'by_kind': {}}
+        return budget
+
+    def count_request(self, kind, daily_limit):
+        """计数一次后台 HTTP 请求；超限抛 ValueError。
+
+        计数存 DB（settings.request_budget），重启不重置、Web 与 worker 两进程共用；
+        并按 kind 记录每类请求的数量，便于看出会话/岗位/附件/额度各自占用。
+        """
+        from zoneinfo import ZoneInfo
+        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        with self.db() as db:
+            row = db.execute("SELECT value FROM settings WHERE key='request_budget'").fetchone()
+            budget = json.loads(row[0]) if row else {'date': day, 'count': 0, 'by_kind': {}}
+            if budget.get('date') != day:
+                budget = {'date': day, 'count': 0, 'by_kind': {}}
+            if budget['count'] >= daily_limit:
+                raise ValueError(f'后台请求达到单日上限 {daily_limit} 次，请明日再试')
+            budget['count'] += 1
+            budget['by_kind'][kind] = budget['by_kind'].get(kind, 0) + 1
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('request_budget', ?)", (encode(budget),))
+        return budget
+
     def event(self, kind, object_id="", detail=""):
         with self.db() as db:
             db.execute("INSERT INTO events(kind,object_id,detail,created_at) VALUES (?,?,?,?)",
@@ -137,9 +166,13 @@ class Store:
             if old:
                 pid = old[0]
             else:
-                # 同名岗位共享一条 position：按 title 查已存在的，避免每个会话各建一条
-                existing = db.execute("SELECT id FROM positions WHERE title=?", (snapshot["position_title"],)).fetchone()
-                pid = existing[0] if existing else "context-" + fingerprint([snapshot["position_title"]])[:16]
+                platform_id = snapshot.get("position_platform_id")
+                if platform_id:
+                    # 按平台岗位唯一 ID 关联，同名但不同职责/地点的岗位不会共用 JD
+                    pid = "boss-" + str(platform_id)
+                else:
+                    # 读不到平台岗位 ID：每个会话独立岗位，不按名称复用，避免同名岗位误共用
+                    pid = "context-" + fingerprint([ident])[:16]
             pos = db.execute("SELECT title FROM positions WHERE id=?", (pid,)).fetchone()
             if pos and pos[0] != snapshot["position_title"]:
                 raise ValueError("会话关联职位已变化，请先人工核对")

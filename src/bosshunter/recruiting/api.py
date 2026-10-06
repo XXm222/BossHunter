@@ -52,7 +52,7 @@ def register(app, data_dir, config, respond):
                 "binding/preview": lambda: s.preview_binding(payload["conversation_id"], payload["name"], payload["position_title"]),
                 "binding/confirm": lambda: s.confirm_binding(payload["conversation_id"], payload["name"], payload["position_title"], payload["expected_account"]),
                 "sync": lambda: s.sync(payload.get("conversation_id")),
-                "discover/greet": lambda: s.greet_discovered(payload["uid"]),
+                "discover/greet": lambda: s.greet_discovered(payload["uid"], payload.get("name", ""), payload["job_id"]),
                 "discover/run": lambda: s.start_discovery(),
                 "discover/stop": lambda: s.stop_discovery(),
                 "position": lambda: s.position(payload),

@@ -16,6 +16,11 @@ class BrowserError(RuntimeError):
     pass
 
 
+class AccountPauseError(BrowserError):
+    """账号需要人工处理（验证码、登录失效、身份不一致），应暂停自动任务而非自动重试。"""
+    pass
+
+
 READ_CHAT = r"""
 const selected = document.querySelector('.geek-item.selected');
 const editor = document.querySelector('#boss-chat-editor-input');
