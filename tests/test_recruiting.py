@@ -292,6 +292,12 @@ class RecruitingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             agent.validate_assessment(payload, "实际资料", True)
 
+    def test_quote_with_whitespace_difference_is_locatable(self):
+        # 模型常用空格拼 PDF 换行分隔的字段，空白差异应仍能定位；编造的证据仍拒绝
+        source = "诺亚创梦电子商务有限公司\n大模型应用开发\n2025.08-2026.06"
+        self.assertTrue(agent._quote_in_source("诺亚创梦电子商务有限公司 大模型应用开发 2025.08-2026.06", source))
+        self.assertFalse(agent._quote_in_source("编造的证据", source))
+
     def test_company_text_is_versioned_and_invalidates_ai_drafts(self):
         company = self.service.save_company("真实公司作息说明")
         self.assertEqual(company["version"], 1)
