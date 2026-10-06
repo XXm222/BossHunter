@@ -686,12 +686,24 @@ class RecruitingService:
         self.store.set_setting('worker_heartbeat', now())
 
     def worker_loop(self, stop_event):
-        """独立进程主循环：写心跳、轮询 monitor_enabled 标志、定期跑 monitor_once。"""
+        """独立进程主循环：独立心跳线程 + 轮询 monitor_enabled 标志、定期跑 monitor_once。"""
         self.store.event('worker_started', '', '独立监测进程已启动')
+        if hasattr(self.local_session, 'set_stop_event'):
+            self.local_session.set_stop_event(stop_event)
+
+        def heartbeat():
+            # monitor_once 会被节流睡眠阻塞 1–2 分钟以上，若只在主循环写心跳，
+            # 前端 30 秒阈值会把运行中的 worker 误判为已停止。独立线程保证心跳始终新鲜。
+            while not stop_event.wait(10):
+                try:
+                    self._write_heartbeat()
+                except Exception:
+                    pass  # 心跳失败不致命，下个周期重试
+
+        Thread(target=heartbeat, daemon=True, name='recruiting-heartbeat').start()
         last_run = 0.0
         try:
             while not stop_event.is_set():
-                self._write_heartbeat()
                 if self.store.setting('monitor_enabled', False):
                     if time.time() - last_run >= self.monitor['interval_seconds']:
                         try:
@@ -701,7 +713,7 @@ class RecruitingService:
                         finally:
                             # 失败也推进 last_run：持续出错时仍按 interval 重试，而不是每 10 秒紧循环。
                             last_run = time.time()
-                stop_event.wait(10)  # 每 10 秒轮询一次标志 + 心跳
+                stop_event.wait(10)  # 每 10 秒轮询一次 monitor_enabled 标志
         finally:
             self.store.event('worker_stopped', '', '独立监测进程已停止')
 

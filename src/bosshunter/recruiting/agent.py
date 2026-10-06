@@ -27,6 +27,16 @@ def require_model(config):
         raise ValueError("尚未配置评分模型，请在模型配置页填写接口和凭据；未调用模型、未生成模拟评分")
 
 
+def _quote_in_source(quote: str, source: str) -> bool:
+    """判断一条评分证据 quote 是否能在原文中定位，忽略空白差异。
+
+    简历 PDF 提取的字段之间是换行，模型常把多个字段用空格拼成一条 quote，
+    精确子串匹配会误杀，因此去掉所有空白后再做子串判断。
+    """
+    normalized = re.sub(r"\s+", "", quote)
+    return bool(normalized) and normalized in re.sub(r"\s+", "", source)
+
+
 def validate_assessment(payload, source, complete):
     components = payload.get("components")
     if not isinstance(components, dict) or set(components) != set(LIMITS):
@@ -38,7 +48,7 @@ def validate_assessment(payload, source, complete):
         if not isinstance(part, dict) or part.get("status") not in {"supported", "adjacent", "unknown", "mismatch"}:
             raise ValueError("评分状态不符合协议")
         quotes = part.get("quotes", [])
-        if not isinstance(quotes, list) or not all(isinstance(q, str) and q.strip() and q in source for q in quotes):
+        if not isinstance(quotes, list) or not all(isinstance(q, str) and q.strip() and _quote_in_source(q, source) for q in quotes):
             raise ValueError("评分证据无法在原始资料中定位")
         score = part.get("score")
         if part["status"] == "unknown":

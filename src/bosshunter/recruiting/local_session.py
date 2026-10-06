@@ -35,7 +35,7 @@ def _default_chrome_user_data_dir() -> Path:
 
 class LocalBossSession:
     def __init__(self, cookie_loader=None, transport=None, throttle=None, user_data_dir=None,
-                 read_delay=(20.0, 40.0), daily_limit=50, page_delay=3.0):
+                 read_delay=(20.0, 40.0), daily_limit=50, page_delay=3.0, stop_event=None):
         self._user_data_dir = user_data_dir
         self.cookie_loader = cookie_loader or self.load_cookies
         self.transport = transport
@@ -43,6 +43,7 @@ class LocalBossSession:
         self._request_count = 0
         self._daily_limit = daily_limit
         self._page_delay = page_delay
+        self._stop_event = stop_event
         # 后台读取节流：真实网络下每个操作间隔 read_delay 秒降低风控；测试用 MockTransport 时不加延迟
         if throttle is not None:
             self.throttle = throttle
@@ -50,6 +51,16 @@ class LocalBossSession:
             self.throttle = PageThrottle(delay_min=read_delay[0], delay_max=read_delay[1])
         else:
             self.throttle = PageThrottle(delay_min=0.0, delay_max=0.0)
+
+    def set_stop_event(self, stop_event):
+        """让节流睡眠在 worker 请求停止时及时中断，Ctrl+C 不必等完整节流周期。"""
+        self._stop_event = stop_event
+
+    def _interruptible_sleep(self, seconds):
+        if self._stop_event is not None:
+            self._stop_event.wait(seconds)
+        else:
+            time.sleep(seconds)
 
     def _wait(self):
         """节流：单日上限 + 操作间隔；达到单日上限则当天停止后台读取。"""
@@ -60,8 +71,7 @@ class LocalBossSession:
         if self._request_count >= self._daily_limit:
             raise BrowserError(f'后台请求达到单日上限 {self._daily_limit} 次，请明日再试')
         self._request_count += 1
-        throttle = self.throttle
-        throttle.wait()
+        self.throttle.wait(self._stop_event)
 
     def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False):
         """Read one already-bound conversation. Never mark read or operate a tab.
@@ -135,7 +145,7 @@ class LocalBossSession:
                 if not data['messages'] or type(next_cursor) is not int or next_cursor <= 0 or next_cursor == cursor:
                     raise BrowserError('消息分页游标异常，保留原记录')
                 cursor = next_cursor
-                time.sleep(self._page_delay)
+                self._interruptible_sleep(self._page_delay)
             else:
                 raise BrowserError('单会话超过最小样本读取上限，保留原记录')
         if not messages or len(account_ids) != 1 or names != {name}:
@@ -333,7 +343,7 @@ class LocalBossSession:
                     return {'jobs': jobs, 'total': total, 'complete': True}
                 if data.get('hasMore') is not True or not data['data'] or len(jobs) >= total:
                     raise BrowserError('平台分页信息不一致，本次不更新岗位范围')
-                time.sleep(self._page_delay)
+                self._interruptible_sleep(self._page_delay)
         raise BrowserError('岗位列表超出读取范围')
 
     def read_greeting_quota(self):
