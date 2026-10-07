@@ -125,18 +125,6 @@ class RecruitingJobs:
         self.store.event('jobs_selected', '', f'人工选择 {len(identifiers)} 个岗位；未勾选岗位不进入自动任务')
         return self.state()
 
-    def record_greeting(self, job_id, candidate_id, status, name=""):
-        """记录一次主动招呼（候选人在推荐页已点「打招呼」）。candidate_id 用推荐卡
-        的 data-geekid，job_id 用 'boss-<jobid>' 与 published_jobs.id 对齐。name 为
-        推荐卡读到的候选人姓名，仅用于触达记录展示，不参与身份匹配或去重。"""
-        if status not in {'sent', 'uncertain'}:
-            raise ValueError('招呼状态必须是 sent 或 uncertain')
-        with self.store.db() as db:
-            db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, name, status, created_at) VALUES (?,?,?,?,?,?)',
-                       (day_key(), job_id, candidate_id, name, status, now()))
-        self.store.event('greeting_recorded', candidate_id, f'岗位 {job_id} 招呼记录：{status}')
-        return self.state()
-
     def reserve_greeting(self, job_id, candidate_id, name=""):
         """点击前记录 sending 占用：同一事务里先检查额度与待核实，再占用候选人。
 

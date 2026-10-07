@@ -97,7 +97,7 @@ class RecruitingService:
                 "worker": {"alive": worker_alive, "monitor_enabled": monitor_enabled},
                 "discovery": {"running": discovery_running},
                 "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10)),
-                              "sent_today": self._reply_sent_today()},
+                              "sent_today": self._auto_reply_sent_today()},
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
                 "pilot": {"max_conversations": 20, "invitation_sending": False,
                           "conversation_id": s.setting("pilot_conversation"),
@@ -220,16 +220,15 @@ class RecruitingService:
     def greet_discovered(self, uid, name="", job_id=None):
         """对已通过跨刷新验证的候选人点「打招呼」（BOSS 自动发默认招呼语）。
 
-        job_id 为预期的平台岗位 ID；点击前先记录 sending 占用，点击后能确认成功改
-        sent，报错或回执不明确保留 uncertain，核实前不会重试或继续联系下一人。
+        job_id 为预期的平台岗位 ID（必填）。点击前先记录 sending 占用，点击后能确认
+        成功改 sent，报错或回执不明确保留 uncertain，核实前不会重试或继续联系下一人。
         """
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("缺少岗位 ID，无法核对岗位勾选与额度")
         if self._is_duplicate(uid):
             raise ValueError("该候选人已打过招呼，跳过")
         self._check_greeting_allowed(job_id)
-        reserved = False
-        if job_id:
-            self.jobs.reserve_greeting("boss-" + str(job_id), uid, name)
-            reserved = True
+        self.jobs.reserve_greeting("boss-" + job_id, uid, name)
         if self.verifier is None:
             from .recommend import RecommendVerifier
             self.verifier = RecommendVerifier(self.config_provider)
@@ -237,24 +236,18 @@ class RecruitingService:
             result = self.verifier.greet(uid, job_id)
         except Exception:
             # 点击后异常：结果不确定，保留 uncertain 并暂停，不自动重试
-            if reserved:
-                self.jobs.finish_greeting(uid, 'uncertain')
+            self.jobs.finish_greeting(uid, 'uncertain')
             raise
         actual_job_id = result.get("job_id")
         if not actual_job_id:
-            if reserved:
-                self.jobs.finish_greeting(uid, 'uncertain')
+            self.jobs.finish_greeting(uid, 'uncertain')
             raise ValueError("未读取到推荐页当前岗位")
-        if job_id and str(actual_job_id) != str(job_id):
+        if str(actual_job_id) != str(job_id):
             self.jobs.finish_greeting(uid, 'uncertain')
             raise ValueError("推荐页当前岗位与任务岗位不一致，已停止招呼")
-        stored_job_id = "boss-" + str(actual_job_id)
         status = "sent" if result.get("sent") else "uncertain"
-        if reserved:
-            self.jobs.finish_greeting(uid, status)
-        else:
-            self.jobs.record_greeting(stored_job_id, uid, status, name)
-        return {**result, "status": status, "job_id": stored_job_id}
+        self.jobs.finish_greeting(uid, status)
+        return {**result, "status": status, "job_id": "boss-" + str(actual_job_id)}
 
     def _quota_stale(self):
         """平台额度缓存是否过期（跨日或超过 TTL），需重新读取。"""
@@ -736,7 +729,8 @@ class RecruitingService:
                           "contact": contact, "note": str(payload.get("note", ""))[:140]})
         return self.store.draft(cid, "invitation", content, {"source": "local_draft", "send_allowed": False})
 
-    def execute(self, ident):
+    def execute(self, ident, auto=False):
+        """执行一条待发草稿；auto=True 表示由自动外发触发，受每日自动回复上限约束。"""
         with self.lock:
             draft = self.store.row("outbox", ident)
             if draft["kind"] == "invitation":
@@ -752,7 +746,7 @@ class RecruitingService:
             refs = json.loads(draft["refs"])
             if refs.get("needs_human") or refs.get("position_version") != p["version"]:
                 raise ValueError("草稿需要人工处理或岗位版本变化，请重新准备")
-            if draft["kind"] == "reply" and self._reply_quota_exhausted():
+            if auto and draft["kind"] == "reply" and self._reply_quota_exhausted():
                 raise ValueError("今日自动回复已达上限，请人工处理")
             for kid, version in refs.get("knowledge", {}).items():
                 fact = self.store.row("knowledge", kid)
@@ -762,10 +756,24 @@ class RecruitingService:
                 raise ValueError("回复依据已变化，请使用最新公司说明、JD、简历和会话重新生成")
             self._check_stopped()
             before = self.browser.open_conversation(c["id"])
-            updated = self.store.import_conversation(before)
-            if updated["context_hash"] != draft["context_hash"] or not before["editor_empty"]:
-                raise ValueError("会话有新消息或人工正在输入，已停止发送")
+            if not before["editor_empty"]:
+                raise ValueError("编辑器中有人工输入，已停止自动操作")
+            if self.use_local_session:
+                # 本地模式：草稿来自 HTTP 快照，而浏览器 DOM 读到的消息结构不同（无 id/timestamp），
+                # 直接比对 context_hash 会误判。这里改用与草稿同源（HTTP）重读判断是否有新消息，
+                # 浏览器快照只用于发送前的编辑框/会话守卫，不写入数据库覆盖 HTTP 快照。
+                source = self.local_session.read_conversation(
+                    c["id"], c["name"], p["title"],
+                    json.loads(c["snapshot"]).get("account_uid"), throttle=False)
+            else:
+                source = before
+            updated = self.store.import_conversation(source)
+            if updated["context_hash"] != draft["context_hash"]:
+                raise ValueError("会话有新消息，已停止发送")
             self.store.claim(ident)
+            if auto and draft["kind"] == "reply":
+                # 占用一次自动回复额度：发送结果待定也算一次外发，避免超发
+                self._mark_auto_reply_sent()
             try:
                 self.browser.execute(draft["kind"], before, draft["content"])
                 # Give the page a short bounded render interval, never click twice.
@@ -780,7 +788,8 @@ class RecruitingService:
                 status = "sent" if confirmed else "uncertain"
                 message = "页面出现一条对应的本人消息；不代表对方已读" if confirmed else "已尝试操作，需核对平台结果；不会自动重试"
                 self.store.finish(ident, status, message)
-                self.store.import_conversation(after)
+                if not self.use_local_session:
+                    self.store.import_conversation(after)
             except Exception:
                 self.store.finish(ident, "uncertain", "操作结果待核实；请查看 Chrome，禁止盲目重试")
                 self.store.event("outbound_uncertain", ident, "执行中断，未自动重试")
@@ -870,22 +879,25 @@ class RecruitingService:
         c = self.store.row("conversations", cid)
         return bool(c.get("auto_send"))
 
-    def _reply_sent_today(self):
+    def _auto_reply_sent_today(self):
+        """今日已自动外发的回复数（只计自动，不计人工手动发送）。"""
         day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
-        count = 0
-        with self.store.db() as db:
-            for r in db.execute("SELECT updated_at FROM outbox WHERE kind='reply' AND status IN ('sending','sent','uncertain')").fetchall():
-                if r['updated_at']:
-                    d = datetime.fromisoformat(r['updated_at']).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
-                    if d == day:
-                        count += 1
-        return count
+        data = self.store.setting('auto_reply_sent', {})
+        return data.get('count', 0) if data.get('date') == day else 0
+
+    def _mark_auto_reply_sent(self):
+        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        data = self.store.setting('auto_reply_sent', {})
+        if data.get('date') != day:
+            data = {'date': day, 'count': 0}
+        data['count'] = data.get('count', 0) + 1
+        self.store.set_setting('auto_reply_sent', data)
 
     def _reply_quota_exhausted(self):
         limit = self.store.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10))
         if not limit:
             return False
-        return self._reply_sent_today() >= limit
+        return self._auto_reply_sent_today() >= limit
 
     def _auto_send_if_allowed(self, draft):
         """按条件自动发送一条回复草稿；不满足则留草稿给人工。"""
@@ -899,7 +911,7 @@ class RecruitingService:
             self.store.event("auto_send_skipped", cid, "今日自动回复已达上限")
             return False
         try:
-            self.execute(draft["id"])
+            self.execute(draft["id"], auto=True)
             self.store.event("auto_sent", cid, "已自动发送回复")
             return True
         except (ValueError, BrowserError) as exc:

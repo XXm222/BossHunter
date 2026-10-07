@@ -201,6 +201,27 @@ class JobSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.count_request('quota', 3)
 
+    def test_count_request_atomic_under_concurrency(self):
+        # 第2项：并发计数不丢递增——多个连接同时 count_request，总数应精确等于调用次数
+        import threading
+        store = Store(Path(self.temp.name) / 'concurrent.db')
+        n = 8
+        errors = []
+
+        def inc():
+            try:
+                store.count_request('conversation', 1000)
+            except Exception as exc:  # pragma: no cover - 收集线程内异常，避免被吞掉
+                errors.append(exc)
+
+        threads = [threading.Thread(target=inc) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(Store(Path(self.temp.name) / 'concurrent.db').request_budget()['count'], n)
+
     def test_reserve_greeting_blocks_when_quota_exhausted(self):
         # 遗漏 1：reserve 本身在同一事务里检查额度，不能只靠 _check_greeting_allowed
         from bosshunter.recruiting.jobs import day_key

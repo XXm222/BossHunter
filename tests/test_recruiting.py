@@ -43,6 +43,26 @@ class FakeBrowser:
             self.snapshot["messages"].append({"direction": "out", "kind": "text", "text": content, "time": ""})
 
 
+class FakeLocalSession:
+    """模拟本地 HTTP 会话读取：返回 HTTP 结构快照（消息带 id/timestamp）。"""
+
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def read_conversation(self, ident, name, position_title, expected_account=None,
+                          *, include_attachments=False, throttle=True):
+        return deepcopy(self.snapshot)
+
+    def set_stop_event(self, stop_event):
+        pass
+
+
+def http_msg(mid, direction, kind, text):
+    """HTTP 接口读到的消息结构，与浏览器 DOM 快照（无 id/timestamp）不同。"""
+    return {"id": str(mid), "direction": direction, "kind": kind, "text": text,
+            "timestamp": 1700000000 + mid, "time": "10:00"}
+
+
 class RecruitingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -100,13 +120,58 @@ class RecruitingTests(unittest.TestCase):
         self.assertEqual(self.service.execute(other["id"])["status"], "sent")
         self.assertEqual(self.browser.calls, 2)
 
-    def test_daily_reply_quota(self):
+    def _local_mode_service(self, http_snapshot):
+        """本地模式服务：HTTP 读取走 FakeLocalSession，发送走 FakeBrowser。"""
+        browser = FakeBrowser()
+        browser.snapshot = {
+            "id": http_snapshot["id"], "name": http_snapshot["name"],
+            "position_title": http_snapshot["position_title"],
+            "messages": [{"direction": m["direction"], "kind": m["kind"], "text": m["text"], "time": m.get("time", "")}
+                         for m in http_snapshot["messages"]],
+            "editor_empty": True, "coverage": "test", "stable_message_ids": False}
+        service = RecruitingService(Path(self.temp.name) / "recruiting_local.db", lambda: {},
+                                    browser, local_session=FakeLocalSession(http_snapshot))
+        service.store.import_conversation(http_snapshot)
+        return service, browser
+
+    def test_local_mode_send_succeeds_despite_schema_difference(self):
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                    "messages": [http_msg(1, "in", "text", "请问工作时间？")],
+                    "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        service, browser = self._local_mode_service(snapshot)
+        draft = service.prepare_reply("123-0", "工作时间是 9-6")
+        self.assertEqual(service.execute(draft["id"])["status"], "sent")
+        self.assertEqual(browser.calls, 1)
+
+    def test_local_mode_send_blocked_on_new_message(self):
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                    "messages": [http_msg(1, "in", "text", "请问工作时间？")],
+                    "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        service, browser = self._local_mode_service(snapshot)
+        draft = service.prepare_reply("123-0", "你好")
+        service.local_session.snapshot = {**snapshot,
+            "messages": snapshot["messages"] + [http_msg(2, "in", "text", "算了不用了")]}
+        with self.assertRaisesRegex(ValueError, "新消息"):
+            service.execute(draft["id"])
+        self.assertEqual(service.store.row("outbox", draft["id"])["status"], "expired")
+        self.assertEqual(browser.calls, 0)
+
+    def test_auto_reply_quota_counts_only_auto_sends(self):
         self.service.store.set_setting('auto_reply_daily_limit', 1)
-        draft = self.service.prepare_reply(self.cid, "测试回复")
-        self.assertEqual(self.service.execute(draft["id"])["status"], "sent")
-        other = self.service.prepare_reply(self.cid, "另一回复")
+        # 人工手动发送不受自动回复上限约束，也不计入自动额度
+        first = self.service.prepare_reply(self.cid, "人工回复一")
+        self.assertEqual(self.service.execute(first["id"])["status"], "sent")
+        second = self.service.prepare_reply(self.cid, "人工回复二")
+        self.assertEqual(self.service.execute(second["id"])["status"], "sent")
+        self.assertEqual(self.browser.calls, 2)
+
+    def test_auto_reply_quota_blocks_auto_send(self):
+        self.service.store.set_setting('auto_reply_daily_limit', 1)
+        first = self.service.prepare_reply(self.cid, "自动回复一")
+        self.assertEqual(self.service.execute(first["id"], auto=True)["status"], "sent")
+        second = self.service.prepare_reply(self.cid, "自动回复二")
         with self.assertRaisesRegex(ValueError, "上限"):
-            self.service.execute(other["id"])
+            self.service.execute(second["id"], auto=True)
         self.assertEqual(self.browser.calls, 1)
 
     def test_auto_send_per_conversation_switch(self):

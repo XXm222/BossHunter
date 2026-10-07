@@ -20,6 +20,15 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+def conversation_hash(snapshot):
+    """会话内容指纹：只取会话标识、关联岗位与消息数组，读取源无关。
+
+    import_conversation 与发送前的变更检测共用这一口径，避免浏览器 DOM 与
+    HTTP 接口消息结构不同导致 context_hash 无法直接比对。
+    """
+    return fingerprint({k: snapshot[k] for k in ("id", "position_title", "messages")})
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -110,10 +119,12 @@ class Store:
 
         计数存 DB（settings.request_budget），重启不重置、Web 与 worker 两进程共用；
         并按 kind 记录每类请求的数量，便于看出会话/岗位/附件/额度各自占用。
+        BEGIN IMMEDIATE 让「读计数 → 加一 → 写回」原子，避免两个进程同时计数时丢一次递增。
         """
         from zoneinfo import ZoneInfo
         day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key='request_budget'").fetchone()
             budget = json.loads(row[0]) if row else {'date': day, 'count': 0, 'by_kind': {}}
             if budget.get('date') != day:
@@ -179,7 +190,7 @@ class Store:
             if not pos:
                 db.execute("INSERT INTO positions(id,title,source,updated_at) VALUES (?,?,?,?)",
                            (pid, snapshot["position_title"], "conversation_context", now()))
-            context_hash = fingerprint({k: snapshot[k] for k in ("id", "position_title", "messages")})
+            context_hash = conversation_hash(snapshot)
             db.execute("""INSERT INTO conversations(id,name,position_id,snapshot,context_hash,updated_at)
                 VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,
                 snapshot=excluded.snapshot,context_hash=excluded.context_hash,updated_at=excluded.updated_at""",

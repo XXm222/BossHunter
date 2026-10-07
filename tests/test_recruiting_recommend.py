@@ -184,7 +184,7 @@ class GreetDiscoveredTests(unittest.TestCase):
 
     def test_records_attempt_with_boss_job_id(self):
         service = self.service(FakeGreetVerifier({"sent": True, "job_id": "encryptJob123", "reason": "已发出"}))
-        result = service.greet_discovered("geek123")
+        result = service.greet_discovered("geek123", "", "encryptJob123")
         self.assertTrue(result["sent"])
         self.assertEqual(result["job_id"], "boss-encryptJob123")
         with service.store.db() as db:
@@ -198,12 +198,15 @@ class GreetDiscoveredTests(unittest.TestCase):
             db.execute("INSERT INTO greeting_attempts(day, job_id, candidate_id, status, created_at) VALUES (?,?,?,?,?)",
                        ("2026-09-29", "boss-encryptJob123", "geek123", "sent", "2026-09-29T00:00:00"))
         with self.assertRaisesRegex(ValueError, "已打过招呼"):
-            service.greet_discovered("geek123")
+            service.greet_discovered("geek123", "", "encryptJob123")
 
     def test_missing_job_id_raises(self):
-        service = self.service(FakeGreetVerifier({"sent": True, "job_id": None}))
-        with self.assertRaisesRegex(ValueError, "岗位"):
+        # 第3条：discover/greet 缺岗位 ID 必须拒绝，且不产生任何占用记录
+        service = self.service(FakeGreetVerifier({"sent": True, "job_id": "encryptJob123"}))
+        with self.assertRaisesRegex(ValueError, "缺少岗位 ID"):
             service.greet_discovered("geek123")
+        with service.store.db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM greeting_attempts").fetchone()[0], 0)
 
 
 class SelectAndReadTests(unittest.TestCase):

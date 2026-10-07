@@ -83,14 +83,18 @@ class LocalBossSession:
         if self.throttle.wait(self._stop_event):
             raise BrowserError("已请求停止，中断当前操作")
 
-    def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False):
+    def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False, throttle=True):
         """Read one already-bound conversation. Never mark read or operate a tab.
 
         The job title comes from the existing verified binding, not a name search.
         All returned messages must belong to this exact peer and one employer.
         Unknown payloads remain explicit system records, not guessed dialogue.
+
+        throttle=False 用于发送前的变更检测：这是用户主动触发的单次读取，不该
+        再叠加后台节流等待；请求计数仍照常执行。
         """
-        self._wait()
+        if throttle:
+            self._wait()
         match = re.fullmatch(r'([1-9][0-9]*)-([01])', ident)
         if not match:
             raise BrowserError('绑定会话的标识不支持后台读取，请先核对会话身份')
