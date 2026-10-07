@@ -46,12 +46,19 @@ class FakeBrowser:
 class FakeLocalSession:
     """模拟本地 HTTP 会话读取：返回 HTTP 结构快照（消息带 id/timestamp）。"""
 
-    def __init__(self, snapshot):
+    def __init__(self, snapshot, friend_jobs=None):
         self.snapshot = snapshot
+        self.friend_jobs = friend_jobs or {}
+        self.return_none_on_since = False
 
     def read_conversation(self, ident, name, position_title, expected_account=None,
-                          *, include_attachments=False, throttle=True):
+                          *, include_attachments=False, throttle=True, since_mid=None):
+        if since_mid is not None and self.return_none_on_since:
+            return None
         return deepcopy(self.snapshot)
+
+    def read_friend_jobs(self, uids):
+        return {str(u): self.friend_jobs[str(u)] for u in uids if str(u) in self.friend_jobs}
 
     def set_stop_event(self, stop_event):
         pass
@@ -156,6 +163,40 @@ class RecruitingTests(unittest.TestCase):
         self.assertEqual(service.store.row("outbox", draft["id"])["status"], "expired")
         self.assertEqual(browser.calls, 0)
 
+    def test_confirm_binding_links_platform_job_by_encrypt_job_id(self):
+        # 问题7：绑定会话时按候选人 uid 查 encryptJobId，关联到 boss-<encryptJobId>
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "电子工程师",
+                    "messages": [], "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(snapshot, friend_jobs={"123": "encryptJob123"})
+        service = RecruitingService(Path(self.temp.name) / "recruiting_bind.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        result = service.confirm_binding("123-0", "候选人", "电子工程师", "u1")
+        self.assertEqual(result["position_id"], "boss-encryptJob123")
+
+    def test_confirm_binding_falls_back_without_job_id(self):
+        snapshot = {"id": "456-0", "name": "候选人", "position_title": "电子工程师",
+                    "messages": [], "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(snapshot)  # 无 friend_jobs
+        service = RecruitingService(Path(self.temp.name) / "recruiting_bind2.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        result = service.confirm_binding("456-0", "候选人", "电子工程师", "u1")
+        self.assertTrue(result["position_id"].startswith("context-"))
+
+    def test_sync_incremental_skips_when_no_new_message(self):
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                    "messages": [http_msg(1, "in", "text", "你好")],
+                    "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(snapshot)
+        local.return_none_on_since = True  # 增量读取返回 None（无新消息）
+        service = RecruitingService(Path(self.temp.name) / "recruiting_inc.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        service.store.import_conversation(snapshot)
+        before = service.store.row("conversations", "123-0")["snapshot"]
+        result = service.sync("123-0")
+        after = service.store.row("conversations", "123-0")["snapshot"]
+        self.assertEqual(before, after)  # 无新消息，快照不变
+        self.assertEqual(result["id"], "123-0")
+
     def test_auto_reply_quota_counts_only_auto_sends(self):
         self.service.store.set_setting('auto_reply_daily_limit', 1)
         # 人工手动发送不受自动回复上限约束，也不计入自动额度
@@ -216,7 +257,7 @@ class RecruitingTests(unittest.TestCase):
         ])
 
     def test_sync_all_contacts_imports_and_skips_existing(self):
-        self.browser.read_contact_list = lambda: [
+        self.browser.read_contact_list = lambda load_all=False: [
             {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
             {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
         ]
@@ -232,7 +273,7 @@ class RecruitingTests(unittest.TestCase):
         self.assertEqual(second["total"], 2)
 
     def test_sync_all_contacts_keeps_same_title_positions_separate(self):
-        self.browser.read_contact_list = lambda: [
+        self.browser.read_contact_list = lambda load_all=False: [
             {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
             {"ident": "84519593-0", "name": "李四", "position_title": "电子工程师"},
             {"ident": "81667022-0", "name": "王五", "position_title": "产品经理"},

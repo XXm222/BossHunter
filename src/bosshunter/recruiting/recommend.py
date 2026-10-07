@@ -266,3 +266,28 @@ class RecommendVerifier:
         finally:
             if pw is not None:
                 pw.stop()
+
+    def reload(self):
+        """刷新推荐页以获取新的候选人列表（BOSS 只在真实刷新时更新推荐）。
+
+        刷新后岗位下拉框会恢复到默认第一个岗位，调用方需在刷新后重新 select_job
+        选中目标岗位，再 read_candidates。
+        """
+        cdp_url = self._find_cdp_url()
+        pw = None
+        try:
+            pw = sync_playwright().start()
+            browser = pw.chromium.connect_over_cdp(cdp_url)
+            context = browser.contexts[0]
+            page = self._recommend_page(context)
+            page.reload(wait_until="domcontentloaded")
+            # 等推荐 iframe 重新加载出来，供后续 select_job/read_candidates 使用
+            deadline = time.time() + self._wait_timeout
+            while time.time() < deadline and not self._recommend_frame(page):
+                time.sleep(0.5)
+            if not self._recommend_frame(page):
+                raise BrowserError("刷新后未找到推荐页 iframe，请确认推荐页已重新加载")
+            return True
+        finally:
+            if pw is not None:
+                pw.stop()

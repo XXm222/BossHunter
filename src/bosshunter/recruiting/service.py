@@ -90,6 +90,12 @@ class RecruitingService:
             "mode": self.monitor['mode'],
             "note": self.monitor['note'],
         }
+        budget = s.request_budget()
+        read_daily_limit = self._recruiting_cfg().get("read_daily_limit", 50)
+        request_budget = {"date": budget.get("date"), "count": budget.get("count", 0),
+                          "daily_limit": read_daily_limit,
+                          "remaining": max(0, read_daily_limit - budget.get("count", 0)),
+                          "by_kind": budget.get("by_kind", {})}
         return {"positions": s.rows("positions"), "conversations": conversations,
                 "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
@@ -98,6 +104,7 @@ class RecruitingService:
                 "discovery": {"running": discovery_running},
                 "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10)),
                               "sent_today": self._auto_reply_sent_today()},
+                "request_budget": request_budget,
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
                 "pilot": {"max_conversations": 20, "invitation_sending": False,
                           "conversation_id": s.setting("pilot_conversation"),
@@ -154,23 +161,25 @@ class RecruitingService:
 
         导入为最小快照，让所有候选人都进入「候选人沟通」列表；消息历史在选中该
         会话后由 sync()/monitor 按需读取并核对归属。已导入的会话跳过。
+        按联系人 uid 批量查 encryptJobId，把会话关联到已发布岗位（问题7）。
         """
-        contacts = self.browser.read_contact_list()
+        contacts = self.browser.read_contact_list(load_all=True)
         existing = {c["id"] for c in self.store.rows("conversations")}
+        new_contacts = [c for c in contacts if c.get("ident") and c.get("name") and c["ident"] not in existing]
+        job_map = self._friend_job_map([c["ident"].split("-", 1)[0] for c in new_contacts])
         imported = 0
-        for c in contacts:
-            ident = c.get("ident")
-            name = c.get("name")
-            if not ident or not name:
-                continue
-            if ident in existing:
-                continue
+        for c in new_contacts:
+            ident = c["ident"]
+            name = c["name"]
             snapshot = {
                 "id": ident, "name": name,
                 "position_title": c.get("position_title", "").strip() or "待关联岗位",
                 "messages": [], "editor_empty": True, "stable_message_ids": False,
                 "coverage": "尚未同步消息；选中该会话后自动读取",
             }
+            job_id = job_map.get(ident.split("-", 1)[0])
+            if job_id:
+                snapshot["position_platform_id"] = job_id
             self.store.import_conversation(snapshot)
             imported += 1
         self.store.event("contacts_synced", "", f"全账号导入 {imported} 个会话（共 {len(contacts)} 个联系人）")
@@ -298,6 +307,13 @@ class RecruitingService:
             self.verifier = RecommendVerifier(self.config_provider)
         throttle = PageThrottle(delay_min=throttle_delay[0], delay_max=throttle_delay[1])
         greeted = 0
+        # 每轮先刷新推荐页拿新候选人；刷新会把岗位重置为默认第一个，下面逐岗重新 select_job
+        try:
+            self.verifier.reload()
+        except BrowserError as exc:
+            self.store.event('discovery_error', '', f'刷新推荐页失败：{exc}')
+            return {'greeted': 0, 'stopped': self.discovery_stop.is_set(),
+                    'reason': f'刷新推荐页失败：{exc}'}
         for job in selected:
             if self.discovery_stop.is_set():
                 break
@@ -390,6 +406,37 @@ class RecruitingService:
                 "message_count": len(snapshot["messages"]),
                 "coverage": snapshot.get("coverage", "")}
 
+    def _friend_job_map(self, uids):
+        """批量查联系人岗位 ID（encryptJobId），返回 {uid: encryptJobId}；失败返回 {}。
+
+        仅在本地模式且 local_session 支持 read_friend_jobs 时生效，避免测试用
+        FakeLocalSession/Mock 或浏览器模式触发真实 HTTP 读取。
+        """
+        if not self.use_local_session:
+            return {}
+        reader = getattr(self.local_session, 'read_friend_jobs', None)
+        if not callable(reader) or not uids:
+            return {}
+        try:
+            result = reader(uids)
+        except (BrowserError, AccountPauseError):
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    def _enrich_position_platform_id(self, snapshot):
+        """按会话候选人的 uid 查岗位 ID，注入 position_platform_id。
+
+        查不到或为空时保持原样，import_conversation 会走 context- 兜底（等价于
+        「待关联」状态）；读取失败不阻塞绑定。
+        """
+        ident = snapshot.get("id") or ""
+        gid = ident.split("-", 1)[0]
+        if not gid:
+            return
+        job_id = self._friend_job_map([gid]).get(str(gid))
+        if isinstance(job_id, str) and job_id.strip():
+            snapshot["position_platform_id"] = job_id
+
     def confirm_binding(self, conversation_id, name, position_title, expected_account):
         """核实后把会话写入 pilot_conversation（首次绑定的唯一入口）。
 
@@ -399,10 +446,18 @@ class RecruitingService:
         snapshot = self.local_session.read_conversation(
             str(conversation_id).strip(), str(name).strip(), str(position_title).strip(),
             expected_account=str(expected_account).strip())
+        self._enrich_position_platform_id(snapshot)
         result = self.store.import_conversation(snapshot)
         self.store.select_conversation(result["id"])  # 新绑定的会话设为当前选中
         self.store.event("conversation_bound", result["id"], "已核实并绑定会话；未发送消息")
         return result
+
+    @staticmethod
+    def _last_message_id(snapshot):
+        """会话快照里最后一条消息的 mid（用于增量同步）；没有消息返回 None。"""
+        mids = [int(m['id']) for m in (snapshot.get('messages') or [])
+                if isinstance(m, dict) and str(m.get('id', '')).isdigit()]
+        return max(mids) if mids else None
 
     def sync(self, cid=None, *, process=True):
         """同步一个会话的消息；process=True 时同时读简历/评分。
@@ -418,12 +473,24 @@ class RecruitingService:
                 position = self.store.row("positions", current['position_id'])
                 previous = json.loads(current['snapshot'])
                 try:
-                    snapshot = self.local_session.read_conversation(ident, current['name'], position['title'], previous.get('account_uid'))
-                    result = self.store.import_conversation(snapshot)
+                    snapshot = self.local_session.read_conversation(
+                        ident, current['name'], position['title'],
+                        previous.get('account_uid'),
+                        since_mid=self._last_message_id(previous))
                 except BrowserError as exc:
                     self.monitor['error'] = str(exc)
                     self.connection = {"connected": False, "transport": "local_cookie_http", "checked_at": now(), "message": str(exc)}
                     raise
+                if snapshot is None:
+                    # 增量：没有新消息，保持原快照，不导入、不处理简历
+                    self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
+                                       "message": "已连接 BOSS：本地登录会话，无新消息",
+                                       "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),
+                                       "read_bound_conversation": True}
+                    self.monitor["last_success"] = now()
+                    self.monitor["error"] = ""
+                    return current
+                result = self.store.import_conversation(snapshot)
                 self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                    "message": "已连接 BOSS：本地登录会话，只读同步绑定候选人的消息",
                                    "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),

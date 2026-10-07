@@ -20,7 +20,7 @@ class AutoResumeTests(TestCase):
         self.browser = Mock()
         self.session = Mock()
         self.snapshot = {'id': '123-0', 'name': '测试候选人', 'position_title': '测试岗位', 'messages': [], 'account_uid': '456', 'received_resume_message_id': '789'}
-        self.session.read_conversation.side_effect = lambda *args: dict(self.snapshot)
+        self.session.read_conversation.side_effect = lambda *args, **kwargs: dict(self.snapshot)
         self.session.read_resume.side_effect = lambda *args: {'source': 'boss_attachment_pdf_http', 'text': '岗位相关经历。' * 30, 'complete': False, 'meta': {'page_count': 1, 'message_id': self.snapshot['received_resume_message_id']}}
         self.service = self.make_service()
         c = self.service.store.import_conversation(self.snapshot)

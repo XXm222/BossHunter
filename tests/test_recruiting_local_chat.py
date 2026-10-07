@@ -59,6 +59,50 @@ class LocalChatTests(unittest.TestCase):
         with self.assertRaises(BrowserError): self.read(self.adapter(lambda req: response([message(), message()])))
         with self.assertRaises(BrowserError): self.read(self.adapter(lambda req: response([], True)))
 
+    def test_read_friend_jobs_posts_batch_and_filters_empty_job(self):
+        import urllib.parse
+        calls = []
+        def handle(req):
+            calls.append(req)
+            self.assertEqual(req.method, 'POST')
+            self.assertEqual(req.url.path, '/wapi/zprelation/friend/getBossFriendListV2.json')
+            form = urllib.parse.parse_qs(req.content.decode())
+            self.assertEqual(form['friendIds'], ['123,456'])
+            return httpx.Response(200, json={'code': 0, 'zpData': {'friendList': [
+                {'uid': 123, 'encryptJobId': 'encryptJob123', 'jobName': '电子工程师'},
+                {'uid': 456, 'encryptJobId': '', 'jobName': ''},
+                {'uid': 789, 'encryptJobId': None},
+            ]}})
+        with patch('bosshunter.recruiting.local_session.time.sleep'):
+            result = self.adapter(handle).read_friend_jobs(['123', '456'])
+        self.assertEqual(result, {'123': 'encryptJob123'})
+        self.assertEqual(len(calls), 1)
+
+    def test_read_friend_jobs_empty_uids_makes_no_request(self):
+        calls = []
+        adapter = self.adapter(lambda req: calls.append(req) or httpx.Response(500))
+        with patch('bosshunter.recruiting.local_session.time.sleep'):
+            self.assertEqual(adapter.read_friend_jobs([]), {})
+        self.assertEqual(calls, [])
+
+    def test_read_conversation_incremental_returns_none_when_no_new(self):
+        calls = []
+        def handle(req):
+            calls.append(req)
+            return response([message(5), message(6)], False, 5)
+        with patch('bosshunter.recruiting.local_session.time.sleep'):
+            result = self.adapter(handle).read_conversation('123-0', '测试候选人', '测试岗位', since_mid=6)
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 1)  # 只读第一页，不翻页
+
+    def test_read_conversation_incremental_returns_snapshot_when_new(self):
+        def handle(req):
+            return response([message(7), message(6)], False, 6)
+        with patch('bosshunter.recruiting.local_session.time.sleep'):
+            result = self.adapter(handle).read_conversation('123-0', '测试候选人', '测试岗位', since_mid=6)
+        self.assertIsNotNone(result)
+        self.assertEqual([m['id'] for m in result['messages']], ['6', '7'])
+
     def test_auth_failure_is_sanitized_and_not_retried(self):
         calls = []
         def handle(req):

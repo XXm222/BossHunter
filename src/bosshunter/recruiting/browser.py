@@ -56,6 +56,14 @@ const contacts = [...document.querySelectorAll('.geek-item')].map(item => {
 """
 
 
+# 把左侧联系人列表最后一个条目滚进可视区，触发懒加载下一页；返回当前已加载的条目数。
+SCROLL_CONTACT_LIST = r"""
+const items = document.querySelectorAll('.geek-item');
+if (items.length) { items[items.length - 1].scrollIntoView(); }
+return JSON.stringify({count: items.length});
+"""
+
+
 class BossBrowser:
     def __init__(self, runtime=None, target_id=None):
         self.runtime = runtime or RuntimeClient()
@@ -122,8 +130,26 @@ class BossBrowser:
             raise BrowserError("当前会话仍在变化，请核对后重试；未执行发送")
         return snapshot
 
-    def read_contact_list(self):
-        """读取聊天页左侧联系人列表（含岗位名）；只读，不点选、不导航、不发消息。"""
+    def read_contact_list(self, load_all=False):
+        """读取聊天页左侧联系人列表（含岗位名）；只读，不点选、不导航、不发消息。
+
+        load_all=True 时先反复滚动到底触发懒加载，直到没有新增联系人，再一次性读取全部；
+        联系人列表是滚动加载的，只读当前 DOM 会漏掉未加载的人。
+        """
+        if load_all:
+            last = -1
+            stable = 0
+            for _ in range(200):
+                value = self.evaluate(SCROLL_CONTACT_LIST)
+                count = value.get('count', 0) if isinstance(value, dict) else 0
+                if count == last:
+                    stable += 1
+                    if stable >= 3:
+                        break
+                else:
+                    stable = 0
+                    last = count
+                time.sleep(0.8)
         value = self.evaluate(READ_CONTACT_LIST + "return JSON.stringify({contacts});")
         return value.get("contacts") if isinstance(value, dict) else []
 

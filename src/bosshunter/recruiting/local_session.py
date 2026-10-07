@@ -83,7 +83,7 @@ class LocalBossSession:
         if self.throttle.wait(self._stop_event):
             raise BrowserError("已请求停止，中断当前操作")
 
-    def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False, throttle=True):
+    def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False, throttle=True, since_mid=None):
         """Read one already-bound conversation. Never mark read or operate a tab.
 
         The job title comes from the existing verified binding, not a name search.
@@ -92,6 +92,9 @@ class LocalBossSession:
 
         throttle=False 用于发送前的变更检测：这是用户主动触发的单次读取，不该
         再叠加后台节流等待；请求计数仍照常执行。
+
+        since_mid 为增量游标：传值时先读第一页，若没有 mid 大于该值的消息则
+        返回 None（表示无变化），调用方保持原快照、不再翻页。
         """
         if throttle:
             self._wait()
@@ -121,6 +124,10 @@ class LocalBossSession:
                 data = body.get('zpData')
                 if not isinstance(data, dict) or not isinstance(data.get('messages'), list) or type(data.get('hasMore')) is not bool:
                     raise BrowserError('会话数据结构变化，保留原记录')
+                if page == 1 and since_mid is not None and not any(
+                        isinstance(it, dict) and isinstance(it.get('mid'), int) and it['mid'] > since_mid
+                        for it in data['messages']):
+                    return None
                 for item in data['messages']:
                     if not isinstance(item, dict):
                         raise BrowserError('会话记录结构不完整')
@@ -405,6 +412,45 @@ class LocalBossSession:
                     'remaining': None, 'unlimited': True}
         # limit/used 不是可信整数：额度未知，不能当作不限继续
         raise BrowserError('平台额度字段不可信，无法确定剩余额度，停止本次读取')
+
+    def read_friend_jobs(self, uids):
+        """查询一批联系人的平台岗位 ID（encryptJobId）。
+
+        getBossFriendListV2 按 friendIds 批量 POST，返回这些联系人的详情（含
+        encryptJobId），用于把会话按平台岗位 ID 关联到已发布岗位、共享 JD。返回
+        {uid: encryptJobId}；查不到或 encryptJobId 为空的 uid 不在结果里。
+        """
+        uids = [str(u) for u in uids if u]
+        if not uids:
+            return {}
+        self._wait()
+        self._count('friend')
+        cookies = self.cookie_loader()
+        with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
+                          timeout=20, follow_redirects=False,
+                          headers={'Referer': 'https://www.zhipin.com/web/chat/index'}) as client:
+            try:
+                response = client.post(
+                    'https://www.zhipin.com/wapi/zprelation/friend/getBossFriendListV2.json',
+                    data={'friendIds': ','.join(uids), 'dzFriendIds': '', 'encJobId': '', 'scene': ''})
+                response.raise_for_status()
+                body = response.json()
+            except (httpx.HTTPError, ValueError):
+                raise BrowserError('联系人岗位读取未完成；保留原记录，不自动重试') from None
+        if not isinstance(body, dict) or body.get('code') != 0:
+            raise AccountPauseError('BOSS 未接受联系人读取请求，请核实登录状态；未操作标签页')
+        data = body.get('zpData')
+        if not isinstance(data, dict) or not isinstance(data.get('friendList'), list):
+            raise BrowserError('联系人数据结构变化，停止本次关联')
+        result = {}
+        for friend in data['friendList']:
+            if not isinstance(friend, dict):
+                raise BrowserError('联系人记录结构不完整')
+            uid = friend.get('uid')
+            job_id = friend.get('encryptJobId')
+            if isinstance(uid, int) and isinstance(job_id, str) and job_id.strip():
+                result[str(uid)] = job_id.strip()
+        return result
 
 
 # 渲染分辨率（DPI）：中文简历识别精度与耗时/内存之间的平衡点；需要更高精度可调到 300，但会更慢、更占内存。

@@ -239,6 +239,17 @@ class SelectAndReadTests(unittest.TestCase):
         self.assertEqual(result, [{"name": "A", "uid": "geek1", "greetable": True},
                                   {"name": "B", "uid": "geek2", "greetable": False}])
 
+    def test_reload_calls_page_reload(self):
+        frame = Mock()
+        frame.url = "https://www.zhipin.com/web/frame/recommend/"
+        page = Page(RECOMMEND_PAGE, [frame])
+        pw = PW(Browser(Context([page])))
+        verifier = RecommendVerifier(lambda: {}, cdp_url="http://127.0.0.1:9222")
+        with patch("bosshunter.recruiting.recommend.sync_playwright", return_value=SyncPlaywright(pw)), \
+             patch("bosshunter.recruiting.recommend.time.sleep"):
+            self.assertTrue(verifier.reload())
+        self.assertEqual(page.reload_calls, 1)
+
 
 class FakeDiscoveryVerifier:
     def __init__(self, candidates, greet_result=None, select_ok=True):
@@ -247,6 +258,11 @@ class FakeDiscoveryVerifier:
         self.select_ok = select_ok
         self.selected_jobs = []
         self.greeted = []
+        self.reload_calls = 0
+
+    def reload(self):
+        self.reload_calls += 1
+        return True
 
     def select_job(self, job_id):
         self.selected_jobs.append(job_id)
@@ -285,6 +301,8 @@ class RunDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["greeted"], 1)
         self.assertEqual(verifier.selected_jobs, ["job1"])
         self.assertEqual(verifier.greeted, ["geek1"])
+        # 每轮开始先刷新推荐页拿新候选人
+        self.assertEqual(verifier.reload_calls, 1)
 
     def test_run_discovery_records_candidate_name(self):
         verifier = FakeDiscoveryVerifier([{"name": "张三", "uid": "geek1", "greetable": True}])
