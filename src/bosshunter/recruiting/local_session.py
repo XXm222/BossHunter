@@ -147,6 +147,8 @@ class LocalBossSession:
                     mid, stamp = item.get('mid'), item.get('time')
                     if type(mid) is not int or mid <= 0 or type(stamp) is not int or stamp <= 0:
                         raise BrowserError('消息唯一标识或时间缺失，停止同步')
+                    if since_mid is not None and mid <= since_mid:
+                        break  # 该条及之后都是更早的消息，增量模式到此为止
                     if mid in seen:
                         raise BrowserError('消息分页重复，保留原记录')
                     seen.add(mid)
@@ -163,6 +165,10 @@ class LocalBossSession:
                                      'time': datetime.fromtimestamp(stamp / 1000, ZoneInfo('Asia/Shanghai')).strftime('%m-%d %H:%M')})
                 if data['hasMore'] is False:
                     break
+                if since_mid is not None:
+                    min_mid = data.get('minMsgId')
+                    if isinstance(min_mid, int) and min_mid <= since_mid:
+                        break  # 本页最旧消息已经 <= 游标，没有更多新消息了
                 next_cursor = data.get('minMsgId')
                 if not data['messages'] or type(next_cursor) is not int or next_cursor <= 0 or next_cursor == cursor:
                     raise BrowserError('消息分页游标异常，保留原记录')
@@ -170,7 +176,8 @@ class LocalBossSession:
                 self._interruptible_sleep(self._page_delay)
             else:
                 raise BrowserError('单会话超过最小样本读取上限，保留原记录')
-        if not messages or len(account_ids) != 1 or names != {name}:
+        bad_name = (names != {name}) if since_mid is None else bool(names - {name})
+        if not messages or len(account_ids) != 1 or bad_name:
             raise AccountPauseError('候选人或招聘账号未能准确核实，保留原记录')
         account = next(iter(account_ids))
         if expected_account and account != expected_account:

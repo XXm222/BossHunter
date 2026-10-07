@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from wsgiref.util import setup_testing_defaults
 
 from bosshunter.recruiting import agent
@@ -196,6 +196,33 @@ class RecruitingTests(unittest.TestCase):
         after = service.store.row("conversations", "123-0")["snapshot"]
         self.assertEqual(before, after)  # 无新消息，快照不变
         self.assertEqual(result["id"], "123-0")
+
+    def test_sync_appends_new_messages_without_dropping_old(self):
+        old_snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                        "messages": [http_msg(1, "in", "text", "你好"), http_msg(2, "in", "text", "第二条")],
+                        "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(old_snapshot)
+        service = RecruitingService(Path(self.temp.name) / "recruiting_merge.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        service.store.import_conversation(old_snapshot)
+        # 增量读只返回新消息（mid > 2）
+        local.snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                          "messages": [http_msg(3, "in", "text", "第三条")],
+                          "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        service.sync("123-0")
+        msgs = json.loads(service.store.row("conversations", "123-0")["snapshot"])["messages"]
+        self.assertEqual([m["id"] for m in msgs], ["1", "2", "3"])  # 旧消息保留 + 新消息追加
+
+    def test_send_channel_status_reports_availability(self):
+        runtime = Mock()
+        runtime.health.return_value = {'runtime': 'other'}
+        browser = BossBrowser(runtime=runtime)
+        service = RecruitingService(Path(self.temp.name) / "sc.db", lambda: {}, browser)
+        self.assertFalse(service.state()['send_channel']['available'])
+        # 健康：正确 Runtime + 招聘页标签存在
+        runtime.health.return_value = {'runtime': 'bosshunter', 'connected': True}
+        runtime.targets.return_value = [{'targetId': 'boss', 'url': 'https://www.zhipin.com/web/chat/index', 'type': 'page'}]
+        self.assertTrue(service.state()['send_channel']['available'])
 
     def test_auto_reply_quota_counts_only_auto_sends(self):
         self.service.store.set_setting('auto_reply_daily_limit', 1)

@@ -95,13 +95,13 @@ class LocalChatTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(len(calls), 1)  # 只读第一页，不翻页
 
-    def test_read_conversation_incremental_returns_snapshot_when_new(self):
+    def test_read_conversation_incremental_returns_only_new(self):
         def handle(req):
             return response([message(7), message(6)], False, 6)
         with patch('bosshunter.recruiting.local_session.time.sleep'):
             result = self.adapter(handle).read_conversation('123-0', '测试候选人', '测试岗位', since_mid=6)
         self.assertIsNotNone(result)
-        self.assertEqual([m['id'] for m in result['messages']], ['6', '7'])
+        self.assertEqual([m['id'] for m in result['messages']], ['7'])  # 只返回新消息（mid > 6）
 
     def test_auth_failure_is_sanitized_and_not_retried(self):
         calls = []

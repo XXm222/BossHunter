@@ -100,6 +100,7 @@ class RecruitingService:
                 "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
                 "connection": self.connection, "monitor": monitor_state,
+                "send_channel": self._send_channel_status(),
                 "worker": {"alive": worker_alive, "monitor_enabled": monitor_enabled},
                 "discovery": {"running": discovery_running},
                 "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10)),
@@ -459,6 +460,20 @@ class RecruitingService:
                 if isinstance(m, dict) and str(m.get('id', '')).isdigit()]
         return max(mids) if mids else None
 
+    @staticmethod
+    def _append_new_messages(previous, snapshot):
+        """把增量读取到的新消息追加到旧快照，按 id 去重排序，不删旧消息。
+
+        增量模式只拉到新消息（mid > since_mid），旧消息可能已被 BOSS 删除但仍保留
+        在本地；追加式合并能保证不覆盖旧记录。新消息的 received_resume_message_id
+        由调用方负责合并（新附件优先，否则沿用旧值）。
+        """
+        merged = {m['id']: m for m in (previous.get('messages') or [])}
+        for m in (snapshot.get('messages') or []):
+            merged[m['id']] = m
+        snapshot['messages'] = sorted(merged.values(), key=lambda m: (m.get('timestamp', 0), int(m['id'])))
+        return snapshot
+
     def sync(self, cid=None, *, process=True):
         """同步一个会话的消息；process=True 时同时读简历/评分。
 
@@ -490,7 +505,8 @@ class RecruitingService:
                     self.monitor["last_success"] = now()
                     self.monitor["error"] = ""
                     return current
-                result = self.store.import_conversation(snapshot)
+                snapshot['received_resume_message_id'] = snapshot.get('received_resume_message_id') or previous.get('received_resume_message_id')
+                result = self.store.import_conversation(self._append_new_messages(previous, snapshot))
                 self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                    "message": "已连接 BOSS：本地登录会话，只读同步绑定候选人的消息",
                                    "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),
@@ -863,6 +879,29 @@ class RecruitingService:
                 raise BrowserError("操作结果待核实；请检查 Chrome，已阻止再次发送")
             self.store.event("outbound_" + status, ident, message)
             return self.store.row("outbox", ident)
+
+    def _send_channel_status(self):
+        """探测发送通道（Browser Runtime + Chrome 招聘页标签）是否可用。
+
+        只读探测，不启动 Runtime、不切换标签；发送通道断了不代表监测要停，
+        这里只把状态暴露给前端，让「发不出去」显式可见（草稿会留在 outbox）。
+        """
+        try:
+            health = self.browser.runtime.health()
+        except Exception as exc:
+            return {"available": False, "message": f"Browser Runtime 未连接：{exc}"}
+        if not isinstance(health, dict) or health.get("runtime") != "bosshunter":
+            return {"available": False, "message": "BossHunter Browser Runtime 未连接"}
+        try:
+            targets = [t for t in self.browser.runtime.targets() if self.browser.recruiter_target(t)]
+        except Exception as exc:
+            return {"available": False, "message": f"读取 Chrome 标签失败：{exc}"}
+        if not targets:
+            return {"available": False, "message": "未找到 BOSS 招聘端标签页，发送需在 Chrome 打开招聘页"}
+        target_id = getattr(self.browser, 'target_id', None)
+        if target_id and not any(t.get('targetId') == target_id for t in targets):
+            return {"available": False, "message": "绑定的招聘标签页已关闭或离开招聘端"}
+        return {"available": True, "message": "发送通道正常"}
 
     def _worker_alive(self):
         """独立 worker 进程是否存活（通过心跳时间戳判断）。"""
