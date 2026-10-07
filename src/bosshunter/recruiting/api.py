@@ -6,7 +6,7 @@ from threading import Lock
 from bottle import request
 
 from bosshunter.ai.credentials import AIRequestError
-from .browser import BrowserError
+from .browser import AccountPauseError, BrowserError
 from .service import RecruitingService
 
 
@@ -65,9 +65,11 @@ def register(app, data_dir, config, respond):
                 "reply/draft": lambda: s.prepare_reply(payload["conversation_id"], str(payload.get("text", "")), str(payload.get("question", ""))),
                 "action/draft": lambda: s.prepare_action(payload["conversation_id"], payload["kind"]),
                 "outbox/execute": lambda: s.execute(payload["id"]),
-                "outbox/cancel": lambda: s.store.finish(payload["id"], "cancelled", "本地用户取消草稿") if s.store.row("outbox", payload["id"])["status"] == "draft" else (_ for _ in ()).throw(ValueError("只能取消未执行草稿")),
+                "outbound/resolve": lambda: s.store.resolve_outbound(payload['kind'], payload['id'], payload['outcome'], payload['evidence']),
+                "outbox/cancel": lambda: s.store.cancel_draft(payload["id"]),
                 "invitations/draft": lambda: s.invitation(payload),
                 "conversation/select": lambda: s.store.select_conversation(payload["conversation_id"]),
+                "conversation/link-position": lambda: s.link_position(payload['conversation_id'], payload['platform_id']),
                 "conversation/control": lambda: s.control(payload["conversation_id"], payload["taken_over"], payload["do_not_contact"]),
                 "conversation/auto-send": lambda: s.set_auto_send(payload["conversation_id"], payload["enabled"]),
                 "monitor/once": lambda: s.monitor_once(),
@@ -77,7 +79,7 @@ def register(app, data_dir, config, respond):
             if operation not in actions:
                 return respond({"error": "未知招聘操作"}, 404)
             # Serialize browser use and local policy mutations; a stop can interrupt waits.
-            if operation == "monitor/stop":
+            if operation in {'monitor/stop', 'discover/stop', 'conversation/control', 'conversation/auto-send'}:
                 result = actions[operation]()
             else:
                 with s.lock:
@@ -87,6 +89,10 @@ def register(app, data_dir, config, respond):
             return respond({"error": str(exc), "code": "action_disabled"}, 403)
         except (KeyError, TypeError, ValueError) as exc:
             return respond({"error": str(exc) if not isinstance(exc, KeyError) else "缺少必需字段"}, 400)
+        except AccountPauseError as exc:
+            s.set_monitor_enabled(False)
+            s.stop_discovery()
+            return respond({"error": str(exc), "code": "account_paused"}, 409)
         except BrowserError as exc:
             return respond({"error": str(exc), "code": "browser_unavailable"}, 409)
         except AIRequestError as exc:

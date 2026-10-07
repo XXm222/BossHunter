@@ -103,6 +103,16 @@ class LocalChatTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual([m['id'] for m in result['messages']], ['7'])  # 只返回新消息（mid > 6）
 
+    def test_no_new_messages_still_verify_account(self):
+        item = message(6)
+        item['to']['uid'] = 999
+        with self.assertRaises(BrowserError):
+            self.read(self.adapter(lambda req: response([item])), expected_account='456', since_mid=6)
+
+    def test_incremental_page_order_does_not_drop_new_message(self):
+        value = self.read(self.adapter(lambda req: response([message(6), message(7)])), since_mid=6)
+        self.assertEqual([m['id'] for m in value['messages']], ['7'])
+
     def test_auth_failure_is_sanitized_and_not_retried(self):
         calls = []
         def handle(req):

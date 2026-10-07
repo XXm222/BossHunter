@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act as reactAct, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import RecruitingPage from './RecruitingPage'
+import { BindingWizard } from './BindingWizard'
+import type { State } from './RecruitingPage'
 
 const c = { id: '123456-0', name: '张三', position_id: 'p', updated_at: '2026-01-01', taken_over: 0, do_not_contact: 0, snapshot: { messages: [], coverage: '当前已加载消息' } }
 const baseState = { positions: [{ id: 'p', title: '前端工程师', jd: '', enabled: 1, version: 1 }], conversations: [], documents: [], company: { text: '', version: 0, updated_at: null }, assessments: [], events: [], outbox: [], connection: { connected: true, message: '已连接' }, monitor: { running: false, error: '', last_success: null, interval_seconds: 120 }, model_ready: false }
@@ -72,4 +74,43 @@ describe('binding wizard', () => {
     fireEvent.click(await screen.findByRole('button', { name: /确认绑定这个会话/ }))
     await waitFor(() => expect(fetcher).toHaveBeenCalledWith('/api/recruiting/binding/confirm', expect.objectContaining({ body: JSON.stringify({ conversation_id: '123456-0', name: '张三', position_title: '前端工程师', expected_account: '987654' }) })))
   })
+})
+
+describe('request and preview regressions', () => {
+const data = { conversations: [], connection: { connected: true, message: '' } } as unknown as State
+const contacts = [{ ident: '123-0', name: '合成候选人', position_title: '岗位甲' }]
+const preview = { account_uid: '456', name: '合成候选人', position_title: '岗位甲', message_count: 1, coverage: '合成记录' }
+const reply = (result: unknown) => new Response(JSON.stringify({ result }))
+async function selectContact() {
+  fireEvent.click(screen.getByRole('button', { name: '加载联系人列表' }))
+  fireEvent.click(await screen.findByRole('button', { name: '合成候选人 · 岗位甲' }))
+}
+
+it('invalidates a completed preview when the job title changes', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => reply(url.endsWith('contacts/list') ? contacts : preview)))
+  render(<BindingWizard data={data} act={vi.fn()} busy={false} />)
+  await selectContact()
+  fireEvent.click(screen.getByRole('button', { name: '预览核实' }))
+  expect(await screen.findByRole('button', { name: '确认绑定这个会话' })).toBeTruthy()
+  fireEvent.change(screen.getByLabelText('沟通岗位'), { target: { value: '岗位乙' } })
+  expect(screen.queryByRole('button', { name: '确认绑定这个会话' })).toBeNull()
+})
+
+it('prevents concurrent wizard requests and discards an outdated preview', async () => {
+  let release!: (value: Response) => void
+  const pending = new Promise<Response>(resolve => { release = resolve })
+  const fetcher = vi.fn(async (url: string) => url.endsWith('contacts/list') ? reply(contacts) : pending)
+  vi.stubGlobal('fetch', fetcher)
+  render(<BindingWizard data={data} act={vi.fn()} busy={false} />)
+  await selectContact()
+  fireEvent.click(screen.getByRole('button', { name: '预览核实' }))
+  fireEvent.click(screen.getByRole('button', { name: '预览核实' }))
+  expect((screen.getByRole('button', { name: '加载联系人列表' }) as HTMLButtonElement).disabled).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: '加载联系人列表' }))
+  fireEvent.change(screen.getByLabelText('沟通岗位'), { target: { value: '岗位乙' } })
+  await reactAct(async () => { release(reply(preview)); await pending })
+  expect(fetcher).toHaveBeenCalledTimes(2)
+  expect(screen.queryByRole('button', { name: '确认绑定这个会话' })).toBeNull()
+})
+
 })

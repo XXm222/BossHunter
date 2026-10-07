@@ -3,9 +3,11 @@
 Discovery imports never grant permission to contact. Platform job identifiers are required for synchronization.
 """
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from .store import encode, now
+
+QUOTA_TTL_SECONDS = 300
 
 
 def day_key():
@@ -29,13 +31,28 @@ class RecruitingJobs:
                     status TEXT NOT NULL, created_at TEXT NOT NULL
                 );
             ''')
+            db.execute('BEGIN IMMEDIATE')
             cols = [r[1] for r in db.execute("PRAGMA table_info(greeting_attempts)").fetchall()]
             if 'name' not in cols:
                 db.execute("ALTER TABLE greeting_attempts ADD COLUMN name TEXT NOT NULL DEFAULT ''")
-            db.execute("UPDATE greeting_attempts SET status='uncertain' WHERE status='sending'")
+            if 'owner' not in cols:
+                db.execute("ALTER TABLE greeting_attempts ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+            for row in db.execute("SELECT id,owner FROM greeting_attempts WHERE status='sending'").fetchall():
+                if not store.owner_alive(row['owner']):
+                    db.execute("UPDATE greeting_attempts SET status='uncertain' WHERE id=? AND status='sending'", (row['id'],))
 
     def config(self):
         return self.store.setting('greeting_budget', {'mode': 'platform', 'limit': 100})
+
+    @staticmethod
+    def quota_fresh(quota, day):
+        if quota.get('date') != day:
+            return False
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(quota['updated_at'])).total_seconds()
+            return 0 <= age <= QUOTA_TTL_SECONDS
+        except (KeyError, ValueError, TypeError):
+            return False
 
     @staticmethod
     def _platform_remaining(quota, day, used):
@@ -44,7 +61,7 @@ class RecruitingJobs:
         unlimited 时返回 None（不限）；remaining 缺失或跨日过期返回 None（需重新读取）；
         否则返回 remaining 减去「读取之后新增的本地发送」。
         """
-        if quota.get('unlimited'):
+        if not RecruitingJobs.quota_fresh(quota, day) or quota.get('unlimited'):
             return None
         remaining = quota.get('remaining')
         if remaining is None or quota.get('date') != day:
@@ -57,12 +74,18 @@ class RecruitingJobs:
         if config['mode'] == 'custom':
             if used >= config['limit']:
                 return '今日招呼额度已用完'
+            if not self.quota_fresh(quota, day):
+                return '平台剩余额度未读取或已过期，请先读取额度'
             if quota.get('date') == day and not quota.get('unlimited'):
                 remaining = self._platform_remaining(quota, day, used)
+                if remaining is None:
+                    return '平台剩余额度未知，请先读取额度'
                 if remaining is not None and remaining <= 0:
                     return '平台剩余额度已用完，暂停主动招呼'
             return None
         # platform 模式
+        if not self.quota_fresh(quota, day):
+            return '平台剩余额度未读取或已过期，请先读取额度'
         if quota.get('unlimited'):
             return None
         remaining = self._platform_remaining(quota, day, used)
@@ -134,6 +157,9 @@ class RecruitingJobs:
         day = day_key()
         with self.store.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.require_selected(db, job_id)
+            if self.store.task_active(db, 'greeting-quota'):
+                raise ValueError('正在核对平台额度，请稍后重试招呼')
             config_raw = db.execute("SELECT value FROM settings WHERE key='greeting_budget'").fetchone()
             config = json.loads(config_raw[0]) if config_raw else {'mode': 'platform', 'limit': 100}
             quota_raw = db.execute("SELECT value FROM settings WHERE key='greeting_quota'").fetchone()
@@ -142,20 +168,36 @@ class RecruitingJobs:
             unresolved = db.execute("SELECT count(*) FROM greeting_attempts WHERE status IN ('sending','uncertain')").fetchone()[0]
             if unresolved:
                 raise ValueError('存在发送结果待核实的招呼，暂停继续外发')
+            if db.execute("SELECT 1 FROM outbox WHERE status IN ('sending','uncertain')").fetchone():
+                raise ValueError('存在消息发送结果待核实，暂停继续外发')
             blocked = self._quota_blocked(config, quota, used, day)
             if blocked:
                 raise ValueError(blocked)
-            cur = db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, name, status, created_at) VALUES (?,?,?,?,?,?)',
-                             (day, job_id, candidate_id, name, 'sending', now()))
+            cur = db.execute('INSERT OR IGNORE INTO greeting_attempts(day, job_id, candidate_id, name, status, created_at, owner) VALUES (?,?,?,?,?,?,?)',
+                             (day, job_id, candidate_id, name, 'sending', now(), self.store.owner))
             if cur.rowcount == 0:
                 raise ValueError('该候选人已被占用，请核实后重试')
         self.store.event('greeting_reserved', candidate_id, f'岗位 {job_id} 已占用，准备打招呼')
         return self.state()
 
+    @staticmethod
+    def require_selected(db, job_id):
+        job = db.execute('SELECT * FROM published_jobs WHERE id=?', (job_id,)).fetchone()
+        if not job or not job['platform_id']:
+            raise ValueError('岗位平台身份尚未关联，请先核实岗位')
+        if not job['selected']:
+            raise ValueError('该岗位未人工勾选，不能自动处理')
+        if job['status'] != '开放中':
+            raise ValueError('该岗位当前不是开放中，不能自动处理')
+
+    def check_position(self, job_id):
+        with self.store.db() as db:
+            self.require_selected(db, job_id)
+
     def finish_greeting(self, candidate_id, status):
-        """把 sending 记录更新为最终结果 sent 或 uncertain。"""
-        if status not in {'sent', 'uncertain'}:
-            raise ValueError('招呼结果必须是 sent 或 uncertain')
+        """结束发送占用；cancelled 仅用于已确定未提交点击的任务。"""
+        if status not in {'sent', 'uncertain', 'cancelled'}:
+            raise ValueError('招呼结果必须是 sent、uncertain 或 cancelled')
         with self.store.db() as db:
             db.execute("UPDATE greeting_attempts SET status=? WHERE candidate_id=? AND status='sending'",
                        (status, candidate_id))
@@ -167,7 +209,7 @@ class RecruitingJobs:
         with self.store.db() as db:
             jobs = [dict(r) for r in db.execute("SELECT * FROM published_jobs ORDER BY CASE status WHEN '开放中' THEN 0 ELSE 1 END,title")]
             counts = dict(db.execute('SELECT status,count(*) FROM greeting_attempts WHERE day=? GROUP BY status', (day,)).fetchall())
-            attempts = [dict(r) for r in db.execute('SELECT id,job_id,candidate_id,name,status,created_at FROM greeting_attempts WHERE day=? ORDER BY id DESC', (day,))]
+            attempts = [dict(r) for r in db.execute("SELECT id,day,job_id,candidate_id,name,status,created_at FROM greeting_attempts WHERE day=? OR status IN ('sending','uncertain') ORDER BY id DESC", (day,))]
             unresolved = db.execute("SELECT count(*) FROM greeting_attempts WHERE status IN ('sending','uncertain')").fetchone()[0]
         for job in jobs:
             job['details'] = json.loads(job['details'])
@@ -183,18 +225,15 @@ class RecruitingJobs:
             blockers.append('已选岗位的平台唯一标识尚未核实')
         if unresolved:
             blockers.append('存在发送结果待核实的招呼，暂停继续外发')
+        can_start = not blockers
+        if config['mode'] == 'custom' and used >= config['limit']:
+            can_start = False
         if selected:
-            if config['mode'] == 'platform':
-                if not quota.get('unlimited'):
-                    if platform_remaining is None:
-                        blockers.append('平台剩余额度未读取或已过期，请先读取额度')
-                    elif platform_remaining <= 0:
-                        blockers.append('今日招呼额度已用完')
-            else:
-                if used >= config['limit']:
-                    blockers.append('今日招呼额度已用完')
-                elif quota.get('date') == day and not quota.get('unlimited') and platform_remaining is not None and platform_remaining <= 0:
-                    blockers.append('平台剩余额度已用完，暂停主动招呼')
+            blocked = self._quota_blocked(config, quota, used, day)
+            if blocked:
+                blockers.append(blocked)
+                if self.quota_fresh(quota, day):
+                    can_start = False
         return {'jobs': jobs, 'sync': self.store.setting('jobs_sync', {}), 'budget': config,
                 'daily': {'date': day, 'timezone': 'Asia/Shanghai', 'attempted': used,
                           'sent': counts.get('sent', 0), 'uncertain': counts.get('uncertain', 0),
@@ -203,4 +242,4 @@ class RecruitingJobs:
                           'quota_unlimited': bool(quota.get('unlimited')),
                           'quota_date': quota.get('date')},
                 'attempts': attempts,
-                'selected_count': len(selected), 'running': False, 'blockers': blockers}
+                'selected_count': len(selected), 'running': False, 'can_start': can_start, 'blockers': blockers}

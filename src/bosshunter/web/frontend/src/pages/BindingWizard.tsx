@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Loader2, RefreshCw, ShieldCheck } from 'lucide-react'
 import type { Act, State } from './RecruitingPage'
 
@@ -14,8 +14,13 @@ export function BindingWizard({ data, act, busy }: { data: State; act: Act; busy
   const [preview, setPreview] = useState<Preview | null>(null)
   const [checking, setChecking] = useState(false)
   const [previewError, setPreviewError] = useState('')
+  const pending = useRef(false)
+  const revision = useRef(0)
 
   const loadContacts = async () => {
+    if (busy || pending.current) return
+    pending.current = true
+    revision.current += 1
     setLoading(true); setLoadError(''); setSelected(null); setPreview(null)
     try {
       const response = await fetch('/api/recruiting/contacts/list', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
@@ -25,16 +30,20 @@ export function BindingWizard({ data, act, busy }: { data: State; act: Act; busy
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : '联系人读取失败')
     } finally {
+      pending.current = false
       setLoading(false)
     }
   }
 
   const pick = (c: Contact) => {
+    revision.current += 1
     setSelected(c); setPositionTitle(c.position_title); setPreview(null); setPreviewError('')
   }
 
   const runPreview = async () => {
-    if (!selected) return
+    if (!selected || busy || pending.current) return
+    pending.current = true
+    const expectedRevision = revision.current
     setChecking(true); setPreviewError(''); setPreview(null)
     try {
       const response = await fetch('/api/recruiting/binding/preview', {
@@ -43,10 +52,11 @@ export function BindingWizard({ data, act, busy }: { data: State; act: Act; busy
       })
       const value = await response.json()
       if (!response.ok) throw new Error(value.error || '预览未完成')
-      setPreview(value.result)
+      if (revision.current === expectedRevision) setPreview(value.result)
     } catch (e) {
       setPreviewError(e instanceof Error ? e.message : '预览未完成')
     } finally {
+      pending.current = false
       setChecking(false)
     }
   }
@@ -58,7 +68,7 @@ export function BindingWizard({ data, act, busy }: { data: State; act: Act; busy
     {!data.connection.connected && <p className="rc-alert warning" role="status">{data.connection.message || '尚未核实本地 BOSS 登录状态'}</p>}
 
     <div className="rc-section-heading">
-      <button type="button" disabled={busy || loading} onClick={loadContacts}>
+      <button type="button" disabled={busy || loading || checking} onClick={loadContacts}>
         {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} 加载联系人列表
       </button>
     </div>
@@ -79,7 +89,7 @@ export function BindingWizard({ data, act, busy }: { data: State; act: Act; busy
     {selected && <div className="rc-panel">
       <p>已选候选人：<strong>{selected.name}</strong>（会话 {selected.ident}）</p>
       <label htmlFor="binding-title">沟通岗位</label>
-      <input id="binding-title" value={positionTitle} onChange={e => setPositionTitle(e.target.value)} placeholder="岗位名称（jobName 为空时需手动填）" />
+      <input id="binding-title" value={positionTitle} onChange={e => { revision.current += 1; setPositionTitle(e.target.value); setPreview(null) }} placeholder="岗位名称（jobName 为空时需手动填）" />
       <div className="rc-section-heading">
         <button type="button" disabled={busy || checking || !positionTitle.trim()} onClick={runPreview}>
           {checking ? <Loader2 size={14} className="animate-spin" /> : null} 预览核实
@@ -93,7 +103,7 @@ export function BindingWizard({ data, act, busy }: { data: State; act: Act; busy
       <p>核实到招聘账号 uid：<strong>{preview.account_uid}</strong></p>
       <p>候选人：<strong>{preview.name}</strong> · {preview.position_title} · {preview.message_count} 条已读消息</p>
       <p className="rc-caption">{preview.coverage}</p>
-      <button className="primary" disabled={busy} onClick={async () => { const ok = await act('binding/confirm', { conversation_id: selected.ident, name: selected.name, position_title: positionTitle.trim(), expected_account: preview.account_uid }, '会话已绑定'); if (ok) { setSelected(null); setPreview(null); setPositionTitle('') } }}>
+      <button className="primary" disabled={busy || loading || checking} onClick={async () => { const ok = await act('binding/confirm', { conversation_id: selected.ident, name: selected.name, position_title: preview.position_title, expected_account: preview.account_uid }, '会话已绑定'); if (ok) { setSelected(null); setPreview(null); setPositionTitle('') } }}>
         <ShieldCheck size={14} /> 确认绑定这个会话
       </button>
     </div>}

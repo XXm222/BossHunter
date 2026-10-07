@@ -99,6 +99,16 @@ class RuntimeAdapterTests(unittest.TestCase):
         ])
         self.assertEqual(self.runtime.evaluate.call_count, 7)  # 6 次滚动 + 1 次最终读取
 
+    def test_virtual_contact_list_keeps_rows_that_leave_dom(self):
+        a = {'ident': '1-0', 'name': '甲', 'position_title': '岗位'}
+        b = {'ident': '2-0', 'name': '乙', 'position_title': '岗位'}
+        self.runtime.evaluate.side_effect = [json.dumps({'count': 1, 'contacts': rows})
+            for rows in ([a], [b], [b], [b], [b])] + [json.dumps({'contacts': [b]})]
+        with patch('bosshunter.recruiting.browser.time.sleep'):
+            result = self.browser.read_contact_list(load_all=True)
+        self.assertEqual({c['ident'] for c in result}, {'1-0', '2-0'})
+        self.assertFalse(self.browser.contact_coverage['complete'])
+
     def test_actual_client_contract_uses_configured_builtin_runtime(self):
         calls = []
         def get(url, **kwargs):

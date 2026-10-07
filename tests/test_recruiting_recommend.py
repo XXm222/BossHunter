@@ -22,9 +22,10 @@ class Frame:
 
 
 class Page:
-    def __init__(self, url, frames):
+    def __init__(self, url, frames, target_id='test-target'):
         self.url = url
         self.frames = frames
+        self.target_id = target_id
         self.reload_calls = 0
 
     def reload(self, **kwargs):
@@ -34,6 +35,13 @@ class Page:
 class Context:
     def __init__(self, pages):
         self.pages = pages
+        for page in pages:
+            page.context = self
+
+    def new_cdp_session(self, page):
+        session = Mock()
+        session.send.return_value = {'targetInfo': {'targetId': page.target_id}}
+        return session
 
 
 class Browser:
@@ -73,6 +81,9 @@ class FakeLocalSession:
     def list_contacts(self):
         return self._contacts
 
+    def read_greeting_quota(self):
+        return {'remaining': 100, 'unlimited': False}
+
 
 class GreetFrame:
     """frame 的 evaluate 按 JS 内容分派：读岗位、点击、读文案分别返回。"""
@@ -103,6 +114,18 @@ def greet(uid, frame, wait_timeout=0.05):
 class GreetVerifierTests(unittest.TestCase):
     FRAME_URL = "https://www.zhipin.com/web/frame/recommend/"
 
+    def test_final_preflight_blocks_click_after_connect(self):
+        frame = GreetFrame(self.FRAME_URL)
+        frame.evaluate = Mock(wraps=frame.evaluate)
+        pw = PW(Browser(Context([Page(RECOMMEND_PAGE, [frame])])))
+        verifier = RecommendVerifier(lambda: {}, cdp_url="http://127.0.0.1:9222")
+        from bosshunter.recruiting.browser import TaskCancelled
+        guard = Mock(side_effect=TaskCancelled('停止'))
+        with patch('bosshunter.recruiting.recommend.sync_playwright', return_value=SyncPlaywright(pw)):
+            with self.assertRaises(TaskCancelled):
+                verifier.greet('geek123', preflight=guard)
+        self.assertFalse(any('btn.click()' in call.args[0] for call in frame.evaluate.call_args_list))
+
     def test_greet_clicks_and_confirms(self):
         result, pw, page = greet("geek123", GreetFrame(self.FRAME_URL, job_id="encryptJob123"))
         self.assertTrue(result["sent"])
@@ -129,6 +152,44 @@ class GreetVerifierTests(unittest.TestCase):
         result, _, _ = greet("geek123", GreetFrame(self.FRAME_URL, job_id="encryptJob123", click_result="already"))
         self.assertTrue(result["sent"])
         self.assertIn("已打过招呼", result["reason"])
+
+    def test_bound_same_url_target_is_selected_by_identity(self):
+        wrong = Page(RECOMMEND_PAGE, [], 'wrong')
+        bound = Page(RECOMMEND_PAGE, [], 'bound')
+        verifier = RecommendVerifier(lambda: {'browser': {'recruiting_target_id': 'bound'}})
+        self.assertIs(verifier._recommend_page(Context([wrong, bound])), bound)
+
+    def test_closed_implicit_target_never_switches_to_other_page(self):
+        original = Page(RECOMMEND_PAGE, [], 'original')
+        verifier = RecommendVerifier(lambda: {})
+        verifier._recommend_page(Context([original]))
+        with self.assertRaisesRegex(BrowserError, '绑定'):
+            verifier._recommend_page(Context([Page(RECOMMEND_PAGE, [], 'replacement')]))
+
+    def test_target_in_second_context_is_selected(self):
+        wrong = Context([Page(RECOMMEND_PAGE, [], 'wrong')])
+        bound = Page(RECOMMEND_PAGE, [], 'bound')
+        browser = Mock(contexts=[wrong, Context([bound])])
+        verifier = RecommendVerifier(lambda: {'browser': {'recruiting_target_id': 'bound'}})
+        self.assertIs(verifier._recommend_page(browser), bound)
+
+    def test_missing_button_does_not_prove_success(self):
+        with self.assertRaises(BrowserError):
+            greet('geek123', GreetFrame(self.FRAME_URL, click_result='unavailable'))
+
+    def test_mismatched_browser_login_never_clicks(self):
+        from types import SimpleNamespace
+        frame = Mock(url=self.FRAME_URL)
+        page = Page(RECOMMEND_PAGE, [frame])
+        context = Context([page])
+        context.cookies = Mock(return_value=[{'name': 'wt2', 'value': 'other-synthetic-session'}])
+        pw = PW(Browser(context))
+        verifier = RecommendVerifier(lambda: {}, cdp_url='http://127.0.0.1:9222',
+            cookie_loader=lambda: [SimpleNamespace(name='wt2', value='expected-synthetic-session')])
+        with patch('bosshunter.recruiting.recommend.sync_playwright', return_value=SyncPlaywright(pw)):
+            with self.assertRaisesRegex(BrowserError, '登录账号'):
+                verifier.greet('candidate', 'test-job')
+        frame.evaluate.assert_not_called()
 
     def test_greet_does_not_treat_other_text_as_success(self):
         # 问题 5：按钮文案不是「继续沟通」时，不能判为发送成功

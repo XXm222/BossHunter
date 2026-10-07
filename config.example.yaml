@@ -165,14 +165,15 @@ browser:
 # 招聘端节流与自动外发配置（默认较保守以降低风控/封号风险；真机确认安全后再放宽）
 recruiting:
   # 后台 HTTP 读取节流（同步消息/岗位/联系人/额度）
-  read_delay_min: 20        # 每次读取间隔（秒）下限
-  read_delay_max: 40        # 上限
-  read_daily_limit: 50      # 单日后台请求上限
-  read_page_delay: 3        # 分页读取时每页间隔（秒）
+  read_delay_min: 120       # Web/worker 共用逐请求间隔（秒）下限；包含分页和发送前核验
+  read_delay_max: 180       # 上限；并非平台承诺的安全频率
+  read_daily_limit: 20      # 单日请求/触发加载动作上限，重启不重置
+  read_page_delay: 120      # 独立会话分页等待；服务模式分页使用共用逐请求限速
+  monitor_interval_seconds: 600  # 每 10 分钟处理一个候选人，完整一轮需候选人数 × 10 分钟以上
   # 主动打招呼循环节流
-  greet_delay_min: 30       # 每个招呼动作间隔（秒）下限
-  greet_delay_max: 60       # 上限
+  greet_delay_min: 120      # 每个招呼动作间隔（秒）下限
+  greet_delay_max: 180      # 上限
   greet_per_job_min: 1      # 每岗位每轮最少招呼数
-  greet_per_job_max: 2      # 最多招呼数
+  greet_per_job_max: 1      # 最多招呼数
   # 自动回复
-  auto_reply_daily_limit: 10  # 每日自动回复上限
+  auto_reply_daily_limit: 5   # 每日自动回复上限

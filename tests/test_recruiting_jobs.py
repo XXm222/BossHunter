@@ -8,7 +8,7 @@ import httpx
 from bosshunter.recruiting.browser import BrowserError
 from bosshunter.recruiting.jobs import RecruitingJobs
 from bosshunter.recruiting.local_session import LocalBossSession
-from bosshunter.recruiting.store import Store
+from bosshunter.recruiting.store import Store, now
 
 
 def raw(ident='1', status=0):
@@ -141,7 +141,7 @@ class JobSelectionTests(unittest.TestCase):
 
     def test_platform_remaining_deducts_since_read(self):
         from bosshunter.recruiting.jobs import day_key
-        quota = {'limit': 5, 'used': 1, 'remaining': 4, 'unlimited': False, 'date': day_key(), 'local_used_at_read': 1}
+        quota = {'limit': 5, 'used': 1, 'remaining': 4, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 1}
         # 读取时本地已发 1 次、剩余 4；之后又发 2 次（used=3）→ 剩余 2
         self.assertEqual(self.jobs._platform_remaining(quota, day_key(), 3), 2)
         # 扣到 0 为止，不出现负数
@@ -157,7 +157,7 @@ class JobSelectionTests(unittest.TestCase):
         from bosshunter.recruiting.jobs import day_key
         self.jobs.select(['boss-one'])
         self.jobs.save_budget('platform', 100)
-        self.store.set_setting('greeting_quota', {'limit': 1, 'used': 0, 'remaining': 1, 'unlimited': False, 'date': day_key(), 'local_used_at_read': 0})
+        self.store.set_setting('greeting_quota', {'limit': 1, 'used': 0, 'remaining': 1, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 0})
         with self.store.db() as db:
             db.execute("INSERT INTO greeting_attempts(day,job_id,candidate_id,name,status,created_at) VALUES (?,?,?,?,?,?)",
                        (day_key(), 'boss-one', 'c1', '', 'sent', 'now'))
@@ -180,12 +180,12 @@ class JobSelectionTests(unittest.TestCase):
         self.jobs.select(['boss-one'])
         self.jobs.save_budget('custom', 100)
         # 自定义上限 100 还没到，但平台剩余为 0，应被平台剩余拦住
-        self.store.set_setting('greeting_quota', {'remaining': 0, 'unlimited': False, 'date': day_key(), 'local_used_at_read': 0})
+        self.store.set_setting('greeting_quota', {'remaining': 0, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 0})
         state = self.jobs.state()
         self.assertEqual(state['daily']['custom_remaining'], 100)
         self.assertTrue(any('平台剩余额度已用完' in b for b in state['blockers']))
         # 平台剩余充足时不误报
-        self.store.set_setting('greeting_quota', {'remaining': 5, 'unlimited': False, 'date': day_key(), 'local_used_at_read': 0})
+        self.store.set_setting('greeting_quota', {'remaining': 5, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 0})
         state = self.jobs.state()
         self.assertFalse(any('平台剩余额度已用完' in b for b in state['blockers']))
 

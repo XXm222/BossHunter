@@ -5,8 +5,8 @@ fingerprint — to lower platform risk, then reloads the recommend page and read
 the fresh first candidate card. BOSS only refreshes the recommend list on a real
 browser reload, not on in-app page switches, so the reload is mandatory.
 
-Safety: never creates, activates, closes, or switches tabs. It only reloads a
-page the user already opened on the recommend URL, and it never sends a message.
+Never creates, activates, closes, or switches tabs. Discovery reloads the bound
+recommend page; greeting clicks the authorized card and sends BOSS's default greeting.
 """
 import json
 import time
@@ -14,7 +14,7 @@ import time
 import httpx
 from patchright.sync_api import sync_playwright
 
-from .browser import BrowserError
+from .browser import AccountPauseError, BrowserError
 
 RECOMMEND_URL_PREFIX = "https://www.zhipin.com/web/chat/recommend"
 RECOMMEND_FRAME_PATH = "/web/frame/recommend/"
@@ -36,7 +36,9 @@ CLICK_GREET = r"""
         const geekid = (inner?.getAttribute('data-geekid') || inner?.getAttribute('data-geek') || '').trim();
         if (geekid !== uid) continue;
         const btn = card.querySelector('.btn-greet');
-        if (!btn) return 'already';
+        if (!btn) return 'unavailable';
+        if ((btn.innerText || '').trim() === '继续沟通') return 'already';
+        if ((btn.innerText || '').trim() !== '打招呼') return 'unavailable';
         btn.click();
         return 'clicked';
     }
@@ -101,10 +103,12 @@ READ_CANDIDATES = r"""
 
 
 class RecommendVerifier:
-    def __init__(self, config_provider, cdp_url=None, wait_timeout=15.0):
+    def __init__(self, config_provider, cdp_url=None, wait_timeout=15.0, cookie_loader=None):
         self.config_provider = config_provider
         self._cdp_url = cdp_url
         self._wait_timeout = wait_timeout
+        self._target_id = self._bound_target_id()
+        self._cookie_loader = cookie_loader
 
     def _chrome_ports(self):
         config = self.config_provider() or {}
@@ -117,15 +121,23 @@ class RecommendVerifier:
     def _find_cdp_url(self):
         if self._cdp_url:
             return self._cdp_url
+        candidates = []
         for port in self._chrome_ports():
             url = f"http://127.0.0.1:{port}"
             try:
                 response = httpx.get(f"{url}/json/version", timeout=2, trust_env=False)
                 if response.status_code == 200 and response.json().get("webSocketDebuggerUrl"):
-                    return url
+                    if self._target_id:
+                        targets = httpx.get(f'{url}/json/list', timeout=2, trust_env=False).json()
+                        if not any(t.get('id') == self._target_id for t in targets):
+                            continue
+                    candidates.append(url)
             except (httpx.HTTPError, ValueError):
                 continue
-        raise BrowserError("未找到可连接的 Chrome 调试端口，请确认 Chrome 已用调试端口启动")
+        if len(candidates) != 1:
+            raise BrowserError('Chrome 调试实例无法唯一确定，请绑定目标标签页；不会选取其他实例')
+        self._cdp_url = candidates[0]
+        return self._cdp_url
 
     def _bound_target_id(self):
         config = self.config_provider() or {}
@@ -142,27 +154,34 @@ class RecommendVerifier:
         except (httpx.HTTPError, ValueError):
             return []
 
-    def _recommend_page(self, context):
+    def _recommend_page(self, browser):
         """确定唯一要操作的推荐页：优先用绑定的 recruiting_target_id，否则要求唯一。
 
         多窗口/多推荐页/多账号时不再「取第一个」，避免连错页面；目标失效或出现
         多个可选页面就停止，不自动换另一页。
         """
-        pages = [p for p in context.pages if p.url and p.url.startswith(RECOMMEND_URL_PREFIX)]
-        target_id = self._bound_target_id()
+        contexts = browser.contexts if hasattr(browser, 'contexts') else [browser]
+        pages = [p for c in contexts for p in c.pages if p.url and p.url.startswith(RECOMMEND_URL_PREFIX)]
+        target_id = self._target_id
         if target_id:
-            target = next((t for t in self._cdp_page_targets() if t.get("id") == target_id), None)
-            if not target or not str(target.get("url", "")).startswith(RECOMMEND_URL_PREFIX):
-                raise BrowserError("绑定的招聘标签页不是推荐页或已关闭，停止操作；不会切换到其他标签页")
-            page = next((p for p in context.pages if p.url == target["url"]), None)
-            if not page:
-                raise BrowserError("绑定的推荐页当前不可用，请刷新后重试；不会切换到其他标签页")
-            return page
+            for page in pages:
+                if self._page_target_id(page) == target_id:
+                    return page
+            raise BrowserError('绑定的推荐页已关闭或离开推荐页；不会切换到其他标签页')
         if len(pages) == 1:
+            self._target_id = self._page_target_id(pages[0])
             return pages[0]
         if not pages:
             raise BrowserError("请先在 Chrome 打开 BOSS 牛人推荐页（/web/chat/recommend）")
         raise BrowserError("发现多个推荐页，无法唯一确定；请关闭多余页面或配置 browser.recruiting_target_id")
+
+    @staticmethod
+    def _page_target_id(page):
+        session = page.context.new_cdp_session(page)
+        try:
+            return session.send('Target.getTargetInfo')['targetInfo']['targetId']
+        finally:
+            session.detach()
 
     @staticmethod
     def _recommend_frame(page):
@@ -170,6 +189,16 @@ class RecommendVerifier:
             if frame.url and RECOMMEND_FRAME_PATH in frame.url:
                 return frame
         return None
+
+    def _verify_session(self, page):
+        if self._cookie_loader is None:
+            return
+        # Compare only in memory; never persist or return cookies in diagnostics.
+        expected = {(c.name, c.value) for c in self._cookie_loader() if c.name in {'wt2', 'zp_at'}}
+        actual = {(c['name'], c['value']) for c in page.context.cookies(['https://www.zhipin.com'])
+                  if c['name'] in {'wt2', 'zp_at'}}
+        if not expected or expected != actual:
+            raise AccountPauseError('推荐页登录账号与本地已核实的登录会话不一致，停止操作')
 
     @staticmethod
     def _job_id_from_frame(frame):
@@ -190,7 +219,7 @@ class RecommendVerifier:
             time.sleep(0.5)
         return frame.evaluate(READ_GREET_TEXT.replace("__UID__", json.dumps(uid)))
 
-    def greet(self, uid, expected_job_id=None):
+    def greet(self, uid, expected_job_id=None, preflight=None):
         """对已通过跨刷新验证的候选人点「打招呼」，BOSS 自动发默认招呼语。
 
         返回 {sent, job_id, reason}。先读 jobid（读不到就不点，避免发了却无法记录），
@@ -202,8 +231,8 @@ class RecommendVerifier:
         try:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0]
-            page = self._recommend_page(context)
+            page = self._recommend_page(browser)
+            self._verify_session(page)
             frame = self._recommend_frame(page)
             if not frame:
                 raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
@@ -212,11 +241,18 @@ class RecommendVerifier:
                 raise BrowserError("推荐页未选择岗位，无法记录招呼；请先在下拉框选择岗位")
             if expected_job_id and str(job_id) != str(expected_job_id):
                 raise BrowserError("推荐页当前岗位与任务岗位不一致，已停止招呼")
+            if preflight:
+                preflight()
+            self._verify_session(page)
             state = frame.evaluate(CLICK_GREET.replace("__UID__", json.dumps(uid)))
             if state == "missing":
                 raise BrowserError("未找到该候选人的卡片，页面可能已刷新，请重新验证")
             if state == "already":
+                if '继续沟通' not in str(frame.evaluate(READ_GREET_TEXT.replace('__UID__', json.dumps(uid)))):
+                    raise BrowserError('无法确认此前招呼结果，请人工核实')
                 return {"sent": True, "job_id": job_id, "reason": "该候选人已打过招呼（按钮已不是「打招呼」）"}
+            if state != 'clicked':
+                raise BrowserError('打招呼按钮不可用，未执行发送')
             text = self._wait_greet_text(frame, uid)
             sent = isinstance(text, str) and "继续沟通" in text
             return {"sent": sent, "job_id": job_id,
@@ -232,8 +268,8 @@ class RecommendVerifier:
         try:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0]
-            page = self._recommend_page(context)
+            page = self._recommend_page(browser)
+            self._verify_session(page)
             frame = self._recommend_frame(page)
             if not frame:
                 raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
@@ -253,8 +289,8 @@ class RecommendVerifier:
         try:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0]
-            page = self._recommend_page(context)
+            page = self._recommend_page(browser)
+            self._verify_session(page)
             frame = self._recommend_frame(page)
             if not frame:
                 raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
@@ -278,8 +314,8 @@ class RecommendVerifier:
         try:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0]
-            page = self._recommend_page(context)
+            page = self._recommend_page(browser)
+            self._verify_session(page)
             page.reload(wait_until="domcontentloaded")
             # 等推荐 iframe 重新加载出来，供后续 select_job/read_candidates 使用
             deadline = time.time() + self._wait_timeout

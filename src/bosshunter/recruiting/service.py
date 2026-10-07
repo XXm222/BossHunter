@@ -1,5 +1,6 @@
 """One-account, one-conversation recruiting pilot with persistent outbound guards."""
 from datetime import date, datetime, timezone
+from copy import deepcopy
 from zoneinfo import ZoneInfo
 import json
 import random
@@ -8,17 +9,28 @@ from threading import Event, RLock, Thread
 from uuid import uuid4
 
 from . import agent
-from .browser import AccountPauseError, BossBrowser, BrowserError
-from .store import Store, encode, fingerprint, now
+from .browser import AccountPauseError, BossBrowser, BrowserError, TaskCancelled
+from .store import Store, TaskBusy, RequestThrottled, RequestPaused, encode, fingerprint, merge_messages, now
 from .policy import check_reply
 from .jobs import RecruitingJobs
 from .local_session import LocalBossSession
 from bosshunter.browser.client import RuntimeClient
 from bosshunter.throttle import PageThrottle
+from bosshunter.ai.credentials import get_ai_base_url, get_ai_service
 
 # 平台额度缓存有效期（秒）：超过视为过期，主动打招呼循环里重新读取，以覆盖
 # 「人工直接在 BOSS 打招呼」导致平台剩余变化、本地缓存失真的情况。
 QUOTA_TTL_SECONDS = 300
+
+
+def candidate_question(snapshot):
+    """Latest candidate text still awaiting a text reply; system/card records stay in context."""
+    for message in reversed(snapshot.get('messages', [])):
+        if message['direction'] == 'out' and message['kind'] == 'text':
+            return None
+        if message['direction'] == 'in' and message['kind'] == 'text':
+            return message
+    return None
 
 
 class RecruitingService:
@@ -31,10 +43,10 @@ class RecruitingService:
         cfg = self._recruiting_cfg()
         self.local_session = local_session or LocalBossSession(
             user_data_dir=config_provider().get("browser", {}).get("recruiting_user_data_dir"),
-            read_delay=(cfg.get("read_delay_min", 20.0), cfg.get("read_delay_max", 40.0)),
-            daily_limit=cfg.get("read_daily_limit", 50),
-            page_delay=cfg.get("read_page_delay", 3.0),
-            request_counter=self._count_request)
+            read_delay=(cfg.get("read_delay_min", 120.0), cfg.get("read_delay_max", 180.0)),
+            daily_limit=cfg.get("read_daily_limit", 20),
+            page_delay=cfg.get("read_page_delay", 120.0),
+            request_counter=self._count_request, account_pause_handler=self._pause_platform_requests)
         self.verifier = verifier
         self.use_local_session = browser is None or local_session is not None
         self.lock = RLock()
@@ -43,8 +55,8 @@ class RecruitingService:
         self._stop_event = None
         saved_monitor = self.store.setting('monitor_state', {})
         self.monitor = {"running": False, "last_success": saved_monitor.get('last_success'),
-                        "error": saved_monitor.get('error') or "", "interval_seconds": 120,
-                        "mode": "read_assess_and_draft", "note": "监测绑定会话，收到简历自动读取和评分；不会自动外发"}
+                        "error": saved_monitor.get('error') or "", "interval_seconds": max(60, cfg.get('monitor_interval_seconds', 600)),
+                        "mode": "round_robin_read_assess_and_reply", "note": "轮询已授权绑定会话；自动外发遵循每会话开关，非全账号实时监听"}
         self.connection = {"connected": False, "message": "尚未核实本地 BOSS 登录状态", "transport": "local_cookie_http"}
         self.store.recover_outbox()
 
@@ -54,10 +66,30 @@ class RecruitingService:
 
     def _count_request(self, kind):
         """LocalBossSession 每次后台请求前的计数回调：按账号存 DB，超限抛 BrowserError。"""
-        try:
-            self.store.count_request(kind, self._recruiting_cfg().get("read_daily_limit", 50))
-        except ValueError as exc:
-            raise BrowserError(str(exc)) from None
+        cfg = self._recruiting_cfg()
+        interval = random.uniform(cfg.get('read_delay_min', 120.0), cfg.get('read_delay_max', 180.0))
+        while True:
+            self._check_stopped()
+            if kind in {'greeting', 'recommend_load'} and self.discovery_stop.is_set():
+                raise TaskCancelled('主动招呼已停止')
+            try:
+                self.store.count_request(kind, cfg.get('read_daily_limit', 20), min_interval=interval)
+                return
+            except RequestThrottled as exc:
+                # No DB transaction is held during the wait. Recheck and compete
+                # for the slot after waking; Web and worker share this deadline.
+                self.local_session._wait_cancelled(min(exc.seconds, 1.0))
+            except RequestPaused as exc:
+                raise AccountPauseError(str(exc)) from None
+            except ValueError as exc:
+                if self._stop_event is not None:
+                    self.set_monitor_enabled(False)
+                raise BrowserError(str(exc)) from None
+
+    def _pause_platform_requests(self, seconds):
+        self.store.pause_requests(seconds)
+        self.discovery_stop.set()
+        self.store.event('platform_cooldown', '', 'BOSS 拒绝或限流；后台任务暂停，共享冷却至少 30 分钟，核实账号后手动恢复')
 
     def state(self):
         s = self.store
@@ -65,11 +97,18 @@ class RecruitingService:
         for c in conversations:
             c["snapshot"] = json.loads(c["snapshot"])
         docs = s.rows("documents", "ORDER BY created_at DESC, rowid DESC")
+        current_documents = {c['id']: s.current_document(c['id']) for c in conversations}
+        current_document_ids = {d['id'] for d in current_documents.values() if d}
+        docs.sort(key=lambda d: d['id'] not in current_document_ids)
         for d in docs:
             d["meta"] = json.loads(d["meta"])
         assessments = s.rows("assessments", "ORDER BY created_at DESC, rowid DESC")
         for a in assessments:
             a["result"] = json.loads(a["result"])
+        current_assessment_ids = {}
+        for c in conversations:
+            assessment = self.reply_context(c['id'])['assessment']
+            current_assessment_ids[c['id']] = assessment['id'] if assessment else None
         drafts = s.rows("outbox", "ORDER BY created_at DESC, rowid DESC")
         for d in drafts:
             d["refs"] = json.loads(d["refs"])
@@ -80,6 +119,7 @@ class RecruitingService:
         monitor_enabled = bool(s.setting('monitor_enabled', False))
         # 读 DB 里的 monitor_state：worker 独立进程写入的最新成功时间/错误，本进程内存不会自动刷新
         saved_monitor = s.setting('monitor_state', {})
+        allowed_count = len(self._allowed_conversations())
         monitor_state = {
             "running": worker_alive and monitor_enabled,
             "paused": worker_alive and not monitor_enabled,
@@ -89,23 +129,29 @@ class RecruitingService:
             "interval_seconds": self.monitor['interval_seconds'],
             "mode": self.monitor['mode'],
             "note": self.monitor['note'],
+            'allowed_count': allowed_count,
+            'estimated_cycle_seconds': allowed_count * self.monitor['interval_seconds'],
+            'processing_conversation_id': saved_monitor.get('processing_conversation_id') if worker_alive else None,
         }
         budget = s.request_budget()
-        read_daily_limit = self._recruiting_cfg().get("read_daily_limit", 50)
+        read_daily_limit = self._recruiting_cfg().get("read_daily_limit", 20)
         request_budget = {"date": budget.get("date"), "count": budget.get("count", 0),
                           "daily_limit": read_daily_limit,
                           "remaining": max(0, read_daily_limit - budget.get("count", 0)),
-                          "by_kind": budget.get("by_kind", {})}
+                          "by_kind": budget.get("by_kind", {}),
+                          'paused_until': s.setting('request_paused_until', 0)}
         return {"positions": s.rows("positions"), "conversations": conversations,
                 "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
+                "current_assessment_ids": current_assessment_ids,
                 "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
                 "connection": self.connection, "monitor": monitor_state,
                 "send_channel": self._send_channel_status(),
                 "worker": {"alive": worker_alive, "monitor_enabled": monitor_enabled},
                 "discovery": {"running": discovery_running},
-                "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10)),
+                "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 5)),
                               "sent_today": self._auto_reply_sent_today()},
                 "request_budget": request_budget,
+                'contact_sync': s.setting('contact_sync', {}),
                 "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
                 "pilot": {"max_conversations": 20, "invitation_sending": False,
                           "conversation_id": s.setting("pilot_conversation"),
@@ -164,7 +210,8 @@ class RecruitingService:
         会话后由 sync()/monitor 按需读取并核对归属。已导入的会话跳过。
         按联系人 uid 批量查 encryptJobId，把会话关联到已发布岗位（问题7）。
         """
-        contacts = self.browser.read_contact_list(load_all=True)
+        contacts = (self.browser.read_contact_list(load_all=True, before_load=lambda: self._count_request('contacts_load'))
+                    if isinstance(self.browser, BossBrowser) else self.browser.read_contact_list(load_all=True))
         existing = {c["id"] for c in self.store.rows("conversations")}
         new_contacts = [c for c in contacts if c.get("ident") and c.get("name") and c["ident"] not in existing]
         job_map = self._friend_job_map([c["ident"].split("-", 1)[0] for c in new_contacts])
@@ -183,16 +230,27 @@ class RecruitingService:
                 snapshot["position_platform_id"] = job_id
             self.store.import_conversation(snapshot)
             imported += 1
-        self.store.event("contacts_synced", "", f"全账号导入 {imported} 个会话（共 {len(contacts)} 个联系人）")
-        return {"imported": imported, "total": len(contacts)}
+        coverage = getattr(self.browser, 'contact_coverage', {})
+        if not isinstance(coverage, dict):
+            coverage = {}
+        coverage = {'complete': False, 'scope': 'loaded_browser_contacts', **coverage}
+        self.store.set_setting('contact_sync', {**coverage, 'imported': imported, 'total': len(contacts), 'updated_at': now()})
+        self.store.event("contacts_synced", "", f"导入页面可加载的 {imported} 个会话（共 {len(contacts)} 个联系人，非已证明的全账号范围）")
+        return {"imported": imported, "total": len(contacts), 'coverage': coverage}
 
     def read_greeting_quota(self):
         """读取今日剩余打招呼额度并缓存，返回结果。"""
-        quota = self.local_session.read_greeting_quota()
-        daily = self.jobs.state()['daily']
-        # 记录日期和读取时的本地发送数，供 state() 计算「读取之后新增的发送占用」。
-        self.store.set_setting('greeting_quota', {**quota, 'date': daily['date'],
-                                                  'updated_at': now(), 'local_used_at_read': daily['attempted']})
+        with self.store.task('greeting-quota'):
+            with self.store.db() as db:
+                if db.execute("SELECT 1 FROM greeting_attempts WHERE status IN ('sending','uncertain')").fetchone():
+                    raise ValueError('存在发送结果待核实的招呼，请先核实再读取额度')
+            daily = self.jobs.state()['daily']
+            quota = self.local_session.read_greeting_quota()
+            from .jobs import day_key
+            if daily['date'] != day_key():
+                raise ValueError('读取期间日期变化，请重新读取今日额度')
+            self.store.set_setting('greeting_quota', {**quota, 'date': daily['date'],
+                                                      'updated_at': now(), 'local_used_at_read': daily['attempted']})
         if quota.get('unlimited'):
             label = '不限'
         else:
@@ -228,6 +286,10 @@ class RecruitingService:
                 raise ValueError('该岗位当前不是开放中，不能主动招呼')
 
     def greet_discovered(self, uid, name="", job_id=None):
+        with self.store.task('outbound-browser'):
+            return self._greet_discovered(uid, name, job_id)
+
+    def _greet_discovered(self, uid, name="", job_id=None):
         """对已通过跨刷新验证的候选人点「打招呼」（BOSS 自动发默认招呼语）。
 
         job_id 为预期的平台岗位 ID（必填）。点击前先记录 sending 占用，点击后能确认
@@ -237,13 +299,34 @@ class RecruitingService:
             raise ValueError("缺少岗位 ID，无法核对岗位勾选与额度")
         if self._is_duplicate(uid):
             raise ValueError("该候选人已打过招呼，跳过")
+        self._refresh_quota_if_needed()
         self._check_greeting_allowed(job_id)
-        self.jobs.reserve_greeting("boss-" + job_id, uid, name)
         if self.verifier is None:
             from .recommend import RecommendVerifier
-            self.verifier = RecommendVerifier(self.config_provider)
+            self.verifier = RecommendVerifier(self.config_provider, cookie_loader=self.local_session.cookie_loader)
+        from .recommend import RecommendVerifier
+        if isinstance(self.verifier, RecommendVerifier):
+            self._count_request('greeting')
+            self._check_greeting_allowed(job_id)
+        self.jobs.reserve_greeting("boss-" + job_id, uid, name)
         try:
-            result = self.verifier.greet(uid, job_id)
+            def preflight():
+                if self.discovery_stop.is_set():
+                    raise TaskCancelled('主动招呼已停止')
+                self._check_platform_cooldown()
+                try:
+                    self.jobs.check_position('boss-' + job_id)
+                except ValueError as exc:
+                    raise TaskCancelled(str(exc)) from exc
+            preflight()
+            from .recommend import RecommendVerifier
+            if isinstance(self.verifier, RecommendVerifier):
+                result = self.verifier.greet(uid, job_id, preflight=preflight)
+            else:
+                result = self.verifier.greet(uid, job_id)
+        except TaskCancelled:
+            self.jobs.finish_greeting(uid, 'cancelled')
+            raise
         except Exception:
             # 点击后异常：结果不确定，保留 uncertain 并暂停，不自动重试
             self.jobs.finish_greeting(uid, 'uncertain')
@@ -263,16 +346,12 @@ class RecruitingService:
         """平台额度缓存是否过期（跨日或超过 TTL），需重新读取。"""
         from .jobs import day_key
         quota = self.store.setting('greeting_quota', {})
-        if quota.get('date') != day_key():
-            return True
-        updated_at = quota.get('updated_at')
-        if not updated_at:
-            return True
-        try:
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds()
-            return age > QUOTA_TTL_SECONDS
-        except (ValueError, TypeError):
-            return True
+        return not self.jobs.quota_fresh(quota, day_key())
+
+    def _refresh_quota_if_needed(self):
+        quota = self.store.setting('greeting_quota', {})
+        if self._quota_stale():
+            self.read_greeting_quota()
 
     def _quota_exhausted_now(self):
         daily = self.jobs.state()['daily']
@@ -286,15 +365,15 @@ class RecruitingService:
         """循环勾选的开放岗位，每岗位招呼若干个候选人（同步执行，节流防封号）。"""
         cfg = self._recruiting_cfg()
         per_job_min = per_job_min if per_job_min is not None else cfg.get("greet_per_job_min", 1)
-        per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 2)
-        throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 30.0), cfg.get("greet_delay_max", 60.0))
+        per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 1)
+        throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 120.0), cfg.get("greet_delay_max", 180.0))
         if not isinstance(per_job_min, int) or not isinstance(per_job_max, int) or not 1 <= per_job_min <= per_job_max:
             raise ValueError("每岗位招呼数需为整数且满足 1 ≤ 下限 ≤ 上限")
         config = self.jobs.config()
-        if config['mode'] == 'platform':
+        if self._quota_stale():
             # 先读平台额度，再检查 blockers，否则「未读取额度」会先于读取把任务拦住
             try:
-                self.read_greeting_quota()
+                self._refresh_quota_if_needed()
             except BrowserError as exc:
                 raise ValueError(f"无法读取平台剩余额度，停止执行：{exc}")
         state = self.jobs.state()
@@ -305,12 +384,19 @@ class RecruitingService:
             raise ValueError('没有可处理的开放岗位')
         if self.verifier is None:
             from .recommend import RecommendVerifier
-            self.verifier = RecommendVerifier(self.config_provider)
+            self.verifier = RecommendVerifier(self.config_provider, cookie_loader=self.local_session.cookie_loader)
         throttle = PageThrottle(delay_min=throttle_delay[0], delay_max=throttle_delay[1])
         greeted = 0
         # 每轮先刷新推荐页拿新候选人；刷新会把岗位重置为默认第一个，下面逐岗重新 select_job
         try:
+            from .recommend import RecommendVerifier
+            if isinstance(self.verifier, RecommendVerifier):
+                self._count_request('recommend_load')
+                if self.discovery_stop.is_set():
+                    raise TaskCancelled('主动招呼已停止')
             self.verifier.reload()
+        except AccountPauseError:
+            raise
         except BrowserError as exc:
             self.store.event('discovery_error', '', f'刷新推荐页失败：{exc}')
             return {'greeted': 0, 'stopped': self.discovery_stop.is_set(),
@@ -318,7 +404,7 @@ class RecruitingService:
         for job in selected:
             if self.discovery_stop.is_set():
                 break
-            if config['mode'] == 'platform' and self._quota_stale():
+            if self.store.setting('greeting_quota', {}) and self._quota_stale():
                 # 额度缓存过期（可能人工打了招呼）：重新读平台额度，覆盖人工打招呼导致的失真
                 try:
                     self.read_greeting_quota()
@@ -328,8 +414,14 @@ class RecruitingService:
             if self._quota_exhausted_now():
                 break
             try:
+                if isinstance(self.verifier, RecommendVerifier):
+                    self._count_request('recommend_load')
+                    if self.discovery_stop.is_set():
+                        raise TaskCancelled('主动招呼已停止')
                 self.verifier.select_job(job['platform_id'])
                 candidates = self.verifier.read_candidates()
+            except AccountPauseError:
+                raise
             except BrowserError as exc:
                 self.store.event('discovery_error', job['platform_id'], str(exc))
                 continue
@@ -344,8 +436,8 @@ class RecruitingService:
                 if result.get('sent'):
                     greeted += 1
                     done += 1
-                throttle.wait()
-            throttle.wait()
+                throttle.wait(self.discovery_stop)
+            throttle.wait(self.discovery_stop)
         stopped = self.discovery_stop.is_set()
         return {'greeted': greeted, 'stopped': stopped,
                 'reason': '主动打招呼已手动停止' if stopped else f'本轮主动招呼 {greeted} 次'}
@@ -359,10 +451,13 @@ class RecruitingService:
         """
         if self.discovery_worker and self.discovery_worker.is_alive():
             return {'running': True, 'message': '主动打招呼循环已在运行'}
+        self.discovery_stop.clear()
+        self._refresh_quota_if_needed()
+        if self.discovery_stop.is_set():
+            raise TaskCancelled('启动期间已请求停止，未启动主动招呼任务')
         state = self.jobs.state()
         if state['blockers']:
             raise ValueError('；'.join(state['blockers']))
-        self.discovery_stop.clear()
 
         def run():
             total = 0
@@ -387,7 +482,7 @@ class RecruitingService:
         return {'running': True, 'message': '主动打招呼循环已启动'}
 
     def stop_discovery(self):
-        """请求停止正在运行的主动打招呼循环；在下一个节流点生效（≤30 秒）。"""
+        """请求停止正在运行的主动打招呼循环；节流等待可中断，已发出的请求等待返回。"""
         self.discovery_stop.set()
         return {'running': bool(self.discovery_worker and self.discovery_worker.is_alive()),
                 'message': '已请求停止主动打招呼循环'}
@@ -420,7 +515,9 @@ class RecruitingService:
             return {}
         try:
             result = reader(uids)
-        except (BrowserError, AccountPauseError):
+        except AccountPauseError:
+            raise
+        except BrowserError:
             return {}
         return result if isinstance(result, dict) else {}
 
@@ -468,11 +565,7 @@ class RecruitingService:
         在本地；追加式合并能保证不覆盖旧记录。新消息的 received_resume_message_id
         由调用方负责合并（新附件优先，否则沿用旧值）。
         """
-        merged = {m['id']: m for m in (previous.get('messages') or [])}
-        for m in (snapshot.get('messages') or []):
-            merged[m['id']] = m
-        snapshot['messages'] = sorted(merged.values(), key=lambda m: (m.get('timestamp', 0), int(m['id'])))
-        return snapshot
+        return merge_messages(previous, snapshot)
 
     def sync(self, cid=None, *, process=True):
         """同步一个会话的消息；process=True 时同时读简历/评分。
@@ -497,6 +590,7 @@ class RecruitingService:
                     self.connection = {"connected": False, "transport": "local_cookie_http", "checked_at": now(), "message": str(exc)}
                     raise
                 if snapshot is None:
+                    current = self.store.row('conversations', ident)
                     # 增量：没有新消息，保持原快照，不导入、不处理简历
                     self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                        "message": "已连接 BOSS：本地登录会话，无新消息",
@@ -504,9 +598,12 @@ class RecruitingService:
                                        "read_bound_conversation": True}
                     self.monitor["last_success"] = now()
                     self.monitor["error"] = ""
+                    if process:
+                        self.process_received_resume(current)
                     return current
+                snapshot['position_platform_id'] = snapshot.get('position_platform_id') or previous.get('position_platform_id')
                 snapshot['received_resume_message_id'] = snapshot.get('received_resume_message_id') or previous.get('received_resume_message_id')
-                result = self.store.import_conversation(self._append_new_messages(previous, snapshot))
+                result = self.store.import_conversation(snapshot, append=True)
                 self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                    "message": "已连接 BOSS：本地登录会话，只读同步绑定候选人的消息",
                                    "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),
@@ -526,13 +623,18 @@ class RecruitingService:
         if auto_send is not None and type(auto_send) is not bool:
             raise ValueError("自动外发开关必须是布尔值")
         self.store.row("conversations", cid)
-        with self.lock, self.store.db() as db:
+        with self.store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
             if auto_send is None:
                 db.execute("UPDATE conversations SET taken_over=?,do_not_contact=? WHERE id=?", (taken_over, do_not_contact, cid))
             else:
                 db.execute("UPDATE conversations SET taken_over=?,do_not_contact=?,auto_send=? WHERE id=?", (taken_over, do_not_contact, auto_send, cid))
-            if taken_over or do_not_contact:
+            if do_not_contact:
                 db.execute("UPDATE outbox SET status='cancelled',updated_at=? WHERE conversation_id=? AND status='draft'", (now(), cid))
+            elif taken_over:
+                # Takeover withdraws unsubmitted drafts; an explicit human edit may
+                # prepare the same wording again. Submitted actions remain untouched.
+                db.execute("UPDATE outbox SET status='expired',result='人工接管，请编辑核实后重新准备',updated_at=? WHERE conversation_id=? AND status='draft'", (now(), cid))
         self.store.event("contact_control", cid, "已更新人工接管／停止联系设置")
 
     def set_auto_send(self, cid, enabled):
@@ -540,7 +642,7 @@ class RecruitingService:
         if type(enabled) is not bool:
             raise ValueError("自动外发开关必须是布尔值")
         self.store.row("conversations", cid)
-        with self.lock, self.store.db() as db:
+        with self.store.db() as db:
             db.execute("UPDATE conversations SET auto_send=? WHERE id=?", (int(enabled), cid))
         self.store.event("auto_send_toggled", cid, f"会话自动外发已{'开启' if enabled else '关闭'}")
         return self.store.row("conversations", cid)
@@ -559,10 +661,16 @@ class RecruitingService:
 
     def read_position(self, ident):
         p = self.store.row("positions", ident)
-        value = self.browser.read_position(p["title"])
+        if not ident.startswith('boss-'):
+            raise ValueError('请先核实并关联平台岗位 ID')
+        value = self.browser.read_position(p["title"], ident.removeprefix('boss-'))
         result = self.store.save_position(p["id"], p["title"], value["jd"], value["source"], bool(p["enabled"]))
         self.store.event("position_read", ident, "读取平台现有职位描述；没有修改或发布职位")
         return result
+
+    def link_position(self, cid, platform_id):
+        with self.lock, self.store.task('outbound-browser'):
+            return self.store.link_position(cid, str(platform_id))
 
     def knowledge(self, payload):
         title, content, source = [str(payload.get(k, "")).strip() for k in ("title", "content", "source")]
@@ -590,12 +698,21 @@ class RecruitingService:
         return self.store.row("knowledge", ident)
 
     def resume(self, cid):
-        with self.lock:
+        with self.lock, self.store.task('resume:' + cid):
+            self._check_stopped()
             if self.use_local_session:
                 current = self.store.row('conversations', cid)
                 position = self.store.row('positions', current['position_id'])
                 snapshot = json.loads(current['snapshot'])
+                message_id = snapshot.get('received_resume_message_id')
+                if message_id:
+                    docs = self.store.rows('documents', 'WHERE conversation_id=?', (cid,))
+                    cached = next((d for d in docs if json.loads(d['meta']).get('message_id') == message_id), None)
+                    if cached:
+                        self.auto_assess(cid)
+                        return cached
                 value = self.local_session.read_resume(cid, current['name'], position['title'], snapshot.get('account_uid'))
+                self._check_stopped()
                 result = self.store.save_document(cid, value['source'], value['text'], value['complete'], value['meta'])
                 self.store.event('resume_read', cid, f"后台读取已收到的 PDF 全部 {value['meta']['page_count']} 页文字；完整性待核对，未操作标签页")
                 self.auto_assess(cid)
@@ -626,11 +743,17 @@ class RecruitingService:
 
     def process_received_resume(self, conversation):
         """Run on every sync, even when chat text is unchanged. No external writes."""
+        self._check_stopped()
         cid = conversation["id"]
         position = self.store.row("positions", conversation["position_id"])
         if conversation["taken_over"] or conversation["do_not_contact"] or not position["enabled"]:
             reason = "已停止联系" if conversation["do_not_contact"] else "人工接管中" if conversation["taken_over"] else "岗位已暂停"
             self.resume_status(cid, "paused", reason + "，简历自动处理已暂停")
+            return
+        try:
+            self.jobs.check_position(position['id'])
+        except ValueError as exc:
+            self.resume_status(cid, 'paused', str(exc))
             return
         message_id = json.loads(conversation["snapshot"]).get("received_resume_message_id")
         docs = self.store.rows("documents", "WHERE conversation_id=?", (cid,))
@@ -642,6 +765,9 @@ class RecruitingService:
             self.resume_status(cid, "reading", "收到新简历，正在读取附件", message_id=message_id)
             try:
                 self.resume(cid)
+            except TaskCancelled:
+                self.resume_status(cid, 'paused', '任务已停止，已有资料保留', message_id=message_id)
+                raise
             except Exception:
                 self.resume_status(cid, "read_failed", "附件自动读取未完成，请点击重新读取；已有资料保留", message_id=message_id)
                 raise
@@ -651,17 +777,24 @@ class RecruitingService:
     def assessment_input(self, cid):
         c = self.store.row("conversations", cid)
         position = self.store.row("positions", c["position_id"])
-        docs = self.store.rows("documents", "WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (cid,))
-        if not docs:
+        doc = self.store.current_document(cid)
+        if not doc:
             raise ValueError("请先读取或导入该候选人的简历")
-        config = self.config_provider()
+        config = deepcopy(self.config_provider())
         # Include candidate/document identity and model configuration, never persist credentials.
-        digest = fingerprint([cid, docs[0]["id"], docs[0]["content_hash"], position["id"], position["version"],
-                              config.get("ai", {}), agent.get_ai_api_key(config), "assessment-v2"])
-        return position, docs[0], config, digest
+        digest = fingerprint([cid, doc["id"], doc["content_hash"], position["id"], position["version"],
+                              config.get("ai", {}), agent.get_ai_api_key(config),
+                              get_ai_base_url(config), get_ai_service(config), "assessment-v3"])
+        return position, doc, config, digest
 
     def auto_assess(self, cid):
         with self.lock:
+            self._check_stopped()
+            try:
+                self._auto_assessment_guard(cid)
+            except TaskCancelled as exc:
+                self.resume_status(cid, 'paused', str(exc))
+                return
             position, doc, config, digest = self.assessment_input(cid)
             details = {"input_hash": digest, "document_id": doc["id"]}
             if not agent.get_ai_api_key(config):
@@ -671,37 +804,74 @@ class RecruitingService:
                 self.resume_status(cid, "waiting_jd", "简历已读取，等待补充岗位 JD；补充后下次监测自动评分", **details)
                 return
             old = self.store.setting("resume_processing:" + cid, {})
+            if old.get('input_hash') == digest and old.get('status') == 'scoring':
+                existing = self.store.rows('assessments', 'WHERE input_hash=?', (digest,))
+                with self.store.db() as db:
+                    active = self.store.task_active(db, 'assessment:' + digest)
+                if active and not existing:
+                    return
+                if existing:
+                    return self.assess(cid, auto=True)
             if old.get("input_hash") == digest and old.get("status") in {"failed", "scoring"}:
                 self.resume_status(cid, "failed", "自动评分未完成，简历已保留；请点击重试评分", **details)
                 return
             try:
-                return self.assess(cid)
+                return self.assess(cid, auto=True)
+            except TaskCancelled:
+                raise
+            except TaskBusy:
+                self.resume_status(cid, 'scoring', '相同资料已在另一进程评估，等待结果', **details)
+                return
             except Exception:
                 self.resume_status(cid, "failed", "自动评分未完成，简历已保留；请点击重试评分", **details)
                 self.store.event("assessment_failed", cid, "自动评分失败；未覆盖已有评估，不自动反复调用模型")
 
-    def assess(self, cid):
+    def _auto_assessment_guard(self, cid):
+        self._check_stopped()
+        c = self.store.row('conversations', cid)
+        p = self.store.row('positions', c['position_id'])
+        if c['taken_over'] or c['do_not_contact'] or not p['enabled']:
+            raise TaskCancelled('已人工接管、停止联系或岗位暂停，自动评分已停止')
+        try:
+            self.jobs.check_position(p['id'])
+        except ValueError as exc:
+            raise TaskCancelled(str(exc)) from exc
+
+    def assess(self, cid, *, auto=False):
         # Serialize automatic/manual attempts so concurrent requests cannot double-charge.
         with self.lock:
+            self._check_stopped()
             p, doc, config, digest = self.assessment_input(cid)
             details = {"input_hash": digest, "document_id": doc["id"]}
-            existing = self.store.rows("assessments", "WHERE input_hash=?", (digest,))
-            if existing:
+            with self.store.task('assessment:' + digest):
+                existing = self.store.rows("assessments", "WHERE input_hash=?", (digest,))
+                if existing:
+                    self.resume_status(cid, "completed", "已按当前岗位 JD 自动评估，缺失证据保留待确认", **details)
+                    return json.loads(existing[0]["result"])
+                self.resume_status(cid, "scoring", "正在按岗位 JD 评分", **details)
+                try:
+                    self._check_stopped()
+                    if auto:
+                        self._auto_assessment_guard(cid)
+                    result = agent.assess(p, doc, config)
+                    self._check_stopped()
+                    if auto:
+                        self._auto_assessment_guard(cid)
+                        if self.assessment_input(cid)[3] != digest:
+                            raise TaskCancelled('评分期间岗位或简历依据已变化，请按最新资料重新评分')
+                except TaskCancelled:
+                    self.resume_status(cid, 'paused', '任务已停止，未继续处理评分', **details)
+                    raise
+                except Exception:
+                    self.resume_status(cid, "failed", "评分未完成，简历已保留；请检查模型配置后重试", **details)
+                    raise
+                result.update({"document_id": doc["id"], "position_id": p['id'], "position_version": p["version"], "model": config.get("ai", {}).get("model")})
+                ident = uuid4().hex
+                with self.store.db() as db:
+                    db.execute("INSERT OR IGNORE INTO assessments VALUES (?,?,?,?,?)", (ident, cid, digest, encode(result), now()))
                 self.resume_status(cid, "completed", "已按当前岗位 JD 自动评估，缺失证据保留待确认", **details)
-                return json.loads(existing[0]["result"])
-            self.resume_status(cid, "scoring", "正在按岗位 JD 评分", **details)
-            try:
-                result = agent.assess(p, doc, config)
-            except Exception:
-                self.resume_status(cid, "failed", "评分未完成，简历已保留；请检查模型配置后重试", **details)
-                raise
-            result.update({"document_id": doc["id"], "position_version": p["version"], "model": config.get("ai", {}).get("model")})
-            ident = uuid4().hex
-            with self.store.db() as db:
-                db.execute("INSERT OR IGNORE INTO assessments VALUES (?,?,?,?,?)", (ident, cid, digest, encode(result), now()))
-            self.resume_status(cid, "completed", "已按当前岗位 JD 自动评估，缺失证据保留待确认", **details)
-            self.store.event("assessment_completed", cid, "完成有来源的岗位评估，未作录用决定")
-            return result
+                self.store.event("assessment_completed", cid, "完成有来源的岗位评估，未作录用决定")
+                return result
 
     def company(self):
         return self.store.setting("company_brief", {"text": "", "version": 0, "updated_at": None})
@@ -726,12 +896,12 @@ class RecruitingService:
         c = self.store.row("conversations", cid)
         p = self.store.row("positions", c["position_id"])
         snapshot = json.loads(c["snapshot"])
-        docs = self.store.rows("documents", "WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (cid,))
-        doc = docs[0] if docs else None
+        doc = self.store.current_document(cid)
         assessment = None
+        digest = self.assessment_input(cid)[3] if doc else None
         for item in self.store.rows("assessments", "WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC", (cid,)):
             result = json.loads(item["result"])
-            if doc and result.get("document_id") == doc["id"] and result.get("position_version") == p["version"]:
+            if doc and item['input_hash'] == digest and result.get('position_id') == p['id'] and result.get("document_id") == doc["id"] and result.get("position_version") == p["version"]:
                 assessment = {"id": item["id"], "result": result}
                 break
         return {
@@ -747,7 +917,7 @@ class RecruitingService:
     def prepare_reply(self, cid, text="", question=""):
         c = self.store.row("conversations", cid)
         p = self.store.row("positions", c["position_id"])
-        if c["taken_over"] or c["do_not_contact"] or not p["enabled"]:
+        if c["do_not_contact"] or (not text and (c['taken_over'] or not p['enabled'])):
             raise ValueError("当前会话已人工接管、停止联系或岗位暂停")
         refs = {"position_id": p["id"], "position_version": p["version"], "knowledge": {}}
         if text:
@@ -755,36 +925,66 @@ class RecruitingService:
                 raise ValueError("测试回复最多500字")
             refs["source"] = "human_draft"
         else:
-            with self.lock:
+            with self.lock, self.store.task('reply:' + cid):
                 self.sync(cid)
                 context = self.reply_context(cid)
+                current = self.store.row('conversations', cid)
+                position = self.store.row('positions', current['position_id'])
+                if current['taken_over'] or current['do_not_contact'] or not position['enabled']:
+                    raise TaskCancelled('已人工接管、停止联系或岗位暂停，回复生成已停止')
+                refs.update(position_id=position['id'], position_version=position['version'])
                 messages = context["conversation"]["messages"]
-                if not messages or messages[-1]["direction"] != "in":
+                target = candidate_question(context['conversation'])
+                if not target:
                     raise ValueError("最新消息不是候选人发来的消息，请核对会话后处理")
-                if question and question != messages[-1]["text"]:
+                if question and question != target['text']:
                     raise ValueError("问题与实际会话不一致，不使用脱离上下文的问题生成回复")
+                config = deepcopy(self.config_provider())
+                signature = self.reply_context_signature(context, self._reply_model_revision(config))
+                for draft in self.store.rows('outbox', "WHERE conversation_id=? AND kind='reply' AND status='draft' ORDER BY created_at DESC,rowid DESC", (cid,)):
+                    saved = json.loads(draft['refs'])
+                    if saved.get('source') == 'ai_draft' and saved.get('context_signature') == signature:
+                        return draft
                 self._check_stopped()
-                result = agent.reply(context, self.config_provider())
+                result = agent.reply(context, config)
+                self._check_stopped()
                 # Human messages can change the live browser even while our queue is locked.
                 self.sync(cid)
                 fresh = self.reply_context(cid)
-                if self.reply_context_signature(fresh) != self.reply_context_signature(context):
+                if self.reply_context_signature(fresh) != signature:
                     raise ValueError("生成期间会话或资料发生变化，本次回复未保存，请基于新上下文重新生成")
                 text = result["text"]
                 refs.update({"source": "ai_draft", "needs_human": result["needs_human"],
                     "company_version": context["company"]["version"],
                     "document_id": context["resume"]["id"] if context["resume"] else None,
                     "assessment_id": context["assessment"]["id"] if context["assessment"] else None,
-                    "message_count": len(messages), "context_signature": self.reply_context_signature(context),
+                    "message_count": len(messages), "context_signature": signature,
                     "context_coverage": context["conversation"]["coverage"],
                     "basis": result["basis"], "missing": result.get("missing", [])})
+                check_reply(text)
+                return self.store.draft(cid, 'reply', text.strip(), refs)
         check_reply(text)
         return self.store.draft(cid, "reply", text.strip(), refs)
 
-    @staticmethod
-    def reply_context_signature(context):
+    def _reply_model_revision(self, config=None):
+        config = self.config_provider() if config is None else config
+        digest = fingerprint([config.get('ai', {}), agent.get_ai_api_key(config),
+                              get_ai_base_url(config), get_ai_service(config), 'reply-model-v1'])
+        # Keep credential-derived identity private. Only a random revision contributes
+        # to the public draft signature; raw credentials and this digest stay server-side.
+        with self.store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT value FROM settings WHERE key='reply_model_identity'").fetchone()
+            identity = json.loads(row['value']) if row else {}
+            if identity.get('digest') != digest:
+                identity = {'digest': digest, 'revision': uuid4().hex}
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('reply_model_identity',?)", (encode(identity),))
+            return identity['revision']
+
+    def reply_context_signature(self, context, model_revision=None):
+        revision = self._reply_model_revision() if model_revision is None else model_revision
         return fingerprint([context["conversation"]["context_hash"], context["company"]["version"],
-                            context["job"]["version"], context["resume"], context["assessment"]])
+                            context['job']['id'], context["job"]["version"], context["resume"], context["assessment"], revision])
 
     def prepare_action(self, cid, kind):
         if kind not in {"request_resume", "accept_resume"}:
@@ -814,7 +1014,7 @@ class RecruitingService:
 
     def execute(self, ident, auto=False):
         """执行一条待发草稿；auto=True 表示由自动外发触发，受每日自动回复上限约束。"""
-        with self.lock:
+        with self.lock, self.store.task('outbound-browser'):
             draft = self.store.row("outbox", ident)
             if draft["kind"] == "invitation":
                 raise PermissionError("本次测试禁止发送面试邀约；仅支持保存本地草稿")
@@ -822,7 +1022,9 @@ class RecruitingService:
                 check_reply(draft["content"])
             c = self.store.row("conversations", draft["conversation_id"])
             p = self.store.row("positions", c["position_id"])
-            if c["taken_over"] or c["do_not_contact"] or not p["enabled"]:
+            if auto:
+                self.jobs.check_position(p['id'])
+            if c["do_not_contact"] or (auto and (c['taken_over'] or not p['enabled'])):
                 raise ValueError("已人工接管、停止联系或岗位暂停")
             if draft["status"] != "draft":
                 raise ValueError("动作不在待执行状态")
@@ -847,18 +1049,29 @@ class RecruitingService:
                 # 浏览器快照只用于发送前的编辑框/会话守卫，不写入数据库覆盖 HTTP 快照。
                 source = self.local_session.read_conversation(
                     c["id"], c["name"], p["title"],
-                    json.loads(c["snapshot"]).get("account_uid"), throttle=False)
+                    json.loads(c["snapshot"]).get("account_uid"), throttle=False,
+                    since_mid=self._last_message_id(json.loads(c['snapshot'])))
+                if source is not None:
+                    previous = json.loads(c['snapshot'])
+                    source['position_platform_id'] = source.get('position_platform_id') or previous.get('position_platform_id')
+                    source['received_resume_message_id'] = source.get('received_resume_message_id') or previous.get('received_resume_message_id')
+                    source = self._append_new_messages(previous, source)
             else:
                 source = before
-            updated = self.store.import_conversation(source)
+            updated = self.store.import_conversation(source, append=self.use_local_session) if source is not None else self.store.row('conversations', c['id'])
             if updated["context_hash"] != draft["context_hash"]:
                 raise ValueError("会话有新消息，已停止发送")
-            self.store.claim(ident)
-            if auto and draft["kind"] == "reply":
-                # 占用一次自动回复额度：发送结果待定也算一次外发，避免超发
-                self._mark_auto_reply_sent()
+            if isinstance(self.browser, BossBrowser):
+                self._count_request('identity')
+                self.browser.verify_account(c['id'], json.loads(c['snapshot']).get('account_uid'), on_refusal=self._pause_platform_requests)
+            self._send_guard(ident, auto)
+            self.store.claim(ident, auto=auto, daily_limit=self._recruiting_cfg().get('auto_reply_daily_limit', 5))
             try:
-                self.browser.execute(draft["kind"], before, draft["content"])
+                self._send_guard(ident, auto, claimed=True)
+                if isinstance(self.browser, BossBrowser):
+                    self.browser.execute(draft['kind'], before, draft['content'], preflight=lambda: self._send_guard(ident, auto, claimed=True))
+                else:
+                    self.browser.execute(draft["kind"], before, draft["content"])
                 # Give the page a short bounded render interval, never click twice.
                 time.sleep(.5)
                 after = self.browser.read_current()
@@ -873,12 +1086,41 @@ class RecruitingService:
                 self.store.finish(ident, status, message)
                 if not self.use_local_session:
                     self.store.import_conversation(after)
+            except TaskCancelled:
+                self.store.finish(ident, 'cancelled', '发送前任务已停止，未提交后续点击')
+                raise
             except Exception:
                 self.store.finish(ident, "uncertain", "操作结果待核实；请查看 Chrome，禁止盲目重试")
                 self.store.event("outbound_uncertain", ident, "执行中断，未自动重试")
                 raise BrowserError("操作结果待核实；请检查 Chrome，已阻止再次发送")
             self.store.event("outbound_" + status, ident, message)
             return self.store.row("outbox", ident)
+
+    def _send_guard(self, ident, auto=False, *, claimed=False):
+        self._check_stopped()
+        self._check_platform_cooldown()
+        draft = self.store.row('outbox', ident)
+        expected = 'sending' if claimed else 'draft'
+        if draft['status'] != expected or (claimed and draft['owner'] != self.store.owner):
+            raise TaskCancelled('动作已取消、状态已变化或发送任务不属于当前进程，停止发送')
+        c = self.store.row('conversations', draft['conversation_id'])
+        p = self.store.row('positions', c['position_id'])
+        if c['do_not_contact'] or (auto and (c['taken_over'] or not p['enabled'])):
+            raise TaskCancelled('已人工接管、停止联系或岗位暂停')
+        if auto:
+            try:
+                self.jobs.check_position(p['id'])
+            except ValueError as exc:
+                raise TaskCancelled(str(exc)) from exc
+            if not c['auto_send']:
+                raise TaskCancelled('自动外发已关闭，停止当前发送')
+        refs = json.loads(draft['refs'])
+        if refs.get('needs_human'):
+            raise TaskCancelled('草稿需要人工处理，停止当前发送')
+        if c['context_hash'] != draft['context_hash'] or refs.get('position_version') != p['version']:
+            raise TaskCancelled('会话或岗位已变化，停止当前发送')
+        if refs.get('source') == 'ai_draft' and refs.get('context_signature') != self.reply_context_signature(self.reply_context(c['id'])):
+            raise TaskCancelled('公司说明、简历或评分依据已变化，停止当前发送')
 
     def _send_channel_status(self):
         """探测发送通道（Browser Runtime + Chrome 招聘页标签）是否可用。
@@ -920,7 +1162,12 @@ class RecruitingService:
     def _check_stopped(self):
         """收到停止信号时抛异常，让当前自动任务统一退出（不再发请求/调模型/发送）。"""
         if self._stop_event is not None and self._stop_event.is_set():
-            raise BrowserError("已请求停止，中断当前任务")
+            raise TaskCancelled("已请求停止，中断当前任务")
+        self._check_monitor_enabled()
+
+    def _check_platform_cooldown(self):
+        if self.store.setting('request_paused_until', 0) > datetime.now(timezone.utc).timestamp():
+            raise TaskCancelled('BOSS 拒绝或限流后的共享冷却尚未结束，停止发送；请核实账号后手动恢复')
 
     def _check_monitor_enabled(self):
         """worker 监测流程中检查「关闭监测」标志，及时退出当前任务而非只阻止下一轮。
@@ -928,7 +1175,7 @@ class RecruitingService:
         仅 worker（设置了 stop_event）时检查；Web 的「手动检查一次」不受监测开关约束。
         """
         if self._stop_event is not None and not self.store.setting('monitor_enabled', True):
-            raise BrowserError("监测已停止，中断当前任务")
+            raise TaskCancelled("监测已停止，中断当前任务")
 
     def worker_loop(self, stop_event):
         """独立进程主循环：独立心跳线程 + 轮询 monitor_enabled 标志、定期跑 monitor_once。"""
@@ -936,6 +1183,8 @@ class RecruitingService:
         self._stop_event = stop_event
         if hasattr(self.local_session, 'set_stop_event'):
             self.local_session.set_stop_event(stop_event)
+        if hasattr(self.local_session, 'set_cancel_check'):
+            self.local_session.set_cancel_check(self._check_stopped)
 
         def heartbeat():
             # monitor_once 会被节流睡眠阻塞 1–2 分钟以上，若只在主循环写心跳，
@@ -960,6 +1209,10 @@ class RecruitingService:
                             # 验证码/登录失效/身份不一致：暂停等人工，不自动重试
                             self.set_monitor_enabled(False)
                             self.store.event('monitor_paused', '', f"已暂停，需人工处理：{exc}")
+                            self.monitor['error'] = str(exc)
+                            self._persist_monitor_state()
+                        except (TaskCancelled, TaskBusy):
+                            pass
                         except Exception as exc:
                             consecutive_errors += 1
                             self.store.event('monitor_paused', '', str(exc)[:250])
@@ -978,6 +1231,7 @@ class RecruitingService:
         self.store.set_setting('monitor_state', {
             'last_success': self.monitor['last_success'],
             'error': self.monitor['error'],
+            'processing_conversation_id': self.monitor.get('processing_conversation_id'),
         })
 
     def _auto_send_enabled(self, cid):
@@ -1000,13 +1254,18 @@ class RecruitingService:
         self.store.set_setting('auto_reply_sent', data)
 
     def _reply_quota_exhausted(self):
-        limit = self.store.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 10))
+        limit = self.store.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 5))
         if not limit:
             return False
         return self._auto_reply_sent_today() >= limit
 
     def _auto_send_if_allowed(self, draft):
         """按条件自动发送一条回复草稿；不满足则留草稿给人工。"""
+        if draft['status'] != 'draft':
+            return False
+        with self.store.db() as db:
+            if db.execute("SELECT 1 FROM outbox WHERE status IN ('sending','uncertain') LIMIT 1").fetchone() or db.execute("SELECT 1 FROM greeting_attempts WHERE status IN ('sending','uncertain') LIMIT 1").fetchone():
+                return False
         refs = json.loads(draft["refs"])
         if refs.get("needs_human"):
             return False
@@ -1017,9 +1276,14 @@ class RecruitingService:
             self.store.event("auto_send_skipped", cid, "今日自动回复已达上限")
             return False
         try:
-            self.execute(draft["id"], auto=True)
-            self.store.event("auto_sent", cid, "已自动发送回复")
-            return True
+            result = self.execute(draft["id"], auto=True)
+            if result['status'] == 'sent':
+                self.store.event("auto_sent", cid, "已确认自动发送回复")
+                return True
+            self.store.event('auto_send_uncertain', cid, '自动回复结果待核实，已暂停外发')
+            return False
+        except (AccountPauseError, TaskCancelled):
+            raise
         except (ValueError, BrowserError) as exc:
             self.store.event("auto_send_skipped", cid, str(exc))
             return False
@@ -1033,6 +1297,10 @@ class RecruitingService:
             p = self.store.row("positions", c["position_id"])
             if not p["enabled"]:
                 continue
+            try:
+                self.jobs.check_position(p['id'])
+            except ValueError:
+                continue
             allowed.append(c["id"])
         return allowed
 
@@ -1044,6 +1312,10 @@ class RecruitingService:
         return allowed[0]
 
     def monitor_once(self):
+        with self.store.task('monitor-cycle'):
+            return self._monitor_once()
+
+    def _monitor_once(self):
         """轮询式监测：每轮只处理一个允许的会话（round-robin），而非每轮读全部。
 
         候选人越多越不能每轮把所有历史各拉一遍；用 monitor_cursor 记录上次处理到
@@ -1057,20 +1329,50 @@ class RecruitingService:
         self._check_stopped()
         self._check_monitor_enabled()
         self.store.set_setting("monitor_cursor", cid)
+        self.monitor['processing_conversation_id'] = cid
+        self._persist_monitor_state()
         try:
             before = self.store.row("conversations", cid)
             after = self.sync(cid, process=True)
-            if before["context_hash"] != after["context_hash"]:
+            changed = before['context_hash'] != after['context_hash']
+            if changed:
                 self._check_monitor_enabled()
                 self.store.event("conversation_changed", cid, "会话发生变化，旧草稿已过期")
-                messages = json.loads(after["snapshot"])["messages"]
-                if agent.get_ai_api_key(self.config_provider()) and messages and messages[-1]["direction"] == "in" and messages[-1]["kind"] == "text" and not after["taken_over"] and not after["do_not_contact"]:
-                    try:
-                        draft = self.prepare_reply(cid)
-                        self._auto_send_if_allowed(draft)
-                    except ValueError as exc:
-                        self.store.event("reply_needs_attention", cid, str(exc))
+            messages = json.loads(after['snapshot'])['messages']
+            target = candidate_question({'messages': messages})
+            incoming = target is not None
+            pending = self.store.setting('reply_work:' + cid, {})
+            previous_target = candidate_question(json.loads(before['snapshot']))
+            if changed and incoming and fingerprint(target) != fingerprint(previous_target):
+                pending = {'status': 'waiting', 'context_hash': after['context_hash']}
+                self.store.set_setting('reply_work:' + cid, pending)
+            pending_blocked = False
+            if pending.get('draft_id'):
+                original = self.store.row('outbox', pending['draft_id'])
+                if original['status'] in {'sent', 'cancelled'}:
+                    pending = {}
+                    self.store.set_setting('reply_work:' + cid, {})
+                elif original['status'] in {'sending', 'uncertain'}:
+                    pending_blocked = True
+            if incoming and pending and pending.get('status') != 'needs_attention' and not pending_blocked and agent.get_ai_api_key(self.config_provider()):
+                self._check_stopped()
+                try:
+                    drafts = self.store.rows('outbox', "WHERE conversation_id=? AND kind='reply' AND status='draft' AND context_hash=? ORDER BY created_at DESC", (cid, after['context_hash']))
+                    reusable = next((d for d in drafts if json.loads(d['refs']).get('source') == 'ai_draft'), None)
+                    if reusable and json.loads(reusable['refs']).get('context_signature') != self.reply_context_signature(self.reply_context(cid)):
+                        reusable = None
+                    draft = reusable or self.prepare_reply(cid)
+                    self.store.set_setting('reply_work:' + cid, {'status': 'drafted', 'draft_id': draft['id'], 'context_hash': after['context_hash']})
+                    if self._auto_send_if_allowed(draft):
+                        self.store.set_setting('reply_work:' + cid, {})
+                except (PermissionError, agent.ModelOutputError) as exc:
+                    self.store.set_setting('reply_work:' + cid, {'status': 'needs_attention',
+                                                               'context_hash': after['context_hash'], 'reason': str(exc)})
+                    self.store.event('reply_needs_attention', cid, str(exc))
+                except ValueError as exc:
+                    self.store.event('reply_needs_attention', cid, str(exc))
             return {"changed": before["context_hash"] != after["context_hash"],
                     "conversation_id": cid, "last_success": self.monitor["last_success"]}
         finally:
+            self.monitor['processing_conversation_id'] = None
             self._persist_monitor_state()

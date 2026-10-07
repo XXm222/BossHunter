@@ -12,10 +12,11 @@ from wsgiref.util import setup_testing_defaults
 from bosshunter.recruiting import agent
 from bosshunter.recruiting.browser import BossBrowser, BrowserError
 from bosshunter.recruiting.service import RecruitingService
+from recruiting_fixtures import authorize
 
 
 def sample():
-    return {"id": "sample-1", "name": "测试候选人", "position_title": "测试岗位",
+    return {"id": "sample-1", "name": "测试候选人", "position_title": "测试岗位", "position_platform_id": "test-job",
             "messages": [{"direction": "in", "kind": "text", "text": "请问工作时间？", "time": "10:00"}],
             "editor_empty": True, "coverage": "test", "stable_message_ids": False}
 
@@ -75,6 +76,7 @@ class RecruitingTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.browser = FakeBrowser()
         self.service = RecruitingService(Path(self.temp.name) / "recruiting.db", lambda: {}, self.browser)
+        authorize(self.service)
         self.c = self.service.import_current()
         self.cid = self.c["id"]
 
@@ -234,6 +236,7 @@ class RecruitingTests(unittest.TestCase):
         self.assertEqual(self.browser.calls, 2)
 
     def test_auto_reply_quota_blocks_auto_send(self):
+        self.service.set_auto_send(self.cid, True)
         self.service.store.set_setting('auto_reply_daily_limit', 1)
         first = self.service.prepare_reply(self.cid, "自动回复一")
         self.assertEqual(self.service.execute(first["id"], auto=True)["status"], "sent")
@@ -389,6 +392,8 @@ class RecruitingTests(unittest.TestCase):
     def test_restart_marks_in_flight_as_uncertain(self):
         draft = self.service.prepare_reply(self.cid, "测试")
         self.service.store.claim(draft["id"])
+        with self.service.store.db() as db:
+            db.execute("UPDATE outbox SET owner='999999999:dead' WHERE id=?", (draft['id'],))
         restarted = RecruitingService(self.service.store.path, lambda: {}, self.browser)
         self.assertEqual(restarted.store.row("outbox", draft["id"])["status"], "uncertain")
 
@@ -421,8 +426,9 @@ class RecruitingTests(unittest.TestCase):
     def test_monitor_once_round_robins_across_conversations(self):
         # 问题 6：多个允许处理的会话，监测应按轮询游标逐个处理，而非只读当前选中
         service = RecruitingService(Path(self.temp.name) / "monitor.db", lambda: {}, self.browser)
+        authorize(service)
         for ident in ["a-0", "b-0", "c-0"]:
-            service.store.import_conversation({"id": ident, "name": "候选人", "position_title": "测试岗位",
+            service.store.import_conversation({"id": ident, "name": "候选人", "position_title": "测试岗位", "position_platform_id": "test-job",
                 "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
                 "editor_empty": True, "coverage": "test", "stable_message_ids": False})
         synced = []
@@ -454,7 +460,8 @@ class RecruitingTests(unittest.TestCase):
         # 问题 9：关闭监测后，worker 的 monitor_once 应中断；但手动检查一次不受约束
         import threading
         service = RecruitingService(Path(self.temp.name) / "monitor3.db", lambda: {}, self.browser)
-        service.store.import_conversation({"id": "a-0", "name": "甲", "position_title": "测试岗位",
+        authorize(service)
+        service.store.import_conversation({"id": "a-0", "name": "甲", "position_title": "测试岗位", "position_platform_id": "test-job",
             "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
             "editor_empty": True, "coverage": "test", "stable_message_ids": False})
         service.set_monitor_enabled(False)
