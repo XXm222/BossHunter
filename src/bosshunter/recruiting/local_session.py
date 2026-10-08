@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+import random
 import httpx
 from .browser import AccountPauseError, BrowserError, TaskCancelled, refusal_cooldown
 import html
@@ -35,8 +36,8 @@ def _default_chrome_user_data_dir() -> Path:
 
 class LocalBossSession:
     def __init__(self, cookie_loader=None, transport=None, throttle=None, user_data_dir=None,
-                 read_delay=(120.0, 180.0), daily_limit=20, page_delay=120.0, stop_event=None,
-                 request_counter=None, account_pause_handler=None):
+                 read_delay=(120.0, 180.0), daily_limit=100, page_delay=15.0, stop_event=None,
+                 request_counter=None, account_pause_handler=None, page_delay_max=30.0):
         self._user_data_dir = user_data_dir
         self.cookie_loader = cookie_loader or self.load_cookies
         self.transport = transport
@@ -44,6 +45,7 @@ class LocalBossSession:
         self._request_count = 0
         self._daily_limit = daily_limit
         self._page_delay = page_delay
+        self._page_delay_max = page_delay_max
         self._stop_event = stop_event
         self._cancel_check = None
         self._request_counter = request_counter
@@ -92,15 +94,16 @@ class LocalBossSession:
         else:
             time.sleep(seconds)
 
-    def _count(self, kind):
+    def _count(self, kind, *, pace=True):
         """计数一次后台 HTTP 请求；超限抛异常。request_counter 非 None 时走 DB 计数，否则内存兜底。"""
         self._check_cancelled()
         if self._request_counter is not None:
-            self._request_counter(kind)
+            self._request_counter(kind, pace=pace)
             return
-        # Standalone sessions also pace EVERY request, including pagination and
-        # sending prechecks. Service sessions use the shared SQLite gate instead.
-        self._wait()
+        if pace:
+            self._wait()
+        elif not isinstance(self.transport, httpx.MockTransport):
+            self._interruptible_sleep(random.uniform(self._page_delay, self._page_delay_max))
         today = time.strftime('%Y-%m-%d')
         if self._request_day != today:
             self._request_day = today
@@ -152,7 +155,7 @@ class LocalBossSession:
                           timeout=20, follow_redirects=False,
                           headers={'Referer': 'https://www.zhipin.com/web/chat/index'}) as client:
             for page in range(1, 11):
-                self._count('conversation')
+                self._count('conversation', pace=(page == 1))
                 try:
                     response = client.get('https://www.zhipin.com/wapi/zpchat/boss/historyMsg',
                                           params={'src': int(source), 'gid': gid, 'maxMsgId': cursor, 'c': 20, 'page': page})
@@ -211,8 +214,6 @@ class LocalBossSession:
                 if not data['messages'] or type(next_cursor) is not int or next_cursor <= 0 or next_cursor == cursor:
                     raise BrowserError('消息分页游标异常，保留原记录')
                 cursor = next_cursor
-                if self._request_counter is None:
-                    self._interruptible_sleep(self._page_delay)
             else:
                 raise BrowserError('单会话超过最小样本读取上限，保留原记录')
         bad_name = (names != {name}) if since_mid is None else bool(names - {name})
@@ -394,7 +395,7 @@ class LocalBossSession:
                           headers={'Referer': 'https://www.zhipin.com/web/chat/job/list'}) as client:
             jobs, seen, total = [], set(), None
             for page in range(1, 101):
-                self._count('jobs')
+                self._count('jobs', pace=(page == 1))
                 try:
                     response = client.get('https://www.zhipin.com/wapi/zpjob/job/data/list',
                                           params={'page': page, 'pageSize': 20})
@@ -429,8 +430,6 @@ class LocalBossSession:
                     return {'jobs': jobs, 'total': total, 'complete': True}
                 if data.get('hasMore') is not True or not data['data'] or len(jobs) >= total:
                     raise BrowserError('平台分页信息不一致，本次不更新岗位范围')
-                if self._request_counter is None:
-                    self._interruptible_sleep(self._page_delay)
         raise BrowserError('岗位列表超出读取范围')
 
     def read_greeting_quota(self):

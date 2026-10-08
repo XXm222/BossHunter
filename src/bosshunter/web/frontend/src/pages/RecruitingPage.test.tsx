@@ -11,6 +11,13 @@ function show(path: string) { render(<MemoryRouter initialEntries={[path]}><Side
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks() })
 const seed = (value = state) => vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(value))))
 describe('recruiting workspace', () => {
+  it('distinguishes HTTP requests from browser actions in their shared budget', async () => {
+    seed({ ...state, request_budget: { count: 25, daily_limit: 100, remaining: 75,
+      date: '2026-10-08', by_kind: { conversation: 3, contacts_load: 22 } } })
+    show('/recruiting/requests')
+    expect(await screen.findByText('HTTP 请求 3 次；浏览器加载及招呼动作 22 次。一次浏览器动作不等于一次 HTTP 请求。')).toBeTruthy()
+    expect(screen.getByText('联系人加载动作')).toBeTruthy()
+  })
   it('does not overlap slow local state polls', async () => {
     vi.useFakeTimers()
     let release!: (value: Response) => void

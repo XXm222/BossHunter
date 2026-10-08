@@ -146,7 +146,7 @@ class ResumeTests(unittest.TestCase):
             return httpx.Response(200, json={'code': 0, 'zpData': {'hasMore': page == 1, 'minMsgId': 10 - page, 'messages': [msg]}})
 
         session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(handle), page_delay=0,
-                                   request_counter=lambda kind: kinds.append(kind))
+                                   request_counter=lambda kind, **kwargs: kinds.append(kind))
         session.read_conversation('123-0', '测试候选人', '测试岗位')
         self.assertEqual(kinds, ['conversation', 'conversation'])
         self.assertEqual(len(calls), 2)

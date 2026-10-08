@@ -89,6 +89,7 @@ class RequestPacingTests(unittest.TestCase):
         session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(handle), throttle=throttle, request_counter=counter)
         session.read_conversation('123-0', '测试候选人', '测试岗位', throttle=False)
         self.assertEqual(counter.call_count, 2)
+        self.assertEqual([call.kwargs for call in counter.call_args_list], [{"pace": True}, {"pace": False}])
         self.assertEqual(len(calls), 2)
         throttle.wait.assert_not_called()
 
@@ -98,6 +99,76 @@ class RequestPacingTests(unittest.TestCase):
         session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(lambda _: response([message()])), throttle=throttle)
         session.read_conversation('123-0', '测试候选人', '测试岗位', throttle=False)
         throttle.wait.assert_called_once()
+
+    def test_pages_share_short_deadline_without_resetting_operation_deadline(self):
+        store = Store(self.path)
+        stamp = datetime.now(timezone.utc)
+        with patch('bosshunter.recruiting.store.datetime') as clock:
+            clock.now.return_value = stamp
+            store.count_request('conversation', 100, min_interval=120, page_interval=15)
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + 10, timezone.utc)
+            other = Store(self.path)
+            with self.assertRaises(RequestThrottled) as caught:
+                other.count_request('conversation', 100, min_interval=120, page_interval=15, pace=False)
+            self.assertEqual(caught.exception.seconds, 5)
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + 15, timezone.utc)
+            other.count_request('conversation', 100, min_interval=120, page_interval=15, pace=False)
+            self.assertEqual(store.setting('request_next_at'), stamp.timestamp() + 120)
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + 30, timezone.utc)
+            with self.assertRaises(RequestThrottled) as caught:
+                other.count_request('jobs', 100, min_interval=120, page_interval=15)
+            self.assertEqual(caught.exception.seconds, 90)
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + 120, timezone.utc)
+            other.count_request('jobs', 100, min_interval=120, page_interval=15)
+        self.assertEqual(store.request_budget()['count'], 3)
+
+    def test_pages_cannot_bypass_daily_budget_or_account_cooldown(self):
+        store = Store(self.path)
+        store.count_request('jobs', 1)
+        with self.assertRaises(ValueError):
+            store.count_request('jobs', 1, pace=False)
+        store.pause_requests(1800)
+        with self.assertRaises(RequestPaused):
+            Store(self.path).count_request('jobs', 100, pace=False)
+        self.assertEqual(store.request_budget()['count'], 1)
+
+    def test_three_http_pages_wait_thirty_seconds_then_next_operation_waits(self):
+        service = self.service(read_delay_min=120, read_delay_max=120,
+                               read_page_delay=15, read_page_delay_max=15)
+        calls = []
+        def handle(request):
+            calls.append(request)
+            return response([message(10 - len(calls))], len(calls) < 3, 10 - len(calls))
+        session = LocalBossSession(lambda: CookieJar(), httpx.MockTransport(handle),
+                                   request_counter=service._count_request)
+        service.local_session = session
+        stamp = datetime.now(timezone.utc)
+        elapsed = [0.0]
+        def wait(seconds):
+            elapsed[0] += seconds
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + elapsed[0], timezone.utc)
+        with patch('bosshunter.recruiting.store.datetime') as clock, patch.object(session, '_wait_cancelled', side_effect=wait):
+            clock.now.return_value = stamp
+            session.read_conversation('123-0', '测试候选人', '测试岗位')
+            self.assertEqual(elapsed[0], 30)
+            self.assertEqual(len(calls), 3)
+            service._count_request('identity')
+            self.assertEqual(elapsed[0], 120)
+        self.assertEqual(service.store.request_budget()['count'], 4)
+
+    def test_contact_loader_accumulates_950_contacts_before_three_stable_reads(self):
+        browser = BossBrowser(runtime=Mock())
+        batches = [[{'ident': str(i)} for i in range(start, start + 50)]
+                   for start in range(0, 950, 50)]
+        browser.evaluate = Mock(side_effect=[{'contacts': batch} for batch in batches] +
+                                [{'contacts': batches[-1]}] * 3 + [{'contacts': []}])
+        gate = Mock()
+        with patch('bosshunter.recruiting.browser.time.sleep'):
+            contacts = browser.read_contact_list(load_all=True, before_load=gate)
+        self.assertEqual(len(contacts), 950)
+        self.assertEqual(gate.call_count, 22)
+        self.assertEqual(browser.contact_coverage['reason'], 'loaded_list_stable')
+        self.assertFalse(browser.contact_coverage['complete'])
 
     def test_http_403_and_429_are_account_pauses_without_retry(self):
         for status in (403, 429):
@@ -132,11 +203,13 @@ class RequestPacingTests(unittest.TestCase):
         with self.assertRaises(TaskCancelled):
             browser.read_contact_list(load_all=True, before_load=Mock(side_effect=TaskCancelled('合成停止')))
         browser.evaluate.assert_not_called()
-        browser.evaluate.side_effect = [{'count': i, 'contacts': []} for i in range(10)] + [{'contacts': []}]
+        browser.evaluate.side_effect = [{'count': i, 'contacts': []} for i in range(200)] + [{'contacts': []}]
         gate = Mock()
         with patch('bosshunter.recruiting.browser.time.sleep'):
             browser.read_contact_list(load_all=True, before_load=gate)
-        self.assertEqual(gate.call_count, 10)
+        self.assertEqual(gate.call_count, 200)
+        self.assertEqual(gate.call_args_list[0].args, (True,))
+        self.assertTrue(all(call.args == (False,) for call in gate.call_args_list[1:]))
         self.assertEqual(browser.contact_coverage['reason'], 'scroll_limit')
 
     def test_conservative_defaults_and_explicit_monitor_interval(self):

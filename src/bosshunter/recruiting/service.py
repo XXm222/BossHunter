@@ -44,8 +44,9 @@ class RecruitingService:
         self.local_session = local_session or LocalBossSession(
             user_data_dir=config_provider().get("browser", {}).get("recruiting_user_data_dir"),
             read_delay=(cfg.get("read_delay_min", 120.0), cfg.get("read_delay_max", 180.0)),
-            daily_limit=cfg.get("read_daily_limit", 20),
-            page_delay=cfg.get("read_page_delay", 120.0),
+            daily_limit=cfg.get("read_daily_limit", 100),
+            page_delay=cfg.get("read_page_delay", 15.0),
+            page_delay_max=cfg.get("read_page_delay_max", 30.0),
             request_counter=self._count_request, account_pause_handler=self._pause_platform_requests)
         self.verifier = verifier
         self.use_local_session = browser is None or local_session is not None
@@ -64,16 +65,18 @@ class RecruitingService:
         config = self.config_provider() or {}
         return config.get("recruiting") or {}
 
-    def _count_request(self, kind):
+    def _count_request(self, kind, *, pace=True):
         """LocalBossSession 每次后台请求前的计数回调：按账号存 DB，超限抛 BrowserError。"""
         cfg = self._recruiting_cfg()
         interval = random.uniform(cfg.get('read_delay_min', 120.0), cfg.get('read_delay_max', 180.0))
+        page_interval = random.uniform(cfg.get('read_page_delay', 15.0), cfg.get('read_page_delay_max', 30.0))
         while True:
             self._check_stopped()
             if kind in {'greeting', 'recommend_load'} and self.discovery_stop.is_set():
                 raise TaskCancelled('主动招呼已停止')
             try:
-                self.store.count_request(kind, cfg.get('read_daily_limit', 20), min_interval=interval)
+                self.store.count_request(kind, cfg.get('read_daily_limit', 100), min_interval=interval,
+                                         pace=pace, page_interval=page_interval)
                 return
             except RequestThrottled as exc:
                 # No DB transaction is held during the wait. Recheck and compete
@@ -93,23 +96,49 @@ class RecruitingService:
 
     def state(self):
         s = self.store
-        conversations = s.rows("conversations")
+        saved = s.state_snapshot()
+        settings = saved['settings']
+        positions = saved['positions']
+        by_position = {p['id']: p for p in positions}
+        conversations = saved['conversations']
         for c in conversations:
             c["snapshot"] = json.loads(c["snapshot"])
-        docs = s.rows("documents", "ORDER BY created_at DESC, rowid DESC")
-        current_documents = {c['id']: s.current_document(c['id']) for c in conversations}
+        docs = saved['documents']
+        by_document = {d['id']: d for d in docs}
+        current_documents = {}
+        for doc in docs:
+            current_documents.setdefault(doc['conversation_id'], doc)
+        for c in conversations:
+            chosen = by_document.get(settings.get('current_document:' + c['id']))
+            if chosen and chosen['conversation_id'] == c['id']:
+                current_documents[c['id']] = chosen
         current_document_ids = {d['id'] for d in current_documents.values() if d}
         docs.sort(key=lambda d: d['id'] not in current_document_ids)
         for d in docs:
             d["meta"] = json.loads(d["meta"])
-        assessments = s.rows("assessments", "ORDER BY created_at DESC, rowid DESC")
+        assessments = saved['assessments']
         for a in assessments:
             a["result"] = json.loads(a["result"])
-        current_assessment_ids = {}
+        config = deepcopy(self.config_provider())
+        model_basis = self._assessment_model_basis(config)
+        current_assessment_ids = {c['id']: None for c in conversations}
+        digests = {}
+        by_conversation = {c['id']: c for c in conversations}
         for c in conversations:
-            assessment = self.reply_context(c['id'])['assessment']
-            current_assessment_ids[c['id']] = assessment['id'] if assessment else None
-        drafts = s.rows("outbox", "ORDER BY created_at DESC, rowid DESC")
+            doc = current_documents.get(c['id'])
+            if doc:
+                digests[c['id']] = self._assessment_digest(c['id'], by_position[c['position_id']], doc, model_basis)
+        for assessment in assessments:
+            cid = assessment['conversation_id']
+            if cid not in digests or current_assessment_ids[cid] is not None:
+                continue
+            p = by_position[by_conversation[cid]['position_id']]
+            doc = current_documents[cid]
+            result = assessment['result']
+            if (assessment['input_hash'] == digests[cid] and result.get('position_id') == p['id']
+                    and result.get('document_id') == doc['id'] and result.get('position_version') == p['version']):
+                current_assessment_ids[cid] = assessment['id']
+        drafts = saved['outbox']
         for d in drafts:
             d["refs"] = json.loads(d["refs"])
         jobs_state = self.jobs.state()
@@ -119,7 +148,9 @@ class RecruitingService:
         monitor_enabled = bool(s.setting('monitor_enabled', False))
         # 读 DB 里的 monitor_state：worker 独立进程写入的最新成功时间/错误，本进程内存不会自动刷新
         saved_monitor = s.setting('monitor_state', {})
-        allowed_count = len(self._allowed_conversations())
+        selected = {j['id'] for j in jobs_state['jobs'] if j['selected'] and j['platform_id'] and j['status'] == '开放中'}
+        allowed_count = sum(not c['taken_over'] and not c['do_not_contact']
+                            and by_position[c['position_id']]['enabled'] and c['position_id'] in selected for c in conversations)
         monitor_state = {
             "running": worker_alive and monitor_enabled,
             "paused": worker_alive and not monitor_enabled,
@@ -134,16 +165,16 @@ class RecruitingService:
             'processing_conversation_id': saved_monitor.get('processing_conversation_id') if worker_alive else None,
         }
         budget = s.request_budget()
-        read_daily_limit = self._recruiting_cfg().get("read_daily_limit", 20)
+        read_daily_limit = self._recruiting_cfg().get("read_daily_limit", 100)
         request_budget = {"date": budget.get("date"), "count": budget.get("count", 0),
                           "daily_limit": read_daily_limit,
                           "remaining": max(0, read_daily_limit - budget.get("count", 0)),
                           "by_kind": budget.get("by_kind", {}),
                           'paused_until': s.setting('request_paused_until', 0)}
-        return {"positions": s.rows("positions"), "conversations": conversations,
-                "documents": docs, "resume_processing": {c["id"]: s.setting("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
+        return {"positions": positions, "conversations": conversations,
+                "documents": docs, "resume_processing": {c["id"]: settings.get("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "current_assessment_ids": current_assessment_ids,
-                "outbox": drafts, "events": s.rows("events", "ORDER BY id DESC LIMIT 30"),
+                "outbox": drafts, "events": saved['events'],
                 "connection": self.connection, "monitor": monitor_state,
                 "send_channel": self._send_channel_status(),
                 "worker": {"alive": worker_alive, "monitor_enabled": monitor_enabled},
@@ -152,7 +183,7 @@ class RecruitingService:
                               "sent_today": self._auto_reply_sent_today()},
                 "request_budget": request_budget,
                 'contact_sync': s.setting('contact_sync', {}),
-                "model_ready": bool(agent.get_ai_api_key(self.config_provider())),
+                "model_ready": bool(model_basis[1]),
                 "pilot": {"max_conversations": 20, "invitation_sending": False,
                           "conversation_id": s.setting("pilot_conversation"),
                           "message_identity": "platform_ids" if conversations and all(c['snapshot'].get('stable_message_ids') for c in conversations) else "snapshot_only", "coverage": "已同步多个候选人会话（非全量）"}}
@@ -210,7 +241,7 @@ class RecruitingService:
         会话后由 sync()/monitor 按需读取并核对归属。已导入的会话跳过。
         按联系人 uid 批量查 encryptJobId，把会话关联到已发布岗位（问题7）。
         """
-        contacts = (self.browser.read_contact_list(load_all=True, before_load=lambda: self._count_request('contacts_load'))
+        contacts = (self.browser.read_contact_list(load_all=True, before_load=lambda pace: self._count_request('contacts_load', pace=pace))
                     if isinstance(self.browser, BossBrowser) else self.browser.read_contact_list(load_all=True))
         existing = {c["id"] for c in self.store.rows("conversations")}
         new_contacts = [c for c in contacts if c.get("ident") and c.get("name") and c["ident"] not in existing]
@@ -651,7 +682,11 @@ class RecruitingService:
         """开启/停止回复监测：写入控制标志，由独立 worker 进程轮询执行。"""
         if type(enabled) is not bool:
             raise ValueError("开关必须是布尔值")
-        self.store.set_setting('monitor_enabled', enabled)
+        with self.store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('monitor_enabled',?)", (encode(enabled),))
+            if enabled:
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('monitor_run_id',?)", (encode(uuid4().hex),))
         self.store.event('monitor_control', '', f"回复监测已{'开启' if enabled else '停止'}")
         return {'monitor_enabled': enabled}
 
@@ -782,10 +817,17 @@ class RecruitingService:
             raise ValueError("请先读取或导入该候选人的简历")
         config = deepcopy(self.config_provider())
         # Include candidate/document identity and model configuration, never persist credentials.
-        digest = fingerprint([cid, doc["id"], doc["content_hash"], position["id"], position["version"],
-                              config.get("ai", {}), agent.get_ai_api_key(config),
-                              get_ai_base_url(config), get_ai_service(config), "assessment-v3"])
+        digest = self._assessment_digest(cid, position, doc, self._assessment_model_basis(config))
         return position, doc, config, digest
+
+    @staticmethod
+    def _assessment_model_basis(config):
+        return [config.get('ai', {}), agent.get_ai_api_key(config), get_ai_base_url(config), get_ai_service(config)]
+
+    @staticmethod
+    def _assessment_digest(cid, position, doc, model_basis):
+        return fingerprint([cid, doc['id'], doc['content_hash'], position['id'], position['version'],
+                            *model_basis, 'assessment-v3'])
 
     def auto_assess(self, cid):
         with self.lock:
@@ -1055,7 +1097,6 @@ class RecruitingService:
                     previous = json.loads(c['snapshot'])
                     source['position_platform_id'] = source.get('position_platform_id') or previous.get('position_platform_id')
                     source['received_resume_message_id'] = source.get('received_resume_message_id') or previous.get('received_resume_message_id')
-                    source = self._append_new_messages(previous, source)
             else:
                 source = before
             updated = self.store.import_conversation(source, append=self.use_local_session) if source is not None else self.store.row('conversations', c['id'])
@@ -1198,9 +1239,17 @@ class RecruitingService:
         Thread(target=heartbeat, daemon=True, name='recruiting-heartbeat').start()
         last_run = 0.0
         consecutive_errors = 0
+        previous_enabled = False
+        previous_revision = None
         try:
             while not stop_event.is_set():
                 if self.store.setting('monitor_enabled', False):
+                    revision = self.store.setting('monitor_run_id')
+                    if not previous_enabled or revision != previous_revision:
+                        consecutive_errors = 0
+                        last_run = 0.0
+                    previous_enabled = True
+                    previous_revision = revision
                     if time.time() - last_run >= self.monitor['interval_seconds']:
                         try:
                             self.monitor_once()
@@ -1214,14 +1263,20 @@ class RecruitingService:
                         except (TaskCancelled, TaskBusy):
                             pass
                         except Exception as exc:
-                            consecutive_errors += 1
-                            self.store.event('monitor_paused', '', str(exc)[:250])
-                            if consecutive_errors >= 3:
-                                self.set_monitor_enabled(False)
-                                self.store.event('monitor_paused', '', f"连续失败 {consecutive_errors} 次，已暂停，请人工处理")
+                            if self.store.setting('monitor_run_id') != revision:
+                                # A late failure belongs to the old run. Do not
+                                # charge or stop the run just enabled by the user.
+                                consecutive_errors = 0
+                            else:
+                                consecutive_errors += 1
+                                self.store.event('monitor_paused', '', str(exc)[:250])
+                                if consecutive_errors >= 3 and self.store.pause_monitor_run(revision):
+                                    self.store.event('monitor_paused', '', f"连续失败 {consecutive_errors} 次，已暂停，请人工处理")
                         finally:
                             # 失败也推进 last_run：持续出错时仍按 interval 重试，而不是每 10 秒紧循环。
                             last_run = time.time()
+                else:
+                    previous_enabled = False
                 stop_event.wait(10)  # 每 10 秒轮询一次 monitor_enabled 标志
         finally:
             self.store.event('worker_stopped', '', '独立监测进程已停止')

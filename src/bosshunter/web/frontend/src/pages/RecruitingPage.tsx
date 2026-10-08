@@ -105,6 +105,8 @@ function RequestStats({ data }: { data: State }) {
   if (!b) return <div className="rc-panel rc-empty">暂无请求统计</div>
   const pct = b.daily_limit ? Math.min(100, Math.round(b.count / b.daily_limit * 100)) : 0
   const kinds = Object.entries(b.by_kind || {}).sort((a, c) => c[1] - a[1])
+  const actions = kinds.filter(([kind]) => ['contacts_load', 'recommend_load', 'greeting'].includes(kind)).reduce((sum, [, count]) => sum + count, 0)
+  const http = kinds.reduce((sum, [, count]) => sum + count, 0) - actions
   return <div>
     <PageHeading title="请求统计" description="后台 HTTP 请求和主动触发平台加载、招呼的动作共用预算；页面自身的后台请求未计入。" />
     {!!b.paused_until && b.paused_until * 1000 > Date.now() && <p className="rc-alert warning" role="status">BOSS 拒绝或限流后的冷却中，最早 {new Date(b.paused_until * 1000).toLocaleString('zh-CN', { hour12: false })} 后再尝试。请先在 Chrome 核实账号，自动任务需手动重新开启。</p>}
@@ -118,7 +120,8 @@ function RequestStats({ data }: { data: State }) {
       <div style={{ height: 8, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}><div style={{ height: '100%', width: `${pct}%`, background: pct >= 90 ? '#dc2626' : '#2563eb' }} /></div>
     </div>
     <div className="rc-panel">
-      <h3>各类请求占用</h3>
+      <h3>各类预算占用</h3>
+      <p className="rc-caption">HTTP 请求 {http} 次；浏览器加载及招呼动作 {actions} 次。一次浏览器动作不等于一次 HTTP 请求。</p>
       {kinds.length === 0 ? <p className="rc-muted">今日还没有后台读取。</p> : kinds.map(([k, n]) => <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid #f1f5f9' }}><span>{REQUEST_KIND_LABELS[k] || k}</span><strong>{n}</strong></div>)}
     </div>
   </div>

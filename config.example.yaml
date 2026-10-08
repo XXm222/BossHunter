@@ -167,8 +167,9 @@ recruiting:
   # 后台 HTTP 读取节流（同步消息/岗位/联系人/额度）
   read_delay_min: 120       # Web/worker 共用逐请求间隔（秒）下限；包含分页和发送前核验
   read_delay_max: 180       # 上限；并非平台承诺的安全频率
-  read_daily_limit: 20      # 单日请求/触发加载动作上限，重启不重置
-  read_page_delay: 120      # 独立会话分页等待；服务模式分页使用共用逐请求限速
+  read_daily_limit: 100      # 单日请求/触发加载动作上限，重启不重置
+  read_page_delay: 15      # 同一操作内分页/联系人滚动间隔下限
+  read_page_delay_max: 30   # 同一操作内分页/联系人滚动间隔上限
   monitor_interval_seconds: 600  # 每 10 分钟处理一个候选人，完整一轮需候选人数 × 10 分钟以上
   # 主动打招呼循环节流
   greet_delay_min: 120      # 每个招呼动作间隔（秒）下限

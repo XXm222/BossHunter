@@ -185,9 +185,9 @@ class BossBrowser:
         if load_all:
             last = -1
             stable = 0
-            for _ in range(10):
+            for step in range(200):
                 if before_load:
-                    before_load()
+                    before_load(step == 0)
                 value = self.evaluate(SCROLL_CONTACT_LIST)
                 for contact in value.get('contacts', []):
                     if contact.get('ident'):

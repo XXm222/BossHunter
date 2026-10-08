@@ -300,8 +300,11 @@ class IssueFixTests(unittest.TestCase):
 
     def test_live_sender_in_another_process_is_recovered_only_after_exit(self):
         draft = self.service.prepare_reply(self.cid, '跨进程合成回复')
-        code = "from pathlib import Path; from bosshunter.recruiting.store import Store; import sys; s=Store(Path(sys.argv[1])); s.claim(sys.argv[2]); print('claimed',flush=True); sys.stdin.read()"
-        proc = subprocess.Popen([sys.executable, '-c', code, str(self.service.store.path), draft['id']],
+        src_dir = str(Path(__file__).resolve().parent.parent / 'src')
+        code = ("import sys; sys.path.insert(0, sys.argv[3]); "
+                "from pathlib import Path; from bosshunter.recruiting.store import Store; "
+                "s=Store(Path(sys.argv[1])); s.claim(sys.argv[2]); print('claimed',flush=True); sys.stdin.read()")
+        proc = subprocess.Popen([sys.executable, '-c', code, str(self.service.store.path), draft['id'], src_dir],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             self.assertEqual(proc.stdout.readline().strip(), 'claimed')

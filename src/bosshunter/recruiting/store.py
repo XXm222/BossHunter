@@ -199,7 +199,7 @@ class Store:
             db.execute("INSERT OR REPLACE INTO settings VALUES ('monitor_enabled','false')")
         return until
 
-    def count_request(self, kind, daily_limit, *, min_interval=0):
+    def count_request(self, kind, daily_limit, *, min_interval=0, pace=True, page_interval=0):
         """计数一次后台 HTTP 请求；超限抛 ValueError。
 
         计数存 DB（settings.request_budget），重启不重置、Web 与 worker 两进程共用；
@@ -220,16 +220,22 @@ class Store:
             if budget['count'] >= daily_limit:
                 raise ValueError(f'后台请求达到单日上限 {daily_limit} 次，请明日再试')
             stamp = datetime.now(timezone.utc).timestamp()
-            if min_interval > 0:
+            remaining = 0
+            if pace and min_interval > 0:
                 slot = db.execute("SELECT value FROM settings WHERE key='request_next_at'").fetchone()
-                remaining = (json.loads(slot[0]) if slot else 0) - stamp
-                if remaining > 0:
-                    raise RequestThrottled(remaining)
+                remaining = max(remaining, (json.loads(slot[0]) if slot else 0) - stamp)
+            if page_interval > 0:
+                page_slot = db.execute("SELECT value FROM settings WHERE key='request_page_next_at'").fetchone()
+                remaining = max(remaining, (json.loads(page_slot[0]) if page_slot else 0) - stamp)
+            if remaining > 0:
+                raise RequestThrottled(remaining)
             budget['count'] += 1
             budget['by_kind'][kind] = budget['by_kind'].get(kind, 0) + 1
             db.execute("INSERT OR REPLACE INTO settings VALUES ('request_budget', ?)", (encode(budget),))
-            if min_interval > 0:
+            if pace and min_interval > 0:
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('request_next_at', ?)", (encode(stamp + min_interval),))
+            if page_interval > 0:
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('request_page_next_at', ?)", (encode(stamp + page_interval),))
         return budget
 
     def event(self, kind, object_id="", detail=""):
@@ -251,6 +257,29 @@ class Store:
             raise ValueError("未知数据类型")
         with self.db() as db:
             return [dict(r) for r in db.execute(f"SELECT * FROM {table} {where}", args)]
+
+    def state_snapshot(self):
+        """Read dashboard records and document selections in one read transaction."""
+        ordering = {'documents': 'ORDER BY created_at DESC,rowid DESC',
+                    'assessments': 'ORDER BY created_at DESC,rowid DESC',
+                    'outbox': 'ORDER BY created_at DESC,rowid DESC',
+                    'events': 'ORDER BY id DESC LIMIT 30'}
+        with self.db() as db:
+            db.execute('BEGIN')
+            result = {table: [dict(row) for row in db.execute(f'SELECT * FROM {table} {ordering.get(table, "")}')]
+                      for table in ('positions', 'conversations', 'documents', 'assessments', 'outbox', 'events')}
+            result['settings'] = {row['key']: json.loads(row['value']) for row in db.execute('SELECT * FROM settings')}
+            return result
+
+    def pause_monitor_run(self, revision):
+        """Only a failure from the current run may pause that run."""
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT value FROM settings WHERE key='monitor_run_id'").fetchone()
+            if (json.loads(row[0]) if row else None) != revision:
+                return False
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('monitor_enabled','false')")
+            return True
 
     def save_position(self, ident, title, jd, source="manual", enabled=True):
         if not title.strip() or len(jd) > 30000:
