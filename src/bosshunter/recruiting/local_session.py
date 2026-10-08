@@ -34,6 +34,11 @@ def _default_chrome_user_data_dir() -> Path:
     return Path.home() / ".config/google-chrome"
 
 
+# getBossFriendListV2 一次可接受的 friendIds 数量；按用户要求取保守值 50，
+# 避免全账号导入时一次 POST 过多 uid 被平台拒绝。
+FRIEND_BATCH_SIZE = 50
+
+
 class LocalBossSession:
     def __init__(self, cookie_loader=None, transport=None, throttle=None, user_data_dir=None,
                  read_delay=(120.0, 180.0), daily_limit=100, page_delay=15.0, stop_event=None,
@@ -479,14 +484,22 @@ class LocalBossSession:
     def read_friend_jobs(self, uids):
         """查询一批联系人的平台岗位 ID（encryptJobId）。
 
-        getBossFriendListV2 按 friendIds 批量 POST，返回这些联系人的详情（含
-        encryptJobId），用于把会话按平台岗位 ID 关联到已发布岗位、共享 JD。返回
-        {uid: encryptJobId}；查不到或 encryptJobId 为空的 uid 不在结果里。
+        getBossFriendListV2 按 friendIds 批量 POST；前端一次约 94 个，这里按
+        FRIEND_BATCH_SIZE 分批请求，避免一次 POST 过多 friendIds 被平台拒绝。
+        返回 {uid: encryptJobId}；查不到或 encryptJobId 为空的 uid 不在结果里。
         """
         uids = [str(u) for u in uids if u]
         if not uids:
             return {}
-        self._count('friend')
+        result = {}
+        for index in range(0, len(uids), FRIEND_BATCH_SIZE):
+            batch = uids[index:index + FRIEND_BATCH_SIZE]
+            result.update(self._read_friend_jobs_batch(batch, pace=(index == 0)))
+        return result
+
+    def _read_friend_jobs_batch(self, uids, *, pace=True):
+        """POST 单批 friendIds，解析返回 {uid: encryptJobId}；接口拒绝抛 AccountPauseError。"""
+        self._count('friend', pace=pace)
         cookies = self.cookie_loader()
         with httpx.Client(cookies=cookies, transport=self.transport, trust_env=False,
                           timeout=20, follow_redirects=False,

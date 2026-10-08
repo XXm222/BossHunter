@@ -22,6 +22,25 @@ function mockFetch(fetcher: (url: string, init?: RequestInit) => Promise<Respons
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('binding wizard', () => {
+  it('offers explicit job linking for an existing placeholder without guessing a job', async () => {
+    const value = { ...baseState, conversations: [{ ...c, position_id: 'context-placeholder' }],
+      recruiting_jobs: { jobs: [{ id: 'boss-job', platform_id: 'job', title: '前端工程师' }] } } as unknown as State
+    const act = vi.fn(async () => true)
+    mockFetch(async url => new Response(JSON.stringify({ result: url.endsWith('/contacts/list') ? contacts : preview })))
+    render(<BindingWizard data={value} act={act} busy={false} />)
+    fireEvent.click(screen.getByRole('button', { name: '加载联系人列表' }))
+    fireEvent.click(await screen.findByRole('button', { name: /张三/ }))
+    fireEvent.click(screen.getByRole('button', { name: '预览核实' }))
+    expect(await screen.findByRole('button', { name: '确认绑定这个会话' })).toBeTruthy()
+    expect((screen.getByRole('button', { name: '确认关联岗位' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(act).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText('人工关联平台岗位'), { target: { value: 'job' } })
+    fireEvent.click(screen.getByRole('button', { name: '确认关联岗位' }))
+    await waitFor(() => expect(act).toHaveBeenCalledWith('conversation/link-position',
+      { conversation_id: '123456-0', platform_id: 'job' }, '岗位已关联，请重新预览并确认绑定'))
+    await waitFor(() => expect(screen.queryByRole('button', { name: '确认绑定这个会话' })).toBeNull())
+    expect(act).toHaveBeenCalledTimes(1)
+  })
   it('shows the load button when no conversation is bound', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(baseState))))
     show('/recruiting/binding')

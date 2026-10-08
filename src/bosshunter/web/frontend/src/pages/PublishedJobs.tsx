@@ -6,7 +6,7 @@ export type PublishedJobsState = {
   jobs: { id: string; title: string; details: string[]; status: string; selected: number; platform_id: string }[]
   sync: { synced_at?: string; attempted_at?: string; total?: number; error?: string }
   budget: { mode: string; limit: number }
-  daily: { sent: number; attempted: number; platform_remaining: number | null; custom_remaining: number | null; date: string }
+  daily: { sent: number; attempted: number; platform_remaining: number | null; custom_remaining: number | null; date: string; quota_status?: 'unread' | 'expired' | 'fresh' | 'unknown'; quota_updated_at?: string | null; quota_last_remaining?: number | null; quota_unlimited?: boolean }
   attempts?: GreetingAttempt[]
   selected_count: number; running: boolean; can_start?: boolean; blockers: string[]
 }

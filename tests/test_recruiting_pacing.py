@@ -132,6 +132,51 @@ class RequestPacingTests(unittest.TestCase):
             Store(self.path).count_request('jobs', 100, pace=False)
         self.assertEqual(store.request_budget()['count'], 1)
 
+    def test_greetings_share_their_own_slot_and_still_honor_global_short_gap(self):
+        store = Store(self.path)
+        stamp = datetime.now(timezone.utc)
+        with patch('bosshunter.recruiting.store.datetime') as clock:
+            clock.now.return_value = stamp
+            store.count_request('conversation', 100, min_interval=180, page_interval=15)
+            with self.assertRaises(RequestThrottled):
+                Store(self.path).count_request('greeting', 100, min_interval=60, page_interval=15)
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + 15, timezone.utc)
+            store.count_request('greeting', 100, min_interval=60, page_interval=15)
+            clock.now.return_value = datetime.fromtimestamp(stamp.timestamp() + 30, timezone.utc)
+            with self.assertRaises(RequestThrottled) as caught:
+                Store(self.path).count_request('greeting', 100, min_interval=60, page_interval=15)
+            self.assertEqual(caught.exception.seconds, 45)
+            with self.assertRaises(RequestThrottled) as caught:
+                store.count_request('conversation', 100, min_interval=180, page_interval=15)
+            self.assertEqual(caught.exception.seconds, 150)
+
+    def test_browser_loading_uses_short_gap_and_greeting_uses_configured_interval(self):
+        service = self.service(greet_delay_min=60, greet_delay_max=60)
+        with patch.object(service.store, 'count_request') as counter:
+            service._count_request('recommend_load')
+            self.assertFalse(counter.call_args.kwargs['pace'])
+            service._count_request('greeting')
+            self.assertTrue(counter.call_args.kwargs['pace'])
+            self.assertEqual(counter.call_args.kwargs['min_interval'], 60)
+
+    def test_quota_expiring_during_greeting_wait_is_refreshed_before_click(self):
+        from recruiting_fixtures import fresh_quota
+        service = self.service()
+        authorize(service)
+        class Verifier:
+            def greet(self, *args, **kwargs):
+                kwargs['preflight']()
+                return {'sent': True, 'job_id': 'test-job'}
+        service.verifier = Verifier()
+        def wait(_):
+            service.store.set_setting('greeting_quota', {'date': '2000-01-01', 'remaining': 0})
+        def read():
+            fresh_quota(service)
+        with patch('bosshunter.recruiting.recommend.RecommendVerifier', Verifier), patch.object(service, '_count_request', side_effect=wait), patch.object(service, 'read_greeting_quota', side_effect=read) as quota:
+            result = service.greet_discovered('synthetic-candidate', '合成候选人', 'test-job')
+        quota.assert_called_once()
+        self.assertEqual(result['status'], 'sent')
+
     def test_three_http_pages_wait_thirty_seconds_then_next_operation_waits(self):
         service = self.service(read_delay_min=120, read_delay_max=120,
                                read_page_delay=15, read_page_delay_max=15)

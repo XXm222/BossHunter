@@ -168,8 +168,8 @@ recruiting:
   read_page_delay_max: 30   # 同一操作内分页/联系人滚动间隔上限
   read_daily_limit: 100      # 单日请求及主动加载动作预算
   monitor_interval_seconds: 600  # 每 10 分钟处理一个候选人
-  greet_delay_min: 120      # 主动打招呼间隔 120–180 秒
-  greet_delay_max: 180
+  greet_delay_min: 60      # 主动打招呼间隔 60–120 秒
+  greet_delay_max: 120
   greet_per_job_min: 1      # 每岗位每轮招呼 1 个
   greet_per_job_max: 1
   auto_reply_daily_limit: 5   # 每日自动回复默认上限

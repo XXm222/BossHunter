@@ -78,6 +78,28 @@ class LocalChatTests(unittest.TestCase):
         self.assertEqual(result, {'123': 'encryptJob123'})
         self.assertEqual(len(calls), 1)
 
+    def test_read_friend_jobs_batches_large_uid_list(self):
+        import urllib.parse
+        from bosshunter.recruiting.local_session import FRIEND_BATCH_SIZE
+        calls = []
+        def handle(req):
+            calls.append(req)
+            form = urllib.parse.parse_qs(req.content.decode())
+            uids = form['friendIds'][0].split(',')
+            return httpx.Response(200, json={'code': 0, 'zpData': {'friendList': [
+                {'uid': int(u), 'encryptJobId': 'job-' + u, 'jobName': ''} for u in uids
+            ]}})
+        uids = [str(i) for i in range(200)]
+        with patch('bosshunter.recruiting.local_session.time.sleep'):
+            result = self.adapter(handle).read_friend_jobs(uids)
+        self.assertEqual(len(calls), 4)  # 200 个 → 50 × 4
+        self.assertEqual(len(result), 200)
+        self.assertEqual(result['0'], 'job-0')
+        self.assertEqual(result['199'], 'job-199')
+        for call in calls:
+            form = urllib.parse.parse_qs(call.content.decode())
+            self.assertLessEqual(len(form['friendIds'][0].split(',')), FRIEND_BATCH_SIZE)
+
     def test_read_friend_jobs_empty_uids_makes_no_request(self):
         calls = []
         adapter = self.adapter(lambda req: calls.append(req) or httpx.Response(500))

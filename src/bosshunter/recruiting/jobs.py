@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from .store import encode, now
 
-QUOTA_TTL_SECONDS = 300
+QUOTA_TTL_SECONDS = 600
 
 
 def day_key():
@@ -218,6 +218,8 @@ class RecruitingJobs:
         used = sum(counts.values())
         selected = [j for j in jobs if j['selected']]
         platform_remaining = self._platform_remaining(quota, day, used)
+        quota_status = ('unread' if not quota else 'expired' if not self.quota_fresh(quota, day)
+                        else 'fresh' if quota.get('unlimited') or platform_remaining is not None else 'unknown')
         blockers = []
         if not selected:
             blockers.append('请先勾选允许自动处理的开放岗位')
@@ -240,6 +242,8 @@ class RecruitingJobs:
                           'platform_remaining': platform_remaining,
                           'custom_remaining': max(0, config['limit'] - used) if config['mode'] == 'custom' else None,
                           'quota_unlimited': bool(quota.get('unlimited')),
-                          'quota_date': quota.get('date')},
+                          'quota_date': quota.get('date'), 'quota_status': quota_status,
+                          'quota_updated_at': quota.get('updated_at'),
+                          'quota_last_remaining': quota.get('remaining')},
                 'attempts': attempts,
                 'selected_count': len(selected), 'running': False, 'can_start': can_start, 'blockers': blockers}

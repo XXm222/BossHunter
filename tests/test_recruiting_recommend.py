@@ -31,6 +31,9 @@ class Page:
     def reload(self, **kwargs):
         self.reload_calls += 1
 
+    def wait_for_timeout(self, milliseconds):
+        pass
+
 
 class Context:
     def __init__(self, pages):
@@ -309,6 +312,17 @@ class SelectAndReadTests(unittest.TestCase):
         with patch("bosshunter.recruiting.recommend.sync_playwright", return_value=SyncPlaywright(pw)), \
              patch("bosshunter.recruiting.recommend.time.sleep"):
             self.assertTrue(verifier.reload())
+        self.assertEqual(page.reload_calls, 1)
+
+    def test_reload_processes_browser_events_while_waiting_for_new_frame(self):
+        page = Page(RECOMMEND_PAGE, [])
+        frame = Frame(FRAME_URL, None)
+        page.wait_for_timeout = Mock(side_effect=lambda _: page.frames.append(frame))
+        pw = PW(Browser(Context([page])))
+        verifier = RecommendVerifier(lambda: {}, cdp_url="http://127.0.0.1:9222")
+        with patch("bosshunter.recruiting.recommend.sync_playwright", return_value=SyncPlaywright(pw)):
+            self.assertTrue(verifier.reload())
+        page.wait_for_timeout.assert_called_once_with(500)
         self.assertEqual(page.reload_calls, 1)
 
 

@@ -5,12 +5,35 @@ import RecruitingPage from './RecruitingPage'
 import { currentAssessment } from './CandidatePanels'
 import type { State } from './RecruitingPage'
 import { Sidebar } from '../components/layout/Sidebar'
-const c = { id: 'sample', name: '测试候选人', position_id: 'p', updated_at: '2026-01-01', taken_over: 0, do_not_contact: 0, snapshot: { messages: [{ direction: 'out', kind: 'text', text: '你有电商经验吗？', time: '' }, { direction: 'in', kind: 'text', text: '有的，做过三年。', time: '' }], coverage: '当前已加载消息' } }
+const c = { binding_confirmed: 1, id: 'sample', name: '测试候选人', position_id: 'p', updated_at: '2026-01-01', taken_over: 0, do_not_contact: 0, snapshot: { messages: [{ direction: 'out', kind: 'text', text: '你有电商经验吗？', time: '' }, { direction: 'in', kind: 'text', text: '有的，做过三年。', time: '' }], coverage: '当前已加载消息' } }
 const state: State = { recruiting_jobs: { jobs: [{ id: 'p', title: '财务', selected: 1, details: [], status: '开放中', platform_id: 'p' }], sync: {}, budget: { mode: 'platform', limit: 0 }, daily: { sent: 0, attempted: 0, platform_remaining: 20, custom_remaining: null, date: '2026-10-07' }, selected_count: 1, running: false, blockers: [] }, positions: [{ id: 'p', title: '财务', jd: '电商财务经验', enabled: 1, version: 1, source: 'human' }], conversations: [c], documents: [], company: { text: '公司说明原文', version: 1, updated_at: null }, assessments: [], events: [], outbox: [], connection: { connected: false, message: '尚未检查浏览器连接' }, monitor: { running: false, error: '', last_success: null, interval_seconds: 120 }, worker: { alive: true, monitor_enabled: false }, model_ready: false }
 function show(path: string) { render(<MemoryRouter initialEntries={[path]}><Sidebar /><Routes><Route path="/recruiting" element={<RecruitingPage />} /><Route path="/recruiting/:section" element={<RecruitingPage />} /><Route path="/recruiting/candidates/:id" element={<RecruitingPage />} /></Routes></MemoryRouter>) }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks() })
 const seed = (value = state) => vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(value))))
 describe('recruiting workspace', () => {
+  it('keeps the taken-over conversation visible while disabling model scoring', async () => {
+    seed({ ...state, model_ready: true, conversations: [{ ...c, taken_over: 1 }], documents: [{ id: 'doc', conversation_id: c.id, text: '合成简历', complete: 0, source: 'pdf' }] } as State)
+    show('/recruiting/candidates/sample?panel=resume')
+    expect((await screen.findByRole('button', { name: '立即评分' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByRole('button', { name: '读取已收到的简历' })).toBeTruthy()
+    expect(screen.getByText(/继续同步消息和读取简历；暂停模型评分/)).toBeTruthy()
+  })
+  it('hides unconfirmed contacts in a selected job in both communication and overview', async () => {
+    seed({ ...state, conversations: [c, { ...c, id: 'unbound', name: '未确认绑定联系人', binding_confirmed: 0 }] })
+    show('/recruiting/candidates')
+    expect((await screen.findAllByText('测试候选人')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('未确认绑定联系人')).toBeNull()
+    cleanup()
+    show('/recruiting')
+    expect((await screen.findAllByText('测试候选人')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('未确认绑定联系人')).toBeNull()
+  })
+  it('rejects direct communication URLs for contacts not confirmed as bound', async () => {
+    seed({ ...state, conversations: [{ ...c, id: 'unbound', name: '未确认绑定联系人', binding_confirmed: 0 }] })
+    show('/recruiting/candidates/unbound')
+    expect(await screen.findByText('没有找到该候选人，请返回工作台核对。')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '同步会话' })).toBeNull()
+  })
   it('distinguishes HTTP requests from browser actions in their shared budget', async () => {
     seed({ ...state, request_budget: { count: 25, daily_limit: 100, remaining: 75,
       date: '2026-10-08', by_kind: { conversation: 3, contacts_load: 22 } } })

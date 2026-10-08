@@ -172,8 +172,8 @@ recruiting:
   read_page_delay_max: 30   # 同一操作内分页/联系人滚动间隔上限
   monitor_interval_seconds: 600  # 每 10 分钟处理一个候选人，完整一轮需候选人数 × 10 分钟以上
   # 主动打招呼循环节流
-  greet_delay_min: 120      # 每个招呼动作间隔（秒）下限
-  greet_delay_max: 180      # 上限
+  greet_delay_min: 60      # 每个招呼动作间隔（秒）下限
+  greet_delay_max: 120      # 上限
   greet_per_job_min: 1      # 每岗位每轮最少招呼数
   greet_per_job_max: 1      # 最多招呼数
   # 自动回复

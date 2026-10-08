@@ -320,7 +320,9 @@ class RecommendVerifier:
             # 等推荐 iframe 重新加载出来，供后续 select_job/read_candidates 使用
             deadline = time.time() + self._wait_timeout
             while time.time() < deadline and not self._recommend_frame(page):
-                time.sleep(0.5)
+                # Sync Playwright dispatches frame-attached/navigated events during
+                # its own API calls. A Python sleep leaves page.frames stale.
+                page.wait_for_timeout(500)
             if not self._recommend_frame(page):
                 raise BrowserError("刷新后未找到推荐页 iframe，请确认推荐页已重新加载")
             return True

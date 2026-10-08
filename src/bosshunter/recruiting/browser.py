@@ -23,6 +23,10 @@ class TaskCancelled(BrowserError):
     """The current task was stopped before its next operation."""
 
 
+class ConversationNotSelected(BrowserError):
+    """Sending requires the user to open the bound conversation."""
+
+
 class AccountPauseError(BrowserError):
     """账号需要人工处理（验证码、登录失效、身份不一致），应暂停自动任务而非自动重试。"""
     pass
@@ -167,7 +171,7 @@ class BossBrowser:
         # Never navigate or switch the user's selected conversation as a side effect.
         previous = self.read_current()
         if previous.get("id") != ident:
-            raise BrowserError("当前页面不是绑定会话，请在 Chrome 手动打开该会话；未切换页面")
+            raise ConversationNotSelected("当前页面不是绑定会话，请在 Chrome 手动打开该会话；未切换页面")
         time.sleep(.35)
         snapshot = self.read_current()
         if snapshot != previous:

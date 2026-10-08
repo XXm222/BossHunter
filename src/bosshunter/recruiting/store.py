@@ -21,6 +21,16 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+def candidate_question(snapshot):
+    """Latest candidate text still awaiting a text reply."""
+    for message in reversed(snapshot.get('messages', [])):
+        if message['direction'] == 'out' and message['kind'] == 'text':
+            return None
+        if message['direction'] == 'in' and message['kind'] == 'text':
+            return message
+    return None
+
+
 def conversation_hash(snapshot):
     """会话内容指纹：只取会话标识、关联岗位与消息数组，读取源无关。
 
@@ -82,6 +92,7 @@ class Store:
                 snapshot TEXT NOT NULL, context_hash TEXT NOT NULL,
                 taken_over INTEGER NOT NULL DEFAULT 0, do_not_contact INTEGER NOT NULL DEFAULT 0,
                 auto_send INTEGER NOT NULL DEFAULT 0,
+                binding_confirmed INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS documents (
@@ -121,6 +132,11 @@ class Store:
             cols = [r[1] for r in db.execute("PRAGMA table_info(conversations)").fetchall()]
             if 'auto_send' not in cols:
                 db.execute("ALTER TABLE conversations ADD COLUMN auto_send INTEGER NOT NULL DEFAULT 0")
+            if 'binding_confirmed' not in cols:
+                db.execute("ALTER TABLE conversations ADD COLUMN binding_confirmed INTEGER NOT NULL DEFAULT 0")
+                # Only explicit binding events prove that an old record was
+                # confirmed. Contact discovery or job linking is not binding.
+                db.execute("UPDATE conversations SET binding_confirmed=1 WHERE id IN (SELECT object_id FROM events WHERE kind='conversation_bound')")
             if 'owner' not in [r[1] for r in db.execute('PRAGMA table_info(outbox)')]:
                 db.execute("ALTER TABLE outbox ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
         self.path.chmod(0o600)
@@ -143,6 +159,15 @@ class Store:
         with self.db() as db:
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             return json.loads(row[0]) if row else default
+
+    def request_daily_limit(self, default):
+        from zoneinfo import ZoneInfo
+        override = self.setting('request_daily_override', {})
+        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        if (isinstance(override, dict) and override.get('date') == day
+                and type(override.get('limit')) is int and 1 <= override['limit'] <= 10000):
+            return override['limit']
+        return default
 
     def set_setting(self, key, value):
         with self.db() as db:
@@ -221,8 +246,9 @@ class Store:
                 raise ValueError(f'后台请求达到单日上限 {daily_limit} 次，请明日再试')
             stamp = datetime.now(timezone.utc).timestamp()
             remaining = 0
+            operation_key = 'request_greeting_next_at' if kind == 'greeting' else 'request_next_at'
             if pace and min_interval > 0:
-                slot = db.execute("SELECT value FROM settings WHERE key='request_next_at'").fetchone()
+                slot = db.execute("SELECT value FROM settings WHERE key=?", (operation_key,)).fetchone()
                 remaining = max(remaining, (json.loads(slot[0]) if slot else 0) - stamp)
             if page_interval > 0:
                 page_slot = db.execute("SELECT value FROM settings WHERE key='request_page_next_at'").fetchone()
@@ -233,7 +259,7 @@ class Store:
             budget['by_kind'][kind] = budget['by_kind'].get(kind, 0) + 1
             db.execute("INSERT OR REPLACE INTO settings VALUES ('request_budget', ?)", (encode(budget),))
             if pace and min_interval > 0:
-                db.execute("INSERT OR REPLACE INTO settings VALUES ('request_next_at', ?)", (encode(stamp + min_interval),))
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (operation_key, encode(stamp + min_interval)))
             if page_interval > 0:
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('request_page_next_at', ?)", (encode(stamp + page_interval),))
         return budget
@@ -293,19 +319,21 @@ class Store:
                 db.execute("UPDATE outbox SET status='expired',updated_at=? WHERE status='draft' AND conversation_id IN (SELECT id FROM conversations WHERE position_id=?)", (now(), ident))
         return self.row("positions", ident)
 
-    def import_conversation(self, snapshot, *, append=False):
+    def import_conversation(self, snapshot, *, append=False, confirmed=False, track_reply=False):
         ident = snapshot["id"]
         if not snapshot.get("position_title") or not ident:
             raise ValueError("缺少会话标识或沟通职位")
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            old = db.execute("SELECT position_id,snapshot FROM conversations WHERE id=?", (ident,)).fetchone()
+            old = db.execute("SELECT position_id,snapshot,binding_confirmed FROM conversations WHERE id=?", (ident,)).fetchone()
             if append and old:
                 snapshot = merge_messages(json.loads(old['snapshot']), snapshot)
             if old:
                 pid = old[0]
                 platform_id = snapshot.get('position_platform_id')
                 if platform_id and pid != 'boss-' + str(platform_id):
+                    if pid.startswith('context-') and not json.loads(old['snapshot']).get('position_platform_id'):
+                        raise ValueError('该会话尚未关联平台岗位，请先人工确认并关联岗位，再绑定会话')
                     raise ValueError('会话平台岗位身份已变化，请先人工重新关联岗位')
             else:
                 platform_id = snapshot.get("position_platform_id")
@@ -322,11 +350,21 @@ class Store:
                 db.execute("INSERT INTO positions(id,title,source,updated_at) VALUES (?,?,?,?)",
                            (pid, snapshot["position_title"], "conversation_context", now()))
             context_hash = conversation_hash(snapshot)
-            db.execute("""INSERT INTO conversations(id,name,position_id,snapshot,context_hash,updated_at)
-                VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,
-                snapshot=excluded.snapshot,context_hash=excluded.context_hash,updated_at=excluded.updated_at""",
-                       (ident, snapshot["name"], pid, encode(snapshot), context_hash, now()))
+            db.execute("""INSERT INTO conversations(id,name,position_id,snapshot,context_hash,updated_at,binding_confirmed)
+                VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                snapshot=excluded.snapshot,context_hash=excluded.context_hash,updated_at=excluded.updated_at,
+                binding_confirmed=MAX(conversations.binding_confirmed,excluded.binding_confirmed)""",
+                       (ident, snapshot["name"], pid, encode(snapshot), context_hash, now(), int(confirmed)))
             db.execute("UPDATE outbox SET status='expired',updated_at=? WHERE conversation_id=? AND context_hash<>? AND status='draft'", (now(), ident, context_hash))
+            if track_reply and old and old['binding_confirmed']:
+                target = candidate_question(snapshot)
+                if target and fingerprint(target) != fingerprint(candidate_question(json.loads(old['snapshot']))):
+                    # Persist the work in the same transaction as the messages:
+                    # a manual sync cannot consume the worker's change signal.
+                    pending = {'status': 'waiting', 'context_hash': context_hash}
+                    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('reply_work:' + ident, encode(pending)))
+                    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('reply_progress:' + ident, encode(
+                        {'stage': 'queued', 'message': '已发现新消息，等待轮询处理', 'active': False, 'updated_at': now()})))
             # 首个导入的会话自动设为当前（保持向后兼容）；后续导入不改变当前，由 select_conversation 显式切换
             if not db.execute("SELECT 1 FROM settings WHERE key='pilot_conversation'").fetchone():
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('pilot_conversation',?)", (encode(ident),))

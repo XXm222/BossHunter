@@ -14,6 +14,39 @@ from test_recruiting import FakeBrowser, FakeLocalSession, http_msg
 
 
 class ReviewTests(unittest.TestCase):
+    def test_manual_sync_preserves_new_message_work_for_worker_after_restart(self):
+        self.service.browser.snapshot['messages'].append({'direction': 'in', 'kind': 'text', 'text': '合成新问题', 'time': '11:00'})
+        self.service.sync(self.c['id'], process=False)
+        self.assertEqual(self.service.store.setting('reply_work:' + self.c['id'])['status'], 'waiting')
+        restarted = RecruitingService(self.service.store.path, lambda: self.config, self.service.browser)
+        draft = restarted.store.draft(self.c['id'], 'reply', '合成答复', {})
+        with patch.object(restarted, 'prepare_reply', return_value=draft) as prepare, patch.object(restarted, '_auto_send_if_allowed', return_value=False):
+            result = restarted.monitor_once()
+        self.assertFalse(result['changed'])
+        prepare.assert_called_once_with(self.c['id'])
+        self.assertEqual(restarted.store.setting('reply_work:' + self.c['id'])['status'], 'drafted')
+
+    def test_unchanged_sync_or_unconfirmed_contact_does_not_queue_history(self):
+        self.service.sync(self.c['id'], process=False)
+        self.assertIsNone(self.service.store.setting('reply_work:' + self.c['id']))
+        source = {**deepcopy(self.service.browser.snapshot), 'id': 'unconfirmed'}
+        self.service.store.import_conversation(source)
+        source['messages'].append({'direction': 'in', 'kind': 'text', 'text': '合成新增', 'time': '11:01'})
+        self.service.store.import_conversation(source, track_reply=True)
+        self.assertIsNone(self.service.store.setting('reply_work:unconfirmed'))
+
+    def test_daily_budget_override_expires_without_clearing_usage(self):
+        from datetime import datetime, timezone, timedelta
+        from zoneinfo import ZoneInfo
+        stamp = datetime.now(ZoneInfo('Asia/Shanghai'))
+        self.service.store.count_request('conversation', 100)
+        self.service.store.set_setting('request_daily_override', {'date': stamp.date().isoformat(), 'limit': 120})
+        self.assertEqual(self.service.store.request_daily_limit(100), 120)
+        with patch('bosshunter.recruiting.store.datetime') as clock:
+            clock.now.return_value = stamp + timedelta(days=1)
+            self.assertEqual(self.service.store.request_daily_limit(100), 100)
+        self.assertEqual(self.service.store.request_budget()['count'], 1)
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.config = {'ai': {'model': 'synthetic-model', 'api_key': 'synthetic-key'}}
@@ -74,7 +107,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(connections.call_count, baseline)
         key.assert_called_once()
         self.assertEqual(len(data['conversations']), 951)
-        self.assertEqual(data['monitor']['allowed_count'], 951)
+        self.assertEqual(data['monitor']['allowed_count'], 1)
         self.assertNotIn('settings', data)
         self.assertNotIn('synthetic-key', json.dumps(data))
 

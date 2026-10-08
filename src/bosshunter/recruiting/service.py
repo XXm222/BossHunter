@@ -5,12 +5,12 @@ from zoneinfo import ZoneInfo
 import json
 import random
 import time
-from threading import Event, RLock, Thread
+from threading import Event, RLock, Thread, local
 from uuid import uuid4
 
 from . import agent
-from .browser import AccountPauseError, BossBrowser, BrowserError, TaskCancelled
-from .store import Store, TaskBusy, RequestThrottled, RequestPaused, encode, fingerprint, merge_messages, now
+from .browser import AccountPauseError, BossBrowser, BrowserError, TaskCancelled, ConversationNotSelected
+from .store import Store, TaskBusy, RequestThrottled, RequestPaused, encode, fingerprint, merge_messages, now, candidate_question
 from .policy import check_reply
 from .jobs import RecruitingJobs
 from .local_session import LocalBossSession
@@ -21,16 +21,6 @@ from bosshunter.ai.credentials import get_ai_base_url, get_ai_service
 # 平台额度缓存有效期（秒）：超过视为过期，主动打招呼循环里重新读取，以覆盖
 # 「人工直接在 BOSS 打招呼」导致平台剩余变化、本地缓存失真的情况。
 QUOTA_TTL_SECONDS = 300
-
-
-def candidate_question(snapshot):
-    """Latest candidate text still awaiting a text reply; system/card records stay in context."""
-    for message in reversed(snapshot.get('messages', [])):
-        if message['direction'] == 'out' and message['kind'] == 'text':
-            return None
-        if message['direction'] == 'in' and message['kind'] == 'text':
-            return message
-    return None
 
 
 class RecruitingService:
@@ -60,25 +50,51 @@ class RecruitingService:
                         "mode": "round_robin_read_assess_and_reply", "note": "轮询已授权绑定会话；自动外发遵循每会话开关，非全账号实时监听"}
         self.connection = {"connected": False, "message": "尚未核实本地 BOSS 登录状态", "transport": "local_cookie_http"}
         self.store.recover_outbox()
+        self._reply_progress_local = local()
 
     def _recruiting_cfg(self):
         config = self.config_provider() or {}
         return config.get("recruiting") or {}
 
+    def _reply_stage(self, stage, message):
+        progress = getattr(self, '_reply_progress_local', None)
+        if not progress or not getattr(progress, 'cid', None):
+            return
+        progress.stage, progress.message = stage, message
+        progress.wait_until = None
+        self.store.set_setting('reply_progress:' + progress.cid,
+                               {'stage': stage, 'message': message, 'active': True, 'updated_at': now()})
+
     def _count_request(self, kind, *, pace=True):
         """LocalBossSession 每次后台请求前的计数回调：按账号存 DB，超限抛 BrowserError。"""
         cfg = self._recruiting_cfg()
         interval = random.uniform(cfg.get('read_delay_min', 120.0), cfg.get('read_delay_max', 180.0))
+        if kind == 'greeting':
+            interval = random.uniform(cfg.get('greet_delay_min', 60.0), cfg.get('greet_delay_max', 120.0))
+        if kind == 'recommend_load':
+            pace = False  # Browser loading uses the shared short loading interval.
         page_interval = random.uniform(cfg.get('read_page_delay', 15.0), cfg.get('read_page_delay_max', 30.0))
+        daily_limit = self.store.request_daily_limit(cfg.get('read_daily_limit', 100))
         while True:
             self._check_stopped()
             if kind in {'greeting', 'recommend_load'} and self.discovery_stop.is_set():
                 raise TaskCancelled('主动招呼已停止')
             try:
-                self.store.count_request(kind, cfg.get('read_daily_limit', 100), min_interval=interval,
+                self.store.count_request(kind, daily_limit, min_interval=interval,
                                          pace=pace, page_interval=page_interval)
+                progress = getattr(self, '_reply_progress_local', None)
+                if progress and getattr(progress, 'cid', None) and progress.wait_until is not None:
+                    self._reply_stage(progress.stage, progress.message)
                 return
             except RequestThrottled as exc:
+                progress = getattr(self, '_reply_progress_local', None)
+                if progress and getattr(progress, 'cid', None):
+                    deadline = time.time() + exc.seconds
+                    if progress.wait_until is None or abs(progress.wait_until - deadline) > .5:
+                        progress.wait_until = deadline
+                        self.store.set_setting('reply_progress:' + progress.cid,
+                                               {'stage': 'waiting_throttle', 'message': '等待节流；下一步：' + progress.message,
+                                                'wait_until': deadline, 'active': True, 'updated_at': now()})
                 # No DB transaction is held during the wait. Recheck and compete
                 # for the slot after waking; Web and worker share this deadline.
                 self.local_session._wait_cancelled(min(exc.seconds, 1.0))
@@ -149,7 +165,7 @@ class RecruitingService:
         # 读 DB 里的 monitor_state：worker 独立进程写入的最新成功时间/错误，本进程内存不会自动刷新
         saved_monitor = s.setting('monitor_state', {})
         selected = {j['id'] for j in jobs_state['jobs'] if j['selected'] and j['platform_id'] and j['status'] == '开放中'}
-        allowed_count = sum(not c['taken_over'] and not c['do_not_contact']
+        allowed_count = sum(c['binding_confirmed'] and not c['do_not_contact']
                             and by_position[c['position_id']]['enabled'] and c['position_id'] in selected for c in conversations)
         monitor_state = {
             "running": worker_alive and monitor_enabled,
@@ -165,14 +181,17 @@ class RecruitingService:
             'processing_conversation_id': saved_monitor.get('processing_conversation_id') if worker_alive else None,
         }
         budget = s.request_budget()
-        read_daily_limit = self._recruiting_cfg().get("read_daily_limit", 100)
+        read_daily_limit = s.request_daily_limit(self._recruiting_cfg().get("read_daily_limit", 100))
         request_budget = {"date": budget.get("date"), "count": budget.get("count", 0),
                           "daily_limit": read_daily_limit,
                           "remaining": max(0, read_daily_limit - budget.get("count", 0)),
                           "by_kind": budget.get("by_kind", {}),
                           'paused_until': s.setting('request_paused_until', 0)}
         return {"positions": positions, "conversations": conversations,
-                "documents": docs, "resume_processing": {c["id"]: settings.get("resume_processing:" + c["id"], {}) for c in conversations}, "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
+                "documents": docs, "resume_processing": {c["id"]: settings.get("resume_processing:" + c["id"], {}) for c in conversations},
+                'reply_progress': {c['id']: settings.get('reply_progress:' + c['id'], {}) for c in conversations},
+                'reply_work': {c['id']: settings.get('reply_work:' + c['id'], {}) for c in conversations},
+                "company": self.company(), "recruiting_jobs": jobs_state, "assessments": assessments,
                 "current_assessment_ids": current_assessment_ids,
                 "outbox": drafts, "events": saved['events'],
                 "connection": self.connection, "monitor": monitor_state,
@@ -223,16 +242,27 @@ class RecruitingService:
                     raise ValueError("尚未绑定候选人；本地模式不会操作 Chrome 标签页或自动选择候选人")
                 return self.sync()
             self.connect()
-            result = self.store.import_conversation(self.browser.read_current())
+            result = self.store.import_conversation(self.browser.read_current(), confirmed=True)
             self.store.event("conversation_synced", result["id"], "读取当前一个会话；未发送消息")
             return result
 
     def list_contacts(self):
-        """读取聊天页左侧联系人列表（含岗位名），供绑定向导从列表选人。"""
-        contacts = self.browser.read_contact_list()
-        return [{"ident": c.get("ident"), "name": c.get("name"),
-                 "position_title": c.get("position_title", ""), "last_ts": None}
-                for c in contacts]
+        """返回已同步进数据库的候选会话，供绑定向导从列表选人。
+
+        联系人已由 sync_all_contacts 登记进 conversations，这里直接复用数据库里的
+        结果，而不是再从浏览器 DOM 滚动读取（DOM 是虚拟滚动、只渲染当前可视区，
+        读不全且慢）。
+        """
+        contacts = []
+        for c in self.store.rows("conversations"):
+            snapshot = json.loads(c["snapshot"])
+            contacts.append({
+                "ident": c["id"],
+                "name": c["name"],
+                "position_title": snapshot.get("position_title", "") or "待关联岗位",
+                "last_ts": None,
+            })
+        return contacts
 
     def sync_all_contacts(self):
         """批量导入联系人列表里的所有会话（姓名+岗位，不读消息、不调接口）。
@@ -338,6 +368,7 @@ class RecruitingService:
         from .recommend import RecommendVerifier
         if isinstance(self.verifier, RecommendVerifier):
             self._count_request('greeting')
+            self._refresh_quota_if_needed()
             self._check_greeting_allowed(job_id)
         self.jobs.reserve_greeting("boss-" + job_id, uid, name)
         try:
@@ -397,7 +428,7 @@ class RecruitingService:
         cfg = self._recruiting_cfg()
         per_job_min = per_job_min if per_job_min is not None else cfg.get("greet_per_job_min", 1)
         per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 1)
-        throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 120.0), cfg.get("greet_delay_max", 180.0))
+        throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 60.0), cfg.get("greet_delay_max", 120.0))
         if not isinstance(per_job_min, int) or not isinstance(per_job_max, int) or not 1 <= per_job_min <= per_job_max:
             raise ValueError("每岗位招呼数需为整数且满足 1 ≤ 下限 ≤ 上限")
         config = self.jobs.config()
@@ -467,8 +498,10 @@ class RecruitingService:
                 if result.get('sent'):
                     greeted += 1
                     done += 1
+                if not isinstance(self.verifier, RecommendVerifier):
+                    throttle.wait(self.discovery_stop)
+            if not isinstance(self.verifier, RecommendVerifier):
                 throttle.wait(self.discovery_stop)
-            throttle.wait(self.discovery_stop)
         stopped = self.discovery_stop.is_set()
         return {'greeted': greeted, 'stopped': stopped,
                 'reason': '主动打招呼已手动停止' if stopped else f'本轮主动招呼 {greeted} 次'}
@@ -576,7 +609,7 @@ class RecruitingService:
             str(conversation_id).strip(), str(name).strip(), str(position_title).strip(),
             expected_account=str(expected_account).strip())
         self._enrich_position_platform_id(snapshot)
-        result = self.store.import_conversation(snapshot)
+        result = self.store.import_conversation(snapshot, confirmed=True)
         self.store.select_conversation(result["id"])  # 新绑定的会话设为当前选中
         self.store.event("conversation_bound", result["id"], "已核实并绑定会话；未发送消息")
         return result
@@ -634,14 +667,14 @@ class RecruitingService:
                     return current
                 snapshot['position_platform_id'] = snapshot.get('position_platform_id') or previous.get('position_platform_id')
                 snapshot['received_resume_message_id'] = snapshot.get('received_resume_message_id') or previous.get('received_resume_message_id')
-                result = self.store.import_conversation(snapshot, append=True)
+                result = self.store.import_conversation(snapshot, append=True, track_reply=True)
                 self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                    "message": "已连接 BOSS：本地登录会话，只读同步绑定候选人的消息",
                                    "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),
                                    "read_bound_conversation": True}
                 self.store.event("conversation_synced", ident, f"后台同步绑定会话 {len(snapshot['messages'])} 条平台消息；未操作标签页或发送消息")
             else:
-                result = self.store.import_conversation(self.browser.open_conversation(ident))
+                result = self.store.import_conversation(self.browser.open_conversation(ident), track_reply=True)
             if process:
                 self.process_received_resume(result)
             self.monitor["last_success"] = now()
@@ -781,8 +814,8 @@ class RecruitingService:
         self._check_stopped()
         cid = conversation["id"]
         position = self.store.row("positions", conversation["position_id"])
-        if conversation["taken_over"] or conversation["do_not_contact"] or not position["enabled"]:
-            reason = "已停止联系" if conversation["do_not_contact"] else "人工接管中" if conversation["taken_over"] else "岗位已暂停"
+        if conversation["do_not_contact"] or not position["enabled"]:
+            reason = "已停止联系" if conversation["do_not_contact"] else "岗位已暂停"
             self.resume_status(cid, "paused", reason + "，简历自动处理已暂停")
             return
         try:
@@ -883,6 +916,7 @@ class RecruitingService:
         # Serialize automatic/manual attempts so concurrent requests cannot double-charge.
         with self.lock:
             self._check_stopped()
+            self._model_takeover_guard(cid)
             p, doc, config, digest = self.assessment_input(cid)
             details = {"input_hash": digest, "document_id": doc["id"]}
             with self.store.task('assessment:' + digest):
@@ -895,8 +929,10 @@ class RecruitingService:
                     self._check_stopped()
                     if auto:
                         self._auto_assessment_guard(cid)
+                    self._model_takeover_guard(cid)
                     result = agent.assess(p, doc, config)
                     self._check_stopped()
+                    self._model_takeover_guard(cid)
                     if auto:
                         self._auto_assessment_guard(cid)
                         if self.assessment_input(cid)[3] != digest:
@@ -968,6 +1004,7 @@ class RecruitingService:
             refs["source"] = "human_draft"
         else:
             with self.lock, self.store.task('reply:' + cid):
+                self._reply_stage('sync_before_generation', '生成前同步会话')
                 self.sync(cid)
                 context = self.reply_context(cid)
                 current = self.store.row('conversations', cid)
@@ -988,9 +1025,13 @@ class RecruitingService:
                     if saved.get('source') == 'ai_draft' and saved.get('context_signature') == signature:
                         return draft
                 self._check_stopped()
+                self._reply_stage('generating', '模型正在生成回复')
+                self._model_takeover_guard(cid)
                 result = agent.reply(context, config)
                 self._check_stopped()
+                self._model_takeover_guard(cid)
                 # Human messages can change the live browser even while our queue is locked.
+                self._reply_stage('sync_after_generation', '回复已生成，重新核对消息和资料')
                 self.sync(cid)
                 fresh = self.reply_context(cid)
                 if self.reply_context_signature(fresh) != signature:
@@ -1004,6 +1045,7 @@ class RecruitingService:
                     "context_coverage": context["conversation"]["coverage"],
                     "basis": result["basis"], "missing": result.get("missing", [])})
                 check_reply(text)
+                self._model_takeover_guard(cid)
                 return self.store.draft(cid, 'reply', text.strip(), refs)
         check_reply(text)
         return self.store.draft(cid, "reply", text.strip(), refs)
@@ -1022,6 +1064,10 @@ class RecruitingService:
                 identity = {'digest': digest, 'revision': uuid4().hex}
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('reply_model_identity',?)", (encode(identity),))
             return identity['revision']
+
+    def _model_takeover_guard(self, cid):
+        if self.store.row('conversations', cid)['taken_over']:
+            raise TaskCancelled('人工接管中，停止模型评分和回复生成')
 
     def reply_context_signature(self, context, model_revision=None):
         revision = self._reply_model_revision() if model_revision is None else model_revision
@@ -1082,10 +1128,12 @@ class RecruitingService:
             if refs.get("source") == "ai_draft" and refs.get("context_signature") != self.reply_context_signature(self.reply_context(c["id"])):
                 raise ValueError("回复依据已变化，请使用最新公司说明、JD、简历和会话重新生成")
             self._check_stopped()
+            self._reply_stage('checking_browser', '检查 BOSS 当前对话和编辑器')
             before = self.browser.open_conversation(c["id"])
             if not before["editor_empty"]:
                 raise ValueError("编辑器中有人工输入，已停止自动操作")
             if self.use_local_session:
+                self._reply_stage('preflight', '发送前重新核对最新消息')
                 # 本地模式：草稿来自 HTTP 快照，而浏览器 DOM 读到的消息结构不同（无 id/timestamp），
                 # 直接比对 context_hash 会误判。这里改用与草稿同源（HTTP）重读判断是否有新消息，
                 # 浏览器快照只用于发送前的编辑框/会话守卫，不写入数据库覆盖 HTTP 快照。
@@ -1103,12 +1151,14 @@ class RecruitingService:
             if updated["context_hash"] != draft["context_hash"]:
                 raise ValueError("会话有新消息，已停止发送")
             if isinstance(self.browser, BossBrowser):
+                self._reply_stage('verifying_account', '核实发送账号')
                 self._count_request('identity')
                 self.browser.verify_account(c['id'], json.loads(c['snapshot']).get('account_uid'), on_refusal=self._pause_platform_requests)
             self._send_guard(ident, auto)
             self.store.claim(ident, auto=auto, daily_limit=self._recruiting_cfg().get('auto_reply_daily_limit', 5))
             try:
                 self._send_guard(ident, auto, claimed=True)
+                self._reply_stage('sending', '正在提交发送，请勿重复发送')
                 if isinstance(self.browser, BossBrowser):
                     self.browser.execute(draft['kind'], before, draft['content'], preflight=lambda: self._send_guard(ident, auto, claimed=True))
                 else:
@@ -1125,6 +1175,7 @@ class RecruitingService:
                 status = "sent" if confirmed else "uncertain"
                 message = "页面出现一条对应的本人消息；不代表对方已读" if confirmed else "已尝试操作，需核对平台结果；不会自动重试"
                 self.store.finish(ident, status, message)
+                self._reply_stage(status, '已确认发送成功' if status == 'sent' else '发送结果待核实，请先检查 BOSS')
                 if not self.use_local_session:
                     self.store.import_conversation(after)
             except TaskCancelled:
@@ -1146,6 +1197,8 @@ class RecruitingService:
             raise TaskCancelled('动作已取消、状态已变化或发送任务不属于当前进程，停止发送')
         c = self.store.row('conversations', draft['conversation_id'])
         p = self.store.row('positions', c['position_id'])
+        if auto and not c['binding_confirmed']:
+            raise TaskCancelled('会话尚未确认绑定，停止自动发送')
         if c['do_not_contact'] or (auto and (c['taken_over'] or not p['enabled'])):
             raise TaskCancelled('已人工接管、停止联系或岗位暂停')
         if auto:
@@ -1292,7 +1345,7 @@ class RecruitingService:
     def _auto_send_enabled(self, cid):
         """该会话的自动外发开关开启时才允许自动外发。"""
         c = self.store.row("conversations", cid)
-        return bool(c.get("auto_send"))
+        return bool(c.get('binding_confirmed') and c.get("auto_send"))
 
     def _auto_reply_sent_today(self):
         """今日已自动外发的回复数（只计自动，不计人工手动发送）。"""
@@ -1320,14 +1373,18 @@ class RecruitingService:
             return False
         with self.store.db() as db:
             if db.execute("SELECT 1 FROM outbox WHERE status IN ('sending','uncertain') LIMIT 1").fetchone() or db.execute("SELECT 1 FROM greeting_attempts WHERE status IN ('sending','uncertain') LIMIT 1").fetchone():
+                self._reply_stage('blocked', '存在发送结果待核实，请先人工核实')
                 return False
         refs = json.loads(draft["refs"])
         if refs.get("needs_human"):
+            self._reply_stage('needs_attention', '草稿需要人工处理，不自动发送')
             return False
         cid = draft["conversation_id"]
         if not self._auto_send_enabled(cid):
+            self._reply_stage('drafted', '回复草稿已保存，自动外发未开启')
             return False
         if self._reply_quota_exhausted():
+            self._reply_stage('blocked', '今日自动回复已达上限')
             self.store.event("auto_send_skipped", cid, "今日自动回复已达上限")
             return False
         try:
@@ -1339,15 +1396,20 @@ class RecruitingService:
             return False
         except (AccountPauseError, TaskCancelled):
             raise
+        except ConversationNotSelected as exc:
+            self._reply_stage('waiting_browser', '请在 BOSS 手动打开该候选人的对话；草稿已保留，后续轮询重试')
+            self.store.event('auto_send_skipped', cid, str(exc))
+            return False
         except (ValueError, BrowserError) as exc:
+            self._reply_stage('blocked', str(exc)[:250])
             self.store.event("auto_send_skipped", cid, str(exc))
             return False
 
     def _allowed_conversations(self):
-        """返回允许自动处理的会话 id（非接管、非停止联系、岗位启用）。"""
+        """返回允许同步的会话；人工接管只暂停模型与自动外发。"""
         allowed = []
         for c in self.store.rows("conversations"):
-            if c["taken_over"] or c["do_not_contact"]:
+            if not c['binding_confirmed'] or c["do_not_contact"]:
                 continue
             p = self.store.row("positions", c["position_id"])
             if not p["enabled"]:
@@ -1374,7 +1436,7 @@ class RecruitingService:
         """轮询式监测：每轮只处理一个允许的会话（round-robin），而非每轮读全部。
 
         候选人越多越不能每轮把所有历史各拉一遍；用 monitor_cursor 记录上次处理到
-        谁，下一轮处理下一个。人工接管/停止联系/岗位暂停的会话自动跳过。
+        谁，下一轮处理下一个。人工接管继续同步；停止联系/岗位暂停的会话跳过。
         """
         allowed = self._allowed_conversations()
         if not allowed:
@@ -1386,6 +1448,8 @@ class RecruitingService:
         self.store.set_setting("monitor_cursor", cid)
         self.monitor['processing_conversation_id'] = cid
         self._persist_monitor_state()
+        self._reply_progress_local.cid = cid
+        self._reply_stage('syncing', '同步会话，检查新消息与简历')
         try:
             before = self.store.row("conversations", cid)
             after = self.sync(cid, process=True)
@@ -1409,7 +1473,10 @@ class RecruitingService:
                     self.store.set_setting('reply_work:' + cid, {})
                 elif original['status'] in {'sending', 'uncertain'}:
                     pending_blocked = True
-            if incoming and pending and pending.get('status') != 'needs_attention' and not pending_blocked and agent.get_ai_api_key(self.config_provider()):
+            current = self.store.row('conversations', cid)
+            if current['taken_over']:
+                self._reply_stage('taken_over', '人工接管中：继续同步消息和读取简历，模型评分、回复生成与自动外发暂停')
+            elif incoming and pending and pending.get('status') != 'needs_attention' and not pending_blocked and agent.get_ai_api_key(self.config_provider()):
                 self._check_stopped()
                 try:
                     drafts = self.store.rows('outbox', "WHERE conversation_id=? AND kind='reply' AND status='draft' AND context_hash=? ORDER BY created_at DESC", (cid, after['context_hash']))
@@ -1421,13 +1488,32 @@ class RecruitingService:
                     if self._auto_send_if_allowed(draft):
                         self.store.set_setting('reply_work:' + cid, {})
                 except (PermissionError, agent.ModelOutputError) as exc:
+                    self._reply_stage('needs_attention', str(exc)[:250])
                     self.store.set_setting('reply_work:' + cid, {'status': 'needs_attention',
                                                                'context_hash': after['context_hash'], 'reason': str(exc)})
                     self.store.event('reply_needs_attention', cid, str(exc))
                 except ValueError as exc:
+                    self._reply_stage('blocked', str(exc)[:250])
                     self.store.event('reply_needs_attention', cid, str(exc))
+            elif pending.get('status') == 'needs_attention':
+                self._reply_stage('needs_attention', pending.get('reason', '回复需要人工处理'))
+            elif incoming and pending and not agent.get_ai_api_key(self.config_provider()):
+                self._reply_stage('waiting_model', '新消息等待配置模型')
+            else:
+                self._reply_stage('idle', '本轮检查完成，等待下一次轮询')
             return {"changed": before["context_hash"] != after["context_hash"],
                     "conversation_id": cid, "last_success": self.monitor["last_success"]}
+        except (TaskCancelled, AccountPauseError) as exc:
+            self._reply_stage('paused', str(exc)[:250])
+            raise
+        except Exception as exc:
+            self._reply_stage('failed', str(exc)[:250])
+            raise
         finally:
+            progress = self.store.setting('reply_progress:' + cid, {})
+            progress.update(active=False, updated_at=now(), next_check_at=time.time() + self.monitor['interval_seconds'])
+            progress.pop('wait_until', None)
+            self.store.set_setting('reply_progress:' + cid, progress)
+            self._reply_progress_local.cid = None
             self.monitor['processing_conversation_id'] = None
             self._persist_monitor_state()

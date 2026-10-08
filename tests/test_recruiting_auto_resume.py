@@ -101,9 +101,11 @@ class AutoResumeTests(TestCase):
         self.assertEqual(self.session.read_resume.call_count, 1)
         self.assertEqual(len(self.service.state()['documents']), 1)
 
-    def test_takeover_and_paused_job_do_not_run_automatic_processing(self):
+    def test_takeover_reads_without_scoring_and_paused_job_still_stops_reads(self):
         self.service.control(self.cid, True, False); self.service.sync()
-        self.session.read_resume.assert_not_called(); self.assess.assert_not_called()
+        self.session.read_resume.assert_called_once(); self.assess.assert_not_called()
+        self.session.read_resume.reset_mock()
+        self.snapshot['received_resume_message_id'] = '790'
         self.service.control(self.cid, False, False)
         self.service.store.save_position(self.pid, '测试岗位', '职责', 'human', False)
         self.service.sync(); self.session.read_resume.assert_not_called()

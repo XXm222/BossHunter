@@ -153,6 +153,27 @@ class JobSelectionTests(unittest.TestCase):
         # 跨日过期 → None（需重新读取），不被昨天的缓存阻塞
         self.assertIsNone(self.jobs._platform_remaining({'remaining': 0, 'unlimited': False, 'date': '2000-01-01', 'local_used_at_read': 0}, day_key(), 0))
 
+    def test_quota_display_distinguishes_unread_and_expired_without_using_old_value(self):
+        self.assertEqual(self.jobs.state()['daily']['quota_status'], 'unread')
+        self.store.set_setting('greeting_quota', {'remaining': 200, 'unlimited': False,
+            'date': '2000-01-01', 'updated_at': '2000-01-01T00:00:00+00:00', 'local_used_at_read': 0})
+        daily = self.jobs.state()['daily']
+        self.assertEqual(daily['quota_status'], 'expired')
+        self.assertEqual(daily['quota_last_remaining'], 200)
+        self.assertEqual(daily['quota_updated_at'], '2000-01-01T00:00:00+00:00')
+        self.assertIsNone(daily['platform_remaining'])
+
+    def test_quota_is_fresh_for_ten_minutes_only(self):
+        from bosshunter.recruiting.jobs import day_key
+        from datetime import datetime, timezone, timedelta
+        stamp = datetime.now(timezone.utc)
+        quota = {'date': day_key(), 'updated_at': stamp.isoformat()}
+        with patch('bosshunter.recruiting.jobs.datetime', wraps=datetime) as clock:
+            clock.now.return_value = stamp + timedelta(seconds=600)
+            self.assertTrue(self.jobs.quota_fresh(quota, quota['date']))
+            clock.now.return_value = stamp + timedelta(seconds=601)
+            self.assertFalse(self.jobs.quota_fresh(quota, quota['date']))
+
     def test_platform_quota_deducts_after_local_sends(self):
         from bosshunter.recruiting.jobs import day_key
         self.jobs.select(['boss-one'])

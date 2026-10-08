@@ -277,14 +277,17 @@ class RecruitingTests(unittest.TestCase):
         self.assertTrue(self.service.state()["monitor"]["running"])
         self.assertTrue(self.service.state()["worker"]["alive"])
 
-    def test_list_contacts_uses_browser(self):
-        self.browser.read_contact_list = lambda: [
-            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
-        ]
+    def test_list_contacts_reads_from_database(self):
+        # list_contacts 从已同步的 conversations 读，而不是从浏览器 DOM 读
+        self.service.store.import_conversation({
+            "id": "96429428-0", "name": "陈健", "position_title": "电子工程师",
+            "messages": [],
+        })
         result = self.service.list_contacts()
-        self.assertEqual(result, [
-            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师", "last_ts": None},
-        ])
+        by_ident = {c["ident"]: c for c in result}
+        self.assertEqual(by_ident["96429428-0"]["name"], "陈健")
+        self.assertEqual(by_ident["96429428-0"]["position_title"], "电子工程师")
+        self.assertEqual(by_ident["96429428-0"]["last_ts"], None)
 
     def test_sync_all_contacts_imports_and_skips_existing(self):
         self.browser.read_contact_list = lambda load_all=False: [
@@ -430,7 +433,7 @@ class RecruitingTests(unittest.TestCase):
         for ident in ["a-0", "b-0", "c-0"]:
             service.store.import_conversation({"id": ident, "name": "候选人", "position_title": "测试岗位", "position_platform_id": "test-job",
                 "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
-                "editor_empty": True, "coverage": "test", "stable_message_ids": False})
+                "editor_empty": True, "coverage": "test", "stable_message_ids": False}, confirmed=True)
         synced = []
 
         def fake_sync(cid=None, **kw):
@@ -447,7 +450,7 @@ class RecruitingTests(unittest.TestCase):
         service = RecruitingService(Path(self.temp.name) / "monitor2.db", lambda: {}, self.browser)
         service.store.import_conversation({"id": "a-0", "name": "甲", "position_title": "测试岗位",
             "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
-            "editor_empty": True, "coverage": "test", "stable_message_ids": False})
+            "editor_empty": True, "coverage": "test", "stable_message_ids": False}, confirmed=True)
         with service.store.db() as db:
             db.execute("UPDATE conversations SET taken_over=1 WHERE id='a-0'")
         synced = []
@@ -463,7 +466,7 @@ class RecruitingTests(unittest.TestCase):
         authorize(service)
         service.store.import_conversation({"id": "a-0", "name": "甲", "position_title": "测试岗位", "position_platform_id": "test-job",
             "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
-            "editor_empty": True, "coverage": "test", "stable_message_ids": False})
+            "editor_empty": True, "coverage": "test", "stable_message_ids": False}, confirmed=True)
         service.set_monitor_enabled(False)
         # worker 流程（设置了 stop_event）：关闭监测后应中断
         service._stop_event = threading.Event()

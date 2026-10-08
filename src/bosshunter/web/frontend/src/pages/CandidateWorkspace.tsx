@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom'
 import { ChevronRight, MessageSquare, RefreshCw, Search, Settings2, Sparkles } from 'lucide-react'
 import { RecruitIcon } from '../components/recruiting/RecruitIcon'
 import { PositionBinding } from '../components/recruiting/PositionBinding'
+import { ReplyProgress } from './ReplyProgress'
 import { Drafts, InvitationForm, Monitor, ResumePanel, currentAssessment, candidateQuestion, selectedConversations } from './CandidatePanels'
 import type { Act, State } from './RecruitingPage'
 import './candidate-workspace.css'
@@ -60,6 +61,7 @@ function ConversationPanels({ data, c, act, busy, onEditReply }: { data: State; 
   const blocked = !!c.do_not_contact || pending(data, c)
   return <>
     <section className="cw-chat" aria-label="当前候选人对话"><header className="cw-chat-header"><div><h3>{c.name}</h3><p>{job?.title || '岗位待关联'}</p><span className={`rd-badge ${pending(data, c) ? 'amber' : ''}`}>{label(data, c)}</span></div><div><button className="rd-text-button" disabled={busy} onClick={() => act('sync', { conversation_id: c.id }, '最新对话已同步')}><RefreshCw size={13} />同步会话</button><button className="rd-button" disabled={busy && !!c.taken_over} onClick={() => act('conversation/control', { conversation_id: c.id, taken_over: !c.taken_over, do_not_contact: !!c.do_not_contact }, '会话处理方式已更新')}>{c.taken_over ? '交回 Agent' : '人工接管'}</button></div></header>
+      <ReplyProgress data={data} conversation={c} />
       <div className="cw-messages" ref={messagePane} onScroll={e => { const pane = e.currentTarget; followLatest.current = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60 }} aria-label="双方沟通记录"><p className="cw-history-note">{c.snapshot.messages.length} 条已加载消息 · 更早历史可能未加载</p>{c.snapshot.messages.map((message, i) => <div key={i} className={`cw-message ${message.direction === 'out' ? 'ours' : ''}`}><span className="cw-message-avatar">{message.direction === 'out' ? '我' : message.direction === 'in' ? c.name.slice(0, 1) : '·'}</span><div><small>{message.direction === 'in' ? c.name : message.direction === 'out' ? '招聘方' : '系统'} {message.time}</small><p>{message.text}</p></div></div>)}{!c.snapshot.messages.length && <div className="rd-empty">暂无已加载的消息</div>}</div>
       <div className="cw-composer"><label htmlFor="reply-text">回复内容</label><textarea ref={composer} id="reply-text" rows={4} maxLength={500} value={text} onChange={e => setText(e.target.value)} placeholder="输入回复，或采用右侧的回复建议…" /><div className="cw-compose-actions"><small>{text.length}/500 字</small><button className="rd-button" disabled={busy || !text.trim() || blocked} onClick={() => act('reply/draft', { conversation_id: c.id, text }, '回复已保存，尚未发送')}>保存这段回复</button></div><p>{blocked ? '存在待核实结果或已停止联系，先核对后继续。' : '保存为草稿，核对后再发送。'}</p></div>
     </section>
