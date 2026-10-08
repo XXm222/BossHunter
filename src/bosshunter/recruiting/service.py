@@ -426,8 +426,8 @@ class RecruitingService:
     def run_discovery(self, per_job_min=None, per_job_max=None, throttle_delay=None):
         """循环勾选的开放岗位，每岗位招呼若干个候选人（同步执行，节流防封号）。"""
         cfg = self._recruiting_cfg()
-        per_job_min = per_job_min if per_job_min is not None else cfg.get("greet_per_job_min", 1)
-        per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 1)
+        per_job_min = per_job_min if per_job_min is not None else cfg.get("greet_per_job_min", 5)
+        per_job_max = per_job_max if per_job_max is not None else cfg.get("greet_per_job_max", 5)
         throttle_delay = throttle_delay if throttle_delay is not None else (cfg.get("greet_delay_min", 60.0), cfg.get("greet_delay_max", 120.0))
         if not isinstance(per_job_min, int) or not isinstance(per_job_max, int) or not 1 <= per_job_min <= per_job_max:
             raise ValueError("每岗位招呼数需为整数且满足 1 ≤ 下限 ≤ 上限")

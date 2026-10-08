@@ -217,8 +217,8 @@ DEFAULTS: dict[str, Any] = {
         "read_daily_limit": 100,
         "greet_delay_min": 60.0,
         "greet_delay_max": 120.0,
-        "greet_per_job_min": 1,
-        "greet_per_job_max": 1,
+        "greet_per_job_min": 5,
+        "greet_per_job_max": 5,
         "auto_reply_daily_limit": 5,
     },
 }

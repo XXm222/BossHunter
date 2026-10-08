@@ -170,8 +170,8 @@ recruiting:
   monitor_interval_seconds: 600  # 每 10 分钟处理一个候选人
   greet_delay_min: 60      # 主动打招呼间隔 60–120 秒
   greet_delay_max: 120
-  greet_per_job_min: 1      # 每岗位每轮招呼 1 个
-  greet_per_job_max: 1
+  greet_per_job_min: 5      # 每岗位每轮招呼 5 个
+  greet_per_job_max: 5
   auto_reply_daily_limit: 5   # 每日自动回复默认上限
 ```
 

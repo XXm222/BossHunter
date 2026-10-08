@@ -174,7 +174,7 @@ recruiting:
   # 主动打招呼循环节流
   greet_delay_min: 60      # 每个招呼动作间隔（秒）下限
   greet_delay_max: 120      # 上限
-  greet_per_job_min: 1      # 每岗位每轮最少招呼数
-  greet_per_job_max: 1      # 最多招呼数
+  greet_per_job_min: 5      # 每岗位每轮最少招呼数
+  greet_per_job_max: 5      # 最多招呼数
   # 自动回复
   auto_reply_daily_limit: 5   # 每日自动回复上限
