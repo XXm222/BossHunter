@@ -127,6 +127,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS task_claims (
                 key TEXT PRIMARY KEY, owner TEXT NOT NULL, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS read_flights (
+                token TEXT PRIMARY KEY, request_key TEXT NOT NULL, owner TEXT NOT NULL,
+                status TEXT NOT NULL, result TEXT, error TEXT, created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS read_flights_key ON read_flights(request_key,status);
             """)
             db.execute('BEGIN IMMEDIATE')
             cols = [r[1] for r in db.execute("PRAGMA table_info(conversations)").fetchall()]

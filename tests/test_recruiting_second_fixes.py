@@ -270,6 +270,9 @@ class SecondFixTests(unittest.TestCase):
             work = pool.submit(older.sync, self.cid, process=False)
             self.assertTrue(entered.wait(2))
             try:
+                # A newer cursor is a distinct read. Identical in-flight reads
+                # now intentionally share the first request's result.
+                self.service.store.import_conversation(older_reply, append=True)
                 newer.sync(self.cid, process=False)
             finally:
                 newer_written.set()

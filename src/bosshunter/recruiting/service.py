@@ -364,7 +364,8 @@ class RecruitingService:
         self._check_greeting_allowed(job_id)
         if self.verifier is None:
             from .recommend import RecommendVerifier
-            self.verifier = RecommendVerifier(self.config_provider, cookie_loader=self.local_session.cookie_loader)
+            self.verifier = RecommendVerifier(self.config_provider, cookie_loader=self.local_session.cookie_loader,
+                                              account_pause_handler=self._pause_platform_requests)
         from .recommend import RecommendVerifier
         if isinstance(self.verifier, RecommendVerifier):
             self._count_request('greeting')
@@ -446,7 +447,8 @@ class RecruitingService:
             raise ValueError('没有可处理的开放岗位')
         if self.verifier is None:
             from .recommend import RecommendVerifier
-            self.verifier = RecommendVerifier(self.config_provider, cookie_loader=self.local_session.cookie_loader)
+            self.verifier = RecommendVerifier(self.config_provider, cookie_loader=self.local_session.cookie_loader,
+                                              account_pause_handler=self._pause_platform_requests)
         throttle = PageThrottle(delay_min=throttle_delay[0], delay_max=throttle_delay[1])
         greeted = 0
         # 每轮先刷新推荐页拿新候选人；刷新会把岗位重置为默认第一个，下面逐岗重新 select_job
@@ -559,7 +561,7 @@ class RecruitingService:
         """
         if not all(str(x).strip() for x in (conversation_id, name, position_title)):
             raise ValueError("请填写会话标识、候选人姓名和沟通岗位")
-        snapshot = self.local_session.read_conversation(
+        snapshot = self._read_conversation(
             str(conversation_id).strip(), str(name).strip(), str(position_title).strip())
         return {"account_uid": snapshot["account_uid"], "name": snapshot["name"],
                 "position_title": snapshot["position_title"],
@@ -605,7 +607,7 @@ class RecruitingService:
         重新读取一次并带上预览时拿到的 account_uid 作 expected_account，
         read_conversation 会校验当前登录账号未变化，再导入并绑定。
         """
-        snapshot = self.local_session.read_conversation(
+        snapshot = self._read_conversation(
             str(conversation_id).strip(), str(name).strip(), str(position_title).strip(),
             expected_account=str(expected_account).strip())
         self._enrich_position_platform_id(snapshot)
@@ -631,37 +633,56 @@ class RecruitingService:
         """
         return merge_messages(previous, snapshot)
 
-    def sync(self, cid=None, *, process=True):
-        """同步一个会话的消息；process=True 时同时读简历/评分。
+    def _read_conversation(self, ident, name, title, *args, _fresh=False, **kwargs):
+        from .shared_read import shared_read
+        if _fresh:
+            self._check_stopped()
+            return self.local_session.read_conversation(ident, name, title, *args, **kwargs)
+        account = args[0] if args else kwargs.get('expected_account')
+        browser_config = (self.config_provider() or {}).get('browser', {})
+        key = fingerprint({'conversation': ident, 'name': name, 'title': title,
+                           'account': account, 'since_mid': kwargs.get('since_mid'),
+                           'include_attachments': kwargs.get('include_attachments', False),
+                           'profile': browser_config.get('recruiting_user_data_dir'),
+                           'target': browser_config.get('recruiting_target_id')})
+        return shared_read(self.store, key,
+                           lambda: self.local_session.read_conversation(ident, name, title, *args, **kwargs),
+                           self._check_stopped)
 
-        cid 缺省时同步当前选中会话；process=False 只更新消息快照（监测同步所有会话时用）。
-        """
+    def _remember_monitor_sync(self, row, read_at=None):
+        if getattr(self._reply_progress_local, 'cid', None) == row['id']:
+            self._reply_progress_local.fresh_sync = (row['id'], row['context_hash'],
+                                                     time.monotonic() if read_at is None else read_at)
+
+    def sync(self, cid=None, *, process=True, fresh=False):
+        """Sync a bound conversation; identical in-flight HTTP reads share one result."""
+        ident = cid or self.store.setting("pilot_conversation")
+        if not ident:
+            raise ValueError("请先绑定一个会话")
+        if self.use_local_session:
+            current = self.store.row("conversations", ident)
+            position = self.store.row("positions", current['position_id'])
+            previous = json.loads(current['snapshot'])
+            try:
+                snapshot = self._read_conversation(
+                    ident, current['name'], position['title'], previous.get('account_uid'),
+                    since_mid=self._last_message_id(previous), _fresh=fresh)
+                read_at = time.monotonic()
+            except BrowserError as exc:
+                self.monitor['error'] = str(exc)
+                self.connection = {"connected": False, "transport": "local_cookie_http", "checked_at": now(), "message": str(exc)}
+                raise
         with self.lock:
-            ident = cid or self.store.setting("pilot_conversation")
-            if not ident:
-                raise ValueError("请先绑定一个会话")
             if self.use_local_session:
-                current = self.store.row("conversations", ident)
-                position = self.store.row("positions", current['position_id'])
-                previous = json.loads(current['snapshot'])
-                try:
-                    snapshot = self.local_session.read_conversation(
-                        ident, current['name'], position['title'],
-                        previous.get('account_uid'),
-                        since_mid=self._last_message_id(previous))
-                except BrowserError as exc:
-                    self.monitor['error'] = str(exc)
-                    self.connection = {"connected": False, "transport": "local_cookie_http", "checked_at": now(), "message": str(exc)}
-                    raise
                 if snapshot is None:
                     current = self.store.row('conversations', ident)
-                    # 增量：没有新消息，保持原快照，不导入、不处理简历
                     self.connection = {"connected": True, "transport": "local_cookie_http", "checked_at": now(),
                                        "message": "已连接 BOSS：本地登录会话，无新消息",
                                        "read_jobs": bool(self.jobs.state()['sync'].get('synced_at')),
                                        "read_bound_conversation": True}
                     self.monitor["last_success"] = now()
                     self.monitor["error"] = ""
+                    self._remember_monitor_sync(current, read_at)
                     if process:
                         self.process_received_resume(current)
                     return current
@@ -675,6 +696,8 @@ class RecruitingService:
                 self.store.event("conversation_synced", ident, f"后台同步绑定会话 {len(snapshot['messages'])} 条平台消息；未操作标签页或发送消息")
             else:
                 result = self.store.import_conversation(self.browser.open_conversation(ident), track_reply=True)
+                read_at = time.monotonic()
+            self._remember_monitor_sync(result, read_at)
             if process:
                 self.process_received_resume(result)
             self.monitor["last_success"] = now()
@@ -1005,7 +1028,12 @@ class RecruitingService:
         else:
             with self.lock, self.store.task('reply:' + cid):
                 self._reply_stage('sync_before_generation', '生成前同步会话')
-                self.sync(cid)
+                fresh = getattr(self._reply_progress_local, 'fresh_sync', None)
+                current = self.store.row('conversations', cid)
+                if not (fresh and fresh[0] == cid and fresh[1] == current['context_hash']
+                        and 0 <= time.monotonic() - fresh[2] <= 30):
+                    self.sync(cid)
+                self._reply_progress_local.fresh_sync = None
                 context = self.reply_context(cid)
                 current = self.store.row('conversations', cid)
                 position = self.store.row('positions', current['position_id'])
@@ -1032,7 +1060,7 @@ class RecruitingService:
                 self._model_takeover_guard(cid)
                 # Human messages can change the live browser even while our queue is locked.
                 self._reply_stage('sync_after_generation', '回复已生成，重新核对消息和资料')
-                self.sync(cid)
+                self.sync(cid, fresh=True)
                 fresh = self.reply_context(cid)
                 if self.reply_context_signature(fresh) != signature:
                     raise ValueError("生成期间会话或资料发生变化，本次回复未保存，请基于新上下文重新生成")
@@ -1137,10 +1165,10 @@ class RecruitingService:
                 # 本地模式：草稿来自 HTTP 快照，而浏览器 DOM 读到的消息结构不同（无 id/timestamp），
                 # 直接比对 context_hash 会误判。这里改用与草稿同源（HTTP）重读判断是否有新消息，
                 # 浏览器快照只用于发送前的编辑框/会话守卫，不写入数据库覆盖 HTTP 快照。
-                source = self.local_session.read_conversation(
+                source = self._read_conversation(
                     c["id"], c["name"], p["title"],
                     json.loads(c["snapshot"]).get("account_uid"), throttle=False,
-                    since_mid=self._last_message_id(json.loads(c['snapshot'])))
+                    since_mid=self._last_message_id(json.loads(c['snapshot'])), _fresh=True)
                 if source is not None:
                     previous = json.loads(c['snapshot'])
                     source['position_platform_id'] = source.get('position_platform_id') or previous.get('position_platform_id')
@@ -1449,6 +1477,7 @@ class RecruitingService:
         self.monitor['processing_conversation_id'] = cid
         self._persist_monitor_state()
         self._reply_progress_local.cid = cid
+        self._reply_progress_local.fresh_sync = None
         self._reply_stage('syncing', '同步会话，检查新消息与简历')
         try:
             before = self.store.row("conversations", cid)
@@ -1515,5 +1544,6 @@ class RecruitingService:
             progress.pop('wait_until', None)
             self.store.set_setting('reply_progress:' + cid, progress)
             self._reply_progress_local.cid = None
+            self._reply_progress_local.fresh_sync = None
             self.monitor['processing_conversation_id'] = None
             self._persist_monitor_state()

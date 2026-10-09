@@ -6,7 +6,7 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 from io import BytesIO
 from hashlib import sha256
 import os
@@ -15,7 +15,7 @@ import sys
 import time
 import random
 import httpx
-from .browser import AccountPauseError, BrowserError, TaskCancelled, refusal_cooldown
+from .browser import AccountPauseError, BrowserError, TaskCancelled, refusal_cooldown, platform_security_url
 import html
 from bosshunter.throttle import PageThrottle
 
@@ -130,11 +130,18 @@ class LocalBossSession:
             raise BrowserError("已请求停止，中断当前操作")
 
     def _check_response(self, response):
-        if response.status_code in {403, 429}:
+        refused = response.status_code in {403, 429}
+        security = False
+        if not refused:
+            location = response.headers.get('location', '')
+            security = platform_security_url(response.url) or (response.is_redirect and location
+                       and platform_security_url(urljoin(str(response.url), location)))
+        if refused or security:
             seconds = refusal_cooldown(response.headers.get('Retry-After', ''))
             if self._account_pause_handler:
                 self._account_pause_handler(seconds)
-            raise AccountPauseError('BOSS 拒绝请求或触发限流，已停止本次操作，请在 Chrome 核实账号；不自动重试')
+            message = 'BOSS 要求账号验证或访问受限' if security else 'BOSS 拒绝请求或触发限流'
+            raise AccountPauseError(message + '，已停止本次操作，请在 Chrome 核实账号；不自动重试')
         response.raise_for_status()
 
     def read_conversation(self, ident, name, position_title, expected_account=None, *, include_attachments=False, throttle=True, since_mid=None):
@@ -164,8 +171,6 @@ class LocalBossSession:
                 try:
                     response = client.get('https://www.zhipin.com/wapi/zpchat/boss/historyMsg',
                                           params={'src': int(source), 'gid': gid, 'maxMsgId': cursor, 'c': 20, 'page': page})
-                    if response.is_redirect and urlparse(response.headers.get('location', '')).path == '/web/passport/zp/verify.html':
-                        raise AccountPauseError('BOSS 要求账号验证，请在现有 Chrome 招聘端页面完成验证后重新读取；已有记录已保留')
                     self._check_response(response)
                     body = response.json()
                 except (httpx.HTTPError, ValueError):

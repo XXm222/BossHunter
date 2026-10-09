@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from bosshunter.browser.client import RuntimeClient
 from bosshunter.browser.runtime import ensure_runtime
 from .policy import check_reply
@@ -30,6 +30,16 @@ class ConversationNotSelected(BrowserError):
 class AccountPauseError(BrowserError):
     """账号需要人工处理（验证码、登录失效、身份不一致），应暂停自动任务而非自动重试。"""
     pass
+
+
+def platform_security_url(url):
+    """Known BOSS verification/restriction destinations; not a ban-code decoder."""
+    parsed = urlsplit(str(url))
+    host = parsed.hostname or ''
+    if not (host == 'zhipin.com' or host.endswith('.zhipin.com')):
+        return False
+    return (parsed.path in {'/web/passport/zp/verify.html', '/web/passport/zp/403.html'}
+            or (parsed.path in {'', '/'} and '_security_check' in parse_qs(parsed.query, keep_blank_values=True)))
 
 
 def refusal_cooldown(retry_after):

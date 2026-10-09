@@ -10,11 +10,13 @@ recommend page; greeting clicks the authorized card and sends BOSS's default gre
 """
 import json
 import time
+from contextlib import contextmanager
+from urllib.parse import urlparse, urljoin
 
 import httpx
 from patchright.sync_api import sync_playwright
 
-from .browser import AccountPauseError, BrowserError
+from .browser import AccountPauseError, BrowserError, refusal_cooldown, platform_security_url
 
 RECOMMEND_URL_PREFIX = "https://www.zhipin.com/web/chat/recommend"
 RECOMMEND_FRAME_PATH = "/web/frame/recommend/"
@@ -103,12 +105,63 @@ READ_CANDIDATES = r"""
 
 
 class RecommendVerifier:
-    def __init__(self, config_provider, cdp_url=None, wait_timeout=15.0, cookie_loader=None):
+    def __init__(self, config_provider, cdp_url=None, wait_timeout=15.0, cookie_loader=None,
+                 account_pause_handler=None):
         self.config_provider = config_provider
         self._cdp_url = cdp_url
         self._wait_timeout = wait_timeout
         self._target_id = self._bound_target_id()
         self._cookie_loader = cookie_loader
+        self._account_pause_handler = account_pause_handler
+
+    @contextmanager
+    def _page_guard(self, page):
+        failure = []
+
+        def response_received(response):
+            parsed = urlparse(response.url)
+            host = parsed.hostname or ''
+            if not (host == 'zhipin.com' or host.endswith('.zhipin.com')):
+                return
+            security_page = platform_security_url(response.url)
+            if not (parsed.path.startswith('/wapi/') or RECOMMEND_FRAME_PATH in parsed.path
+                    or parsed.path == '/web/chat/recommend' or security_page):
+                return
+            headers = response.headers
+            location = headers.get('location', '')
+            verification = location and platform_security_url(urljoin(response.url, location))
+            if not (security_page or response.status in {403, 429}
+                    or (300 <= response.status < 400 and verification)):
+                return
+            if not failure:
+                failure.append('推荐页请求被拒绝、限流或要求验证；已暂停，请在 Chrome 核实账号')
+                if self._account_pause_handler:
+                    self._account_pause_handler(refusal_cooldown(headers.get('retry-after', '')))
+
+        def check():
+            if failure:
+                raise AccountPauseError(failure[0])
+            if any(platform_security_url(url)
+                   for url in [page.url, *(frame.url for frame in page.frames)]):
+                failure.append('推荐页已进入账号验证或限制页，已暂停，请人工核实')
+                if self._account_pause_handler:
+                    self._account_pause_handler(refusal_cooldown(''))
+                raise AccountPauseError(failure[0])
+
+        page.on('response', response_received)
+        try:
+            check()
+            yield check
+            check()
+        except AccountPauseError:
+            if not failure and self._account_pause_handler:
+                self._account_pause_handler(refusal_cooldown(''))
+            raise
+        except Exception:
+            check()
+            raise
+        finally:
+            page.remove_listener('response', response_received)
 
     def _chrome_ports(self):
         config = self.config_provider() or {}
@@ -164,6 +217,12 @@ class RecommendVerifier:
         pages = [p for c in contexts for p in c.pages if p.url and p.url.startswith(RECOMMEND_URL_PREFIX)]
         target_id = self._target_id
         if target_id:
+            for context in contexts:
+                for page in context.pages:
+                    if platform_security_url(page.url) and self._page_target_id(page) == target_id:
+                        if self._account_pause_handler:
+                            self._account_pause_handler(refusal_cooldown(''))
+                        raise AccountPauseError('绑定推荐页已进入安全检查或限制页，已暂停，请人工核实')
             for page in pages:
                 if self._page_target_id(page) == target_id:
                     return page
@@ -209,14 +268,16 @@ class RecommendVerifier:
             return value.strip()
         return None
 
-    def _wait_greet_text(self, frame, uid):
+    def _wait_greet_text(self, frame, uid, check=lambda: None):
         """等待按钮文案明确变为「继续沟通」，才视为发送成功。"""
         deadline = time.time() + self._wait_timeout
         while time.time() < deadline:
+            check()
             text = frame.evaluate(READ_GREET_TEXT.replace("__UID__", json.dumps(uid)))
             if isinstance(text, str) and "继续沟通" in text:
                 return text
-            time.sleep(0.5)
+            frame.page.wait_for_timeout(500)
+        check()
         return frame.evaluate(READ_GREET_TEXT.replace("__UID__", json.dumps(uid)))
 
     def greet(self, uid, expected_job_id=None, preflight=None):
@@ -232,31 +293,34 @@ class RecommendVerifier:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
             page = self._recommend_page(browser)
-            self._verify_session(page)
-            frame = self._recommend_frame(page)
-            if not frame:
-                raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
-            job_id = self._job_id_from_frame(frame)
-            if not job_id:
-                raise BrowserError("推荐页未选择岗位，无法记录招呼；请先在下拉框选择岗位")
-            if expected_job_id and str(job_id) != str(expected_job_id):
-                raise BrowserError("推荐页当前岗位与任务岗位不一致，已停止招呼")
-            if preflight:
-                preflight()
-            self._verify_session(page)
-            state = frame.evaluate(CLICK_GREET.replace("__UID__", json.dumps(uid)))
-            if state == "missing":
-                raise BrowserError("未找到该候选人的卡片，页面可能已刷新，请重新验证")
-            if state == "already":
-                if '继续沟通' not in str(frame.evaluate(READ_GREET_TEXT.replace('__UID__', json.dumps(uid)))):
-                    raise BrowserError('无法确认此前招呼结果，请人工核实')
-                return {"sent": True, "job_id": job_id, "reason": "该候选人已打过招呼（按钮已不是「打招呼」）"}
-            if state != 'clicked':
-                raise BrowserError('打招呼按钮不可用，未执行发送')
-            text = self._wait_greet_text(frame, uid)
-            sent = isinstance(text, str) and "继续沟通" in text
-            return {"sent": sent, "job_id": job_id,
-                    "reason": "已发出招呼，按钮变为「继续沟通」" if sent else "点击后未确认按钮变化，结果待核实"}
+            with self._page_guard(page) as check:
+                self._verify_session(page)
+                check()
+                frame = self._recommend_frame(page)
+                if not frame:
+                    raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
+                job_id = self._job_id_from_frame(frame)
+                if not job_id:
+                    raise BrowserError("推荐页未选择岗位，无法记录招呼；请先在下拉框选择岗位")
+                if expected_job_id and str(job_id) != str(expected_job_id):
+                    raise BrowserError("推荐页当前岗位与任务岗位不一致，已停止招呼")
+                if preflight:
+                    preflight()
+                self._verify_session(page)
+                check()
+                state = frame.evaluate(CLICK_GREET.replace("__UID__", json.dumps(uid)))
+                if state == "missing":
+                    raise BrowserError("未找到该候选人的卡片，页面可能已刷新，请重新验证")
+                if state == "already":
+                    if '继续沟通' not in str(frame.evaluate(READ_GREET_TEXT.replace('__UID__', json.dumps(uid)))):
+                        raise BrowserError('无法确认此前招呼结果，请人工核实')
+                    return {"sent": True, "job_id": job_id, "reason": "该候选人已打过招呼（按钮已不是「打招呼」）"}
+                if state != 'clicked':
+                    raise BrowserError('打招呼按钮不可用，未执行发送')
+                text = self._wait_greet_text(frame, uid, check)
+                sent = isinstance(text, str) and "继续沟通" in text
+                return {"sent": sent, "job_id": job_id,
+                        "reason": "已发出招呼，按钮变为「继续沟通」" if sent else "点击后未确认按钮变化，结果待核实"}
         finally:
             if pw is not None:
                 pw.stop()
@@ -269,15 +333,17 @@ class RecommendVerifier:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
             page = self._recommend_page(browser)
-            self._verify_session(page)
-            frame = self._recommend_frame(page)
-            if not frame:
-                raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
-            result = frame.evaluate(SELECT_JOB.replace("__JOB_ID__", json.dumps(job_id)))
-            if result != "selected":
-                raise BrowserError("未能在下拉框选中该岗位，请确认该岗位仍处于开放状态")
-            time.sleep(2)  # 切换岗位后等候选人列表刷新
-            return True
+            with self._page_guard(page) as check:
+                self._verify_session(page)
+                check()
+                frame = self._recommend_frame(page)
+                if not frame:
+                    raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
+                result = frame.evaluate(SELECT_JOB.replace("__JOB_ID__", json.dumps(job_id)))
+                if result != "selected":
+                    raise BrowserError("未能在下拉框选中该岗位，请确认该岗位仍处于开放状态")
+                page.wait_for_timeout(2000)  # 等待并处理页面响应事件
+                return True
         finally:
             if pw is not None:
                 pw.stop()
@@ -290,15 +356,17 @@ class RecommendVerifier:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
             page = self._recommend_page(browser)
-            self._verify_session(page)
-            frame = self._recommend_frame(page)
-            if not frame:
-                raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
-            value = frame.evaluate(READ_CANDIDATES)
-            if not isinstance(value, list):
-                return []
-            return [{"name": str(c.get("name") or "").strip(), "uid": str(c.get("uid") or "").strip(),
-                     "greetable": bool(c.get("greetable"))} for c in value if isinstance(c, dict) and c.get("uid")]
+            with self._page_guard(page) as check:
+                self._verify_session(page)
+                check()
+                frame = self._recommend_frame(page)
+                if not frame:
+                    raise BrowserError("未找到推荐页 iframe，请刷新推荐页后重试")
+                value = frame.evaluate(READ_CANDIDATES)
+                if not isinstance(value, list):
+                    return []
+                return [{"name": str(c.get("name") or "").strip(), "uid": str(c.get("uid") or "").strip(),
+                         "greetable": bool(c.get("greetable"))} for c in value if isinstance(c, dict) and c.get("uid")]
         finally:
             if pw is not None:
                 pw.stop()
@@ -315,17 +383,20 @@ class RecommendVerifier:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(cdp_url)
             page = self._recommend_page(browser)
-            self._verify_session(page)
-            page.reload(wait_until="domcontentloaded")
-            # 等推荐 iframe 重新加载出来，供后续 select_job/read_candidates 使用
-            deadline = time.time() + self._wait_timeout
-            while time.time() < deadline and not self._recommend_frame(page):
-                # Sync Playwright dispatches frame-attached/navigated events during
-                # its own API calls. A Python sleep leaves page.frames stale.
-                page.wait_for_timeout(500)
-            if not self._recommend_frame(page):
-                raise BrowserError("刷新后未找到推荐页 iframe，请确认推荐页已重新加载")
-            return True
+            with self._page_guard(page) as check:
+                self._verify_session(page)
+                check()
+                page.reload(wait_until="domcontentloaded")
+                # 等推荐 iframe 重新加载出来，供后续 select_job/read_candidates 使用
+                deadline = time.time() + self._wait_timeout
+                while time.time() < deadline and not self._recommend_frame(page):
+                    # Sync Playwright dispatches frame-attached/navigated events during
+                    # its own API calls. A Python sleep leaves page.frames stale.
+                    page.wait_for_timeout(500)
+                    check()
+                if not self._recommend_frame(page):
+                    raise BrowserError("刷新后未找到推荐页 iframe，请确认推荐页已重新加载")
+                return True
         finally:
             if pw is not None:
                 pw.stop()

@@ -25,8 +25,17 @@ class Page:
     def __init__(self, url, frames, target_id='test-target'):
         self.url = url
         self.frames = frames
+        for frame in frames:
+            frame.page = self
         self.target_id = target_id
         self.reload_calls = 0
+        self.listeners = {}
+
+    def on(self, event, callback):
+        self.listeners[event] = callback
+
+    def remove_listener(self, event, callback):
+        self.listeners.pop(event, None)
 
     def reload(self, **kwargs):
         self.reload_calls += 1
