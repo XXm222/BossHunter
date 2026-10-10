@@ -11,6 +11,7 @@ const pub = (body = proto, topic = 'chat') => { const t = Buffer.from(topic), p 
 const created = (o, id = 'socket') => o.handle({sessionId:'s', method:'Network.webSocketCreated',params:{requestId:id,url:'wss://ws2.zhipin.com/chatws'}},1000);
 const receive = (o, b, id = 'socket') => o.handle({sessionId:'s',method:'Network.webSocketFrameReceived',params:{requestId:id,response:{opcode:2,payloadData:b.toString('base64')}}},2000);
 const send = (o, b) => o.handle({sessionId:'s',method:'Network.webSocketFrameSent',params:{requestId:'socket',response:{opcode:2,payloadData:b.toString('base64')}}},2000);
+const control = (o, opcode, sent = false, now = 2500) => o.handle({sessionId:'s',method:sent ? 'Network.webSocketFrameSent' : 'Network.webSocketFrameReceived',params:{requestId:'socket',response:{opcode,payloadData:'not MQTT data'}}},now);
 function observer() { const o = new ChatObserver(); o.state('s'); created(o); return o; }
 test('large IDs stay exact and no message contents are exposed', () => {
   const result = protocolEvents(proto);
@@ -94,4 +95,44 @@ test('reattaching a CDP session changes stream identity even at the same cursor'
   const o = observer(), epoch = o.snapshot('s').epoch;
   o.remove('s'); o.state('s'); created(o);
   assert.notEqual(o.snapshot('s').epoch, epoch);
+});
+test('WebSocket ping/pong in either direction preserve health and later notifications', () => {
+  for (const sent of [false,true]) for (const opcode of [9,10]) {
+    const o = observer(); receive(o,pub());
+    const before = o.snapshot('s',0,3000);
+    control(o,opcode,sent);
+    const after = o.snapshot('s',0,3000);
+    assert(after.connected); assert.deepEqual(after.events,before.events);
+    receive(o,pub()); assert.equal(o.snapshot('s',0,3000).events.length,2);
+  }
+});
+test('WebSocket ping/pong interleaved in sent and received MQTT fragments leave buffers intact', () => {
+  const o = observer(), packet = pub();
+  receive(o,packet.subarray(0,5)); send(o,packet.subarray(0,3));
+  for (const sent of [false,true]) for (const opcode of [9,10]) control(o,opcode,sent);
+  assert.equal(o.snapshot('s',0,3000).events.length,0);
+  receive(o,packet.subarray(5)); send(o,packet.subarray(3));
+  const result = o.snapshot('s',0,3000);
+  assert(result.connected); assert.equal(result.events.length,2);
+});
+test('WebSocket controls alone do not establish or prolong MQTT health', () => {
+  const o = observer(); control(o,9); control(o,10,true);
+  assert(!o.snapshot('s',0,3000).connected);
+  receive(o,pub()); control(o,10,false,100000);
+  assert(!o.snapshot('s',0,100000).connected);
+});
+test('WebSocket close in either direction removes the socket and allows clean reconnect', () => {
+  for (const sent of [false,true]) {
+    const o = observer(); receive(o,pub()); control(o,8,sent);
+    const result = o.snapshot('s',0,3000);
+    assert(!result.connected); assert.match(result.reason,/已关闭/);
+    assert.equal(result.events.length,1); assert.equal(o.state('s').sockets.size,0);
+    receive(o,pub()); assert.equal(o.snapshot('s',0,3000).events.length,1);
+    created(o,'new'); receive(o,pub(),'new');
+    assert(o.snapshot('s',0,3000).connected);
+  }
+});
+test('unknown application frame still falls back to HTTP', () => {
+  const o = observer(); receive(o,pub()); control(o,1);
+  assert(!o.snapshot('s',0,3000).connected);
 });

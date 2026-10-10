@@ -93,9 +93,18 @@ export class ChatObserver {
     }
     const sent = msg.method === 'Network.webSocketFrameSent';
     if ((!sent && msg.method !== 'Network.webSocketFrameReceived') || socket.failed) return;
+    const opcode = p.response?.opcode;
+    // WebSocket controls are not MQTT application data and may interleave
+    // fragmented packets. Only received MQTT packets establish server health.
+    if (opcode === 9 || opcode === 10) return;
+    if (opcode === 8) {
+      s.sockets.delete(p.requestId);
+      s.reason = 'BOSS WS 已关闭，使用 HTTP 轮询';
+      return;
+    }
     const bufferKey = sent ? 'sentBuffer' : 'buffer';
     try {
-      if (p.response?.opcode !== 2) throw Error('unknown frame');
+      if (opcode !== 2) throw Error('unknown frame');
       if ((p.response.payloadData || '').length > LIMIT * 2) throw Error('frame too large');
       socket[bufferKey] = Buffer.concat([socket[bufferKey], Buffer.from(p.response.payloadData, 'base64')]);
       if (socket[bufferKey].length > LIMIT) throw Error('packet too large');
