@@ -21,8 +21,9 @@ export function ReplyProgress({ data, conversation }: { data: State; conversatio
   const work = data.reply_work?.[conversation.id]
   const draft = data.outbox.find(d => d.conversation_id === conversation.id && d.kind === 'reply')
   const alive = data.worker?.alive ?? false
+  const ws = alive && data.worker?.monitor_enabled && data.monitor?.listener?.transport === 'ws'
   let stage = progress?.stage || (work?.status === 'waiting' ? 'queued' : work?.status === 'needs_attention' ? 'needs_attention' : draft?.status || 'idle')
-  let message = progress?.message || work?.reason || (draft?.status === 'sent' ? '页面已确认出现对应的本人消息' : '等待下一轮检查；不会自动回复绑定前的历史消息')
+  let message = progress?.message || work?.reason || (draft?.status === 'sent' ? '页面已确认出现对应的本人消息' : (ws ? '等待 WS 新消息通知；不会自动回复绑定前的历史消息' : '等待下一轮检查；不会自动回复绑定前的历史消息'))
   if (!progress?.active && draft && ['sending', 'uncertain'].includes(draft.status)) {
     stage = 'uncertain'; message = '发送结果尚未确认，请先核实 BOSS，禁止重复发送'
   } else if (!progress?.active && draft?.status === 'sent' && work?.status !== 'waiting') {
@@ -39,7 +40,8 @@ export function ReplyProgress({ data, conversation }: { data: State; conversatio
     {until && <p>{seconds > 0 ? `约 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒后可继续` : '预计等待时间已到，等待后台更新状态'} · 最早 {new Date(until * 1000).toLocaleTimeString('zh-CN', { hour12: false })}</p>}
     {!!conversation.do_not_contact ? <p>已停止联系，禁止发送。</p> : conversation.taken_over ? <p>继续同步消息和读取简历；暂停模型评分、回复生成和自动外发，仍可人工确认普通回复。</p> : !data.positions.find(p => p.id === conversation.position_id)?.enabled ? <p>岗位自动任务已暂停，仍可人工确认普通回复。</p> : !alive ? <p>worker 未运行，自动处理无法继续。以上为最后记录的状态。</p> : !data.worker?.monitor_enabled ? <p>监测已停止，任务和草稿保留。</p> : null}
     {data.request_budget && data.request_budget.remaining <= 0 && <p>今日请求预算已耗尽，请先处理预算限制。</p>}
-    {progress?.next_check_at && !progress.active && alive && data.worker?.monitor_enabled && !['sent', 'uncertain'].includes(stage) && <p>下一轮最早 {new Date(progress.next_check_at * 1000).toLocaleTimeString('zh-CN', { hour12: false })} 检查；多会话依次轮询。</p>}
+    {!ws && progress?.next_check_at && !progress.active && alive && data.worker?.monitor_enabled && !['sent', 'uncertain'].includes(stage) && <p>下一轮最早 {new Date(progress.next_check_at * 1000).toLocaleTimeString('zh-CN', { hour12: false })} 检查；多会话依次轮询。</p>}
+    {ws && <p>WS 监听中；新消息触发同步，等待发送的草稿仍会定期重试，受请求节流约束。</p>}
     {progress?.updated_at && <small>状态更新于 {new Date(progress.updated_at).toLocaleTimeString('zh-CN', { hour12: false })} · 页面约每 15 秒读取本地状态，倒计时不是发送保证</small>}
   </section>
 }

@@ -11,6 +11,21 @@ function show(path: string) { render(<MemoryRouter initialEntries={[path]}><Side
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks() })
 const seed = (value = state) => vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(value))))
 describe('recruiting workspace', () => {
+  it('keeps the complete processing history in a keyboard-scrollable region', async () => {
+    seed({ ...state, outbox: Array.from({ length: 100 }, (_, i) => ({ id: `history-${i}`, conversation_id: c.id, kind: 'reply', content: `历史回复 ${i}`, status: 'sent', refs: {}, result: '' })) } as State)
+    show('/recruiting/candidates/sample')
+    const history = await screen.findByRole('region', { name: '回复处理记录' })
+    expect(history.className).toBe('cw-processing-results')
+    expect(history.tabIndex).toBe(0)
+    expect(within(history).getByText('历史回复 0')).toBeTruthy()
+    expect(within(history).getByText('历史回复 99')).toBeTruthy()
+  })
+  it.each(['ws', 'http'])('shows the active %s monitoring channel and reason', async (transport) => {
+    seed({ ...state, monitor: { ...state.monitor, running: true, listener: { transport, reason: '测试通道原因', pending_count: 2 } }, worker: { alive: true, monitor_enabled: true } })
+    show('/recruiting/monitor')
+    expect(await screen.findByText(new RegExp(`监测通道：${transport === 'ws' ? 'WS 监听中' : 'HTTP 轮询中'}`))).toBeTruthy()
+    expect(screen.getByText(/测试通道原因/)).toBeTruthy()
+  })
   it('keeps the taken-over conversation visible while disabling model scoring', async () => {
     seed({ ...state, model_ready: true, conversations: [{ ...c, taken_over: 1 }], documents: [{ id: 'doc', conversation_id: c.id, text: '合成简历', complete: 0, source: 'pdf' }] } as State)
     show('/recruiting/candidates/sample?panel=resume')

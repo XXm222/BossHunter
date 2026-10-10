@@ -138,10 +138,12 @@ class BrowserRuntimeManagerTests(unittest.TestCase):
             trust_env=False,
         )
 
+    @patch("bosshunter.browser.runtime.runtime_health", return_value=None)
+    @patch("bosshunter.browser.runtime._is_port_available", return_value=True)
     @patch("bosshunter.browser.runtime.runtime_targets")
     @patch("bosshunter.browser.runtime.start_runtime")
     @patch("bosshunter.browser.runtime.check_node_available")
-    def test_ensure_runtime_starts_builtin_runtime_when_auto_start_enabled(self, check_node, start_runtime, runtime_targets):
+    def test_ensure_runtime_starts_builtin_runtime_when_auto_start_enabled(self, check_node, start_runtime, runtime_targets, port_available, health):
         from bosshunter.browser.runtime import ensure_runtime
 
         check_node.return_value = {"available": True, "version": "v22.1.0"}

@@ -132,6 +132,13 @@ class Store:
                 status TEXT NOT NULL, result TEXT, error TEXT, created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS read_flights_key ON read_flights(request_key,status);
+            CREATE TABLE IF NOT EXISTS auto_reply_days (
+                day TEXT PRIMARY KEY, sent INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS auto_reply_reservations (
+                outbox_id TEXT PRIMARY KEY, day TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved'
+            );
             """)
             db.execute('BEGIN IMMEDIATE')
             cols = [r[1] for r in db.execute("PRAGMA table_info(conversations)").fetchall()]
@@ -144,6 +151,15 @@ class Store:
                 db.execute("UPDATE conversations SET binding_confirmed=1 WHERE id IN (SELECT object_id FROM events WHERE kind='conversation_bound')")
             if 'owner' not in [r[1] for r in db.execute('PRAGMA table_info(outbox)')]:
                 db.execute("ALTER TABLE outbox ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+            if not db.execute("SELECT 1 FROM settings WHERE key='auto_reply_reservation_migrated'").fetchone():
+                legacy = db.execute("SELECT value FROM settings WHERE key='auto_reply_sent'").fetchone()
+                value = json.loads(legacy[0]) if legacy else {}
+                # Old records did not distinguish reservations from confirmed
+                # sends. Preserve their count; never infer which actually sent.
+                if value.get('date'):
+                    db.execute('INSERT OR IGNORE INTO auto_reply_days VALUES (?,?)',
+                               (value['date'], value.get('count', 0)))
+                db.execute("INSERT INTO settings VALUES ('auto_reply_reservation_migrated','true')")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -480,16 +496,12 @@ class Store:
                     raise ValueError('该会话已关闭自动外发')
                 if row['kind'] == 'reply':
                     day = day_key()
-                    value = db.execute("SELECT value FROM settings WHERE key='auto_reply_sent'").fetchone()
-                    count = json.loads(value[0]) if value else {}
-                    if count.get('date') != day:
-                        count = {'date': day, 'count': 0}
+                    budget = self._auto_reply_budget(db, day)
                     configured = db.execute("SELECT value FROM settings WHERE key='auto_reply_daily_limit'").fetchone()
                     limit = json.loads(configured[0]) if configured else daily_limit
-                    if limit and count['count'] >= limit:
+                    if limit and budget['sent'] + budget['reserved'] >= limit:
                         raise ValueError('今日自动回复已达上限，请人工处理')
-                    count['count'] += 1
-                    db.execute("INSERT OR REPLACE INTO settings VALUES ('auto_reply_sent',?)", (encode(count),))
+                    db.execute('INSERT INTO auto_reply_reservations(outbox_id,day) VALUES (?,?)', (ident, day))
             db.execute("UPDATE outbox SET status='sending',owner=?,updated_at=? WHERE id=?", (self.owner, now(), ident))
             return dict(row)
 
@@ -503,7 +515,33 @@ class Store:
 
     def finish(self, ident, status, result):
         with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._settle_auto_reply(db, ident, status)
             db.execute("UPDATE outbox SET status=?,result=?,updated_at=? WHERE id=?", (status, result[:1000], now(), ident))
+
+    @staticmethod
+    def _auto_reply_budget(db, day):
+        sent = db.execute('SELECT sent FROM auto_reply_days WHERE day=?', (day,)).fetchone()
+        reserved = db.execute("SELECT COUNT(*) FROM auto_reply_reservations WHERE day=? AND status='reserved'", (day,)).fetchone()[0]
+        return {'sent': sent[0] if sent else 0, 'reserved': reserved}
+
+    def auto_reply_budget(self, day=None):
+        from .jobs import day_key
+        with self.db() as db:
+            db.execute('BEGIN')
+            return self._auto_reply_budget(db, day or day_key())
+
+    @staticmethod
+    def _settle_auto_reply(db, ident, status):
+        if status not in {'sent', 'cancelled'}:
+            return  # sending/uncertain continue occupying quota.
+        row = db.execute("SELECT day FROM auto_reply_reservations WHERE outbox_id=? AND status='reserved'", (ident,)).fetchone()
+        if not row:
+            return
+        db.execute('UPDATE auto_reply_reservations SET status=? WHERE outbox_id=?',
+                   ('committed' if status == 'sent' else 'released', ident))
+        if status == 'sent':
+            db.execute('INSERT INTO auto_reply_days(day,sent) VALUES (?,1) ON CONFLICT(day) DO UPDATE SET sent=sent+1', (row['day'],))
 
     def resolve_outbound(self, kind, ident, outcome, evidence):
         if kind not in {'reply', 'greeting'} or outcome not in {'sent', 'not_sent'}:
@@ -520,6 +558,7 @@ class Store:
                 raise ValueError('原发送任务仍在运行，不能覆盖执行结果')
             status = 'sent' if outcome == 'sent' else 'cancelled'
             if kind == 'reply':
+                self._settle_auto_reply(db, ident, status)
                 db.execute('UPDATE outbox SET status=?,result=?,updated_at=? WHERE id=?',
                            (status, '人工核实：' + evidence.strip(), now(), ident))
             else:

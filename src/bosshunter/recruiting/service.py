@@ -1,7 +1,6 @@
 """One-account, one-conversation recruiting pilot with persistent outbound guards."""
 from datetime import date, datetime, timezone
 from copy import deepcopy
-from zoneinfo import ZoneInfo
 import json
 import random
 import time
@@ -14,6 +13,7 @@ from .store import Store, TaskBusy, RequestThrottled, RequestPaused, encode, fin
 from .policy import check_reply
 from .jobs import RecruitingJobs
 from .local_session import LocalBossSession
+from .ws_monitor import HybridMonitor
 from bosshunter.browser.client import RuntimeClient
 from bosshunter.throttle import PageThrottle
 from bosshunter.ai.credentials import get_ai_base_url, get_ai_service
@@ -47,10 +47,11 @@ class RecruitingService:
         saved_monitor = self.store.setting('monitor_state', {})
         self.monitor = {"running": False, "last_success": saved_monitor.get('last_success'),
                         "error": saved_monitor.get('error') or "", "interval_seconds": max(60, cfg.get('monitor_interval_seconds', 600)),
-                        "mode": "round_robin_read_assess_and_reply", "note": "轮询已授权绑定会话；自动外发遵循每会话开关，非全账号实时监听"}
+                        "mode": "ws_with_http_fallback", "note": "WS 优先通知已授权绑定会话，断线后 HTTP 轮询；自动外发遵循每会话开关"}
         self.connection = {"connected": False, "message": "尚未核实本地 BOSS 登录状态", "transport": "local_cookie_http"}
         self.store.recover_outbox()
         self._reply_progress_local = local()
+        self.ws_monitor = HybridMonitor(self.store)
 
     def _recruiting_cfg(self):
         config = self.config_provider() or {}
@@ -167,6 +168,10 @@ class RecruitingService:
         selected = {j['id'] for j in jobs_state['jobs'] if j['selected'] and j['platform_id'] and j['status'] == '开放中'}
         allowed_count = sum(c['binding_confirmed'] and not c['do_not_contact']
                             and by_position[c['position_id']]['enabled'] and c['position_id'] in selected for c in conversations)
+        listener = settings.get('ws_monitor_state', {})
+        if (listener.get('transport') == 'ws' and listener.get('updated_at') is not None
+                and time.time() - listener['updated_at'] >= 35):
+            listener = {**listener, 'transport': 'http', 'reason': 'WS 本地监听状态超时，退回 HTTP 轮询'}
         monitor_state = {
             "running": worker_alive and monitor_enabled,
             "paused": worker_alive and not monitor_enabled,
@@ -179,6 +184,7 @@ class RecruitingService:
             'allowed_count': allowed_count,
             'estimated_cycle_seconds': allowed_count * self.monitor['interval_seconds'],
             'processing_conversation_id': saved_monitor.get('processing_conversation_id') if worker_alive else None,
+            'listener': listener,
         }
         budget = s.request_budget()
         read_daily_limit = s.request_daily_limit(self._recruiting_cfg().get("read_daily_limit", 100))
@@ -187,6 +193,7 @@ class RecruitingService:
                           "remaining": max(0, read_daily_limit - budget.get("count", 0)),
                           "by_kind": budget.get("by_kind", {}),
                           'paused_until': s.setting('request_paused_until', 0)}
+        reply_budget = s.auto_reply_budget()
         return {"positions": positions, "conversations": conversations,
                 "documents": docs, "resume_processing": {c["id"]: settings.get("resume_processing:" + c["id"], {}) for c in conversations},
                 'reply_progress': {c['id']: settings.get('reply_progress:' + c['id'], {}) for c in conversations},
@@ -199,7 +206,7 @@ class RecruitingService:
                 "worker": {"alive": worker_alive, "monitor_enabled": monitor_enabled},
                 "discovery": {"running": discovery_running},
                 "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 5)),
-                              "sent_today": self._auto_reply_sent_today()},
+                              "sent_today": reply_budget['sent'], 'reserved_today': reply_budget['reserved']},
                 "request_budget": request_budget,
                 'contact_sync': s.setting('contact_sync', {}),
                 "model_ready": bool(model_basis[1]),
@@ -1318,6 +1325,24 @@ class RecruitingService:
                     pass  # 心跳失败不致命，下个周期重试
 
         Thread(target=heartbeat, daemon=True, name='recruiting-heartbeat').start()
+
+        def observe_ws():
+            while not stop_event.is_set():
+                try:
+                    if self.store.setting('monitor_enabled', False):
+                        self._poll_ws()
+                except AccountPauseError as exc:
+                    self.set_monitor_enabled(False)
+                    self.monitor['error'] = str(exc)
+                    self._persist_monitor_state()
+                except Exception:
+                    # Local observation failure never bypasses HTTP safety guards.
+                    rows = [self.store.row('conversations', cid) for cid in self._allowed_conversations()]
+                    self.ws_monitor.observe(None, rows)
+                stop_event.wait(10)
+
+        if isinstance(self.browser, BossBrowser):
+            Thread(target=observe_ws, daemon=True, name='recruiting-ws-observer').start()
         last_run = 0.0
         consecutive_errors = 0
         previous_enabled = False
@@ -1331,9 +1356,16 @@ class RecruitingService:
                         last_run = 0.0
                     previous_enabled = True
                     previous_revision = revision
-                    if time.time() - last_run >= self.monitor['interval_seconds']:
+                    ws_job = self.ws_monitor.next_job(self._allowed_conversations(), self.monitor['interval_seconds'])
+                    due = time.time() - last_run >= self.monitor['interval_seconds']
+                    if ws_job or (not self.ws_monitor.connected and due):
+                        succeeded = False
                         try:
-                            self.monitor_once()
+                            if ws_job:
+                                self.monitor_once(ws_job[0])
+                            else:
+                                self.monitor_once()
+                            succeeded = True
                             consecutive_errors = 0
                         except AccountPauseError as exc:
                             # 验证码/登录失效/身份不一致：暂停等人工，不自动重试
@@ -1356,11 +1388,31 @@ class RecruitingService:
                         finally:
                             # 失败也推进 last_run：持续出错时仍按 interval 重试，而不是每 10 秒紧循环。
                             last_run = time.time()
+                            self.ws_monitor.finish(ws_job, succeeded, self.monitor['interval_seconds'])
                 else:
                     previous_enabled = False
                 stop_event.wait(10)  # 每 10 秒轮询一次 monitor_enabled 标志
         finally:
             self.store.event('worker_stopped', '', '独立监测进程已停止')
+
+    def _poll_ws(self):
+        """Poll LOCAL runtime metadata only; never starts a BOSS connection."""
+        rows = [self.store.row('conversations', cid) for cid in self._allowed_conversations()]
+        try:
+            target = self.browser.bound_target()
+            result = self.browser.runtime.recruiting_ws(target, self.ws_monitor.cursor)
+        except BrowserError as exc:
+            result = {'connected': False, 'reason': str(exc)[:250]}
+            # bound_target deliberately rejects a page that navigated away from
+            # chat. Still inspect the SAME target's local restriction metadata.
+            if self.browser.target_id:
+                observed = self.browser.runtime.recruiting_ws(self.browser.target_id, self.ws_monitor.cursor)
+                if observed and observed.get('paused'):
+                    result = observed
+        if result and result.get('paused'):
+            self._pause_platform_requests(1800)
+            raise AccountPauseError('检测到 BOSS 验证或限制页面，已统一暂停，请人工处理')
+        self.ws_monitor.observe(result, rows)
 
     def _persist_monitor_state(self):
         """把监测状态写回 DB，供服务重启后恢复显示。"""
@@ -1377,23 +1429,14 @@ class RecruitingService:
 
     def _auto_reply_sent_today(self):
         """今日已自动外发的回复数（只计自动，不计人工手动发送）。"""
-        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
-        data = self.store.setting('auto_reply_sent', {})
-        return data.get('count', 0) if data.get('date') == day else 0
-
-    def _mark_auto_reply_sent(self):
-        day = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
-        data = self.store.setting('auto_reply_sent', {})
-        if data.get('date') != day:
-            data = {'date': day, 'count': 0}
-        data['count'] = data.get('count', 0) + 1
-        self.store.set_setting('auto_reply_sent', data)
+        return self.store.auto_reply_budget()['sent']
 
     def _reply_quota_exhausted(self):
         limit = self.store.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 5))
         if not limit:
             return False
-        return self._auto_reply_sent_today() >= limit
+        budget = self.store.auto_reply_budget()
+        return budget['sent'] + budget['reserved'] >= limit
 
     def _auto_send_if_allowed(self, draft):
         """按条件自动发送一条回复草稿；不满足则留草稿给人工。"""
@@ -1456,21 +1499,21 @@ class RecruitingService:
             return allowed[(allowed.index(cursor) + 1) % len(allowed)]
         return allowed[0]
 
-    def monitor_once(self):
+    def monitor_once(self, cid=None):
         with self.store.task('monitor-cycle'):
-            return self._monitor_once()
+            return self._monitor_once(cid)
 
-    def _monitor_once(self):
+    def _monitor_once(self, requested_cid=None):
         """轮询式监测：每轮只处理一个允许的会话（round-robin），而非每轮读全部。
 
         候选人越多越不能每轮把所有历史各拉一遍；用 monitor_cursor 记录上次处理到
         谁，下一轮处理下一个。人工接管继续同步；停止联系/岗位暂停的会话跳过。
         """
         allowed = self._allowed_conversations()
-        if not allowed:
+        if not allowed or (requested_cid is not None and requested_cid not in allowed):
             self._persist_monitor_state()
             return {"changed": False, "last_success": self.monitor["last_success"]}
-        cid = self._next_monitor_cid(allowed)
+        cid = requested_cid or self._next_monitor_cid(allowed)
         self._check_stopped()
         self._check_monitor_enabled()
         self.store.set_setting("monitor_cursor", cid)

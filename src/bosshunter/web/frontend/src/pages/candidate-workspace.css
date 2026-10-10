@@ -48,7 +48,9 @@
 .cw-panel-tabs{display:flex;justify-content:space-between;gap:10px;margin:0 16px;border-bottom:1px solid #e0e8f2;flex-shrink:0}
 .cw-panel-tabs>a{font-size:12px;padding:19px 0 14px;color:#536883;border-bottom:2px solid transparent;white-space:nowrap}
 .cw-panel-tabs>a[aria-current=page]{color:#2464e9;border-color:#2464e9;font-weight:600}
-.cw-assistant-body{padding:18px 16px;overflow-y:auto;flex:1;scrollbar-gutter:stable}
+.cw-assistant-body{padding:18px 16px;overflow-y:auto;flex:1;min-height:0;scrollbar-gutter:stable}
+.cw-processing-results{max-height:360px;overflow-y:auto;overflow-wrap:anywhere;scrollbar-gutter:stable}
+.cw-processing-results:focus-visible{outline:2px solid #2464e9;outline-offset:2px}
 .cw-assistant-title{display:flex;gap:8px;align-items:center;margin-bottom:15px}
 .cw-assistant-title svg{flex-shrink:0}
 .cw-assistant-title h3{font-size:14px}
