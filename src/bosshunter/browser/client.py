@@ -23,6 +23,11 @@ class RuntimeClient:
         data = self._get_json("/targets", timeout=5)
         return data if isinstance(data, list) else []
 
+    def recruiting_ws(self, target_id: str, after: int = 0) -> dict[str, Any] | None:
+        """Read local passive observation metadata, never a platform HTTP request."""
+        data = self._get_json('/recruiting/ws', params={'target': target_id, 'after': after}, timeout=5)
+        return data if isinstance(data, dict) else None
+
     def new_tab(self, url: str, background: bool = False) -> str | None:
         params: dict[str, str] = {"url": url}
         if background:

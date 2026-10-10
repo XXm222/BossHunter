@@ -8,7 +8,7 @@ import httpx
 from bosshunter.recruiting.browser import BrowserError
 from bosshunter.recruiting.jobs import RecruitingJobs
 from bosshunter.recruiting.local_session import LocalBossSession
-from bosshunter.recruiting.store import Store
+from bosshunter.recruiting.store import Store, now
 
 
 def raw(ident='1', status=0):
@@ -138,6 +138,132 @@ class JobSelectionTests(unittest.TestCase):
         self.assertEqual(state['attempts'][0]['candidate_id'], 'exact-id')
         self.assertEqual(state['attempts'][0]['status'], 'uncertain')
         self.assertEqual(state['daily']['sent'], 0)
+
+    def test_platform_remaining_deducts_since_read(self):
+        from bosshunter.recruiting.jobs import day_key
+        quota = {'limit': 5, 'used': 1, 'remaining': 4, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 1}
+        # 读取时本地已发 1 次、剩余 4；之后又发 2 次（used=3）→ 剩余 2
+        self.assertEqual(self.jobs._platform_remaining(quota, day_key(), 3), 2)
+        # 扣到 0 为止，不出现负数
+        self.assertEqual(self.jobs._platform_remaining(quota, day_key(), 6), 0)
+
+    def test_platform_remaining_unlimited_and_stale(self):
+        from bosshunter.recruiting.jobs import day_key
+        self.assertIsNone(self.jobs._platform_remaining({'unlimited': True, 'remaining': None}, day_key(), 0))
+        # 跨日过期 → None（需重新读取），不被昨天的缓存阻塞
+        self.assertIsNone(self.jobs._platform_remaining({'remaining': 0, 'unlimited': False, 'date': '2000-01-01', 'local_used_at_read': 0}, day_key(), 0))
+
+    def test_quota_display_distinguishes_unread_and_expired_without_using_old_value(self):
+        self.assertEqual(self.jobs.state()['daily']['quota_status'], 'unread')
+        self.store.set_setting('greeting_quota', {'remaining': 200, 'unlimited': False,
+            'date': '2000-01-01', 'updated_at': '2000-01-01T00:00:00+00:00', 'local_used_at_read': 0})
+        daily = self.jobs.state()['daily']
+        self.assertEqual(daily['quota_status'], 'expired')
+        self.assertEqual(daily['quota_last_remaining'], 200)
+        self.assertEqual(daily['quota_updated_at'], '2000-01-01T00:00:00+00:00')
+        self.assertIsNone(daily['platform_remaining'])
+
+    def test_quota_is_fresh_for_ten_minutes_only(self):
+        from bosshunter.recruiting.jobs import day_key
+        from datetime import datetime, timezone, timedelta
+        stamp = datetime.now(timezone.utc)
+        quota = {'date': day_key(), 'updated_at': stamp.isoformat()}
+        with patch('bosshunter.recruiting.jobs.datetime', wraps=datetime) as clock:
+            clock.now.return_value = stamp + timedelta(seconds=600)
+            self.assertTrue(self.jobs.quota_fresh(quota, quota['date']))
+            clock.now.return_value = stamp + timedelta(seconds=601)
+            self.assertFalse(self.jobs.quota_fresh(quota, quota['date']))
+
+    def test_platform_quota_deducts_after_local_sends(self):
+        from bosshunter.recruiting.jobs import day_key
+        self.jobs.select(['boss-one'])
+        self.jobs.save_budget('platform', 100)
+        self.store.set_setting('greeting_quota', {'limit': 1, 'used': 0, 'remaining': 1, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 0})
+        with self.store.db() as db:
+            db.execute("INSERT INTO greeting_attempts(day,job_id,candidate_id,name,status,created_at) VALUES (?,?,?,?,?,?)",
+                       (day_key(), 'boss-one', 'c1', '', 'sent', 'now'))
+        state = self.jobs.state()
+        self.assertEqual(state['daily']['platform_remaining'], 0)
+        self.assertTrue(any('额度已用完' in b for b in state['blockers']))
+
+    def test_platform_quota_stale_after_day_rollover_not_blocking(self):
+        from bosshunter.recruiting.jobs import day_key
+        self.jobs.select(['boss-one'])
+        self.jobs.save_budget('platform', 100)
+        self.store.set_setting('greeting_quota', {'remaining': 0, 'unlimited': False, 'date': '2000-01-01', 'local_used_at_read': 0})
+        state = self.jobs.state()
+        self.assertIsNone(state['daily']['platform_remaining'])
+        self.assertTrue(any('未读取或已过期' in b for b in state['blockers']))
+        self.assertFalse(any('额度已用完' in b for b in state['blockers']))
+
+    def test_custom_budget_respects_platform_quota(self):
+        from bosshunter.recruiting.jobs import day_key
+        self.jobs.select(['boss-one'])
+        self.jobs.save_budget('custom', 100)
+        # 自定义上限 100 还没到，但平台剩余为 0，应被平台剩余拦住
+        self.store.set_setting('greeting_quota', {'remaining': 0, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 0})
+        state = self.jobs.state()
+        self.assertEqual(state['daily']['custom_remaining'], 100)
+        self.assertTrue(any('平台剩余额度已用完' in b for b in state['blockers']))
+        # 平台剩余充足时不误报
+        self.store.set_setting('greeting_quota', {'remaining': 5, 'unlimited': False, 'date': day_key(), 'updated_at': now(), 'local_used_at_read': 0})
+        state = self.jobs.state()
+        self.assertFalse(any('平台剩余额度已用完' in b for b in state['blockers']))
+
+    def test_request_budget_persists_and_buckets(self):
+        # A：计数存 DB，重启不重置，按类别记录
+        self.store.count_request('conversation', 3)
+        self.store.count_request('jobs', 3)
+        budget = Store(Path(self.temp.name) / 'jobs.db').request_budget()
+        self.assertEqual(budget['count'], 2)
+        self.assertEqual(budget['by_kind'], {'conversation': 1, 'jobs': 1})
+        # 第三次达到上限，第四次超限
+        self.store.count_request('resume', 3)
+        with self.assertRaises(ValueError):
+            self.store.count_request('quota', 3)
+
+    def test_count_request_atomic_under_concurrency(self):
+        # 第2项：并发计数不丢递增——多个连接同时 count_request，总数应精确等于调用次数
+        import threading
+        store = Store(Path(self.temp.name) / 'concurrent.db')
+        n = 8
+        errors = []
+
+        def inc():
+            try:
+                store.count_request('conversation', 1000)
+            except Exception as exc:  # pragma: no cover - 收集线程内异常，避免被吞掉
+                errors.append(exc)
+
+        threads = [threading.Thread(target=inc) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(Store(Path(self.temp.name) / 'concurrent.db').request_budget()['count'], n)
+
+    def test_reserve_greeting_blocks_when_quota_exhausted(self):
+        # 遗漏 1：reserve 本身在同一事务里检查额度，不能只靠 _check_greeting_allowed
+        from bosshunter.recruiting.jobs import day_key
+        self.jobs.select(['boss-one'])
+        self.jobs.save_budget('custom', 1)
+        with self.store.db() as db:
+            db.execute("INSERT INTO greeting_attempts(day,job_id,candidate_id,name,status,created_at) VALUES (?,?,?,?,?,?)",
+                       (day_key(), 'boss-one', 'c1', '', 'sent', 'now'))
+        with self.assertRaisesRegex(ValueError, "额度"):
+            self.jobs.reserve_greeting('boss-one', 'c2', '乙')
+
+    def test_reserve_greeting_blocks_when_unresolved(self):
+        # 遗漏 1：有待核实（uncertain/sending）时，reserve 应暂停
+        from bosshunter.recruiting.jobs import day_key
+        self.jobs.select(['boss-one'])
+        self.jobs.save_budget('custom', 100)
+        with self.store.db() as db:
+            db.execute("INSERT INTO greeting_attempts(day,job_id,candidate_id,name,status,created_at) VALUES (?,?,?,?,?,?)",
+                       (day_key(), 'boss-one', 'c1', '', 'uncertain', 'now'))
+        with self.assertRaisesRegex(ValueError, "待核实"):
+            self.jobs.reserve_greeting('boss-one', 'c2', '乙')
 
 if __name__ == '__main__':
     unittest.main()

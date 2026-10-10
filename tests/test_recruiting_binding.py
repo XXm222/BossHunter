@@ -1,11 +1,13 @@
 """绑定向导 service 方法：预览核实与确认写入 pilot_conversation。"""
 import unittest
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 
 from bosshunter.recruiting.browser import BrowserError
 from bosshunter.recruiting.service import RecruitingService
+from bosshunter.recruiting.store import Store
 
 
 def snapshot(ident='123456-0', name='张三', position_title='前端工程师', account_uid='98765'):
@@ -50,6 +52,43 @@ class BindingTests(unittest.TestCase):
         read.assert_called_once_with('123456-0', '张三', '前端工程师', expected_account='98765')
         self.assertEqual(result['id'], '123456-0')
         self.assertEqual(service.store.setting('pilot_conversation'), '123456-0')
+        self.assertEqual(result['binding_confirmed'], 1)
+
+    def test_discovered_contacts_do_not_enter_monitor_until_confirmed(self):
+        service = self.make_service(Mock(return_value=snapshot()))
+        service.local_session.read_friend_jobs.return_value = {'123456': 'platform-job'}
+        service.jobs.import_snapshot({'complete': True, 'total': 1, 'jobs': [
+            {'platform_id': 'platform-job', 'title': '前端工程师', 'status': '开放中', 'details': []}]})
+        service.jobs.select(['boss-platform-job'])
+        discovered = {**snapshot(), 'messages': [], 'position_platform_id': 'platform-job'}
+        service.store.import_conversation(discovered)
+        self.assertEqual(service._allowed_conversations(), [])
+        self.assertEqual(service.state()['monitor']['allowed_count'], 0)
+        service.confirm_binding('123456-0', '张三', '前端工程师', '98765')
+        self.assertEqual(service._allowed_conversations(), ['123456-0'])
+        # Routine imports preserve confirmation; new contacts stay unconfirmed.
+        service.store.import_conversation(discovered)
+        other = {**discovered, 'id': 'unbound-0'}
+        service.store.import_conversation(other)
+        self.assertEqual(service._allowed_conversations(), ['123456-0'])
+        self.assertEqual(service.state()['monitor']['allowed_count'], 1)
+        with service.store.db() as db:
+            db.execute("UPDATE conversations SET auto_send=1 WHERE id='unbound-0'")
+        self.assertFalse(service._auto_send_enabled('unbound-0'))
+
+    def test_legacy_migration_restores_only_explicitly_confirmed_contacts(self):
+        service = self.make_service(Mock(return_value=snapshot()))
+        service.store.import_conversation(snapshot())
+        service.store.import_conversation(snapshot('other-0'))
+        service.store.event('conversation_bound', '123456-0', '合成确认绑定记录')
+        service.store.event('position_reassociated', 'other-0', '仅关联岗位')
+        with service.store.db() as db:
+            db.execute('ALTER TABLE conversations DROP COLUMN binding_confirmed')
+        restarted = Store(service.store.path)
+        self.assertEqual(restarted.row('conversations', '123456-0')['binding_confirmed'], 1)
+        self.assertEqual(restarted.row('conversations', 'other-0')['binding_confirmed'], 0)
+        restarted = Store(service.store.path)
+        self.assertEqual(restarted.row('conversations', 'other-0')['binding_confirmed'], 0)
 
     def test_confirm_propagates_verification_failure(self):
         # 模拟 read_conversation 因账号不一致/登录失效抛错，确认应原样抛出且不写入
@@ -67,6 +106,30 @@ class BindingTests(unittest.TestCase):
         second = service.confirm_binding('999999-0', '李四', '后端工程师', '88888')
         self.assertEqual(second['id'], '999999-0')
         self.assertEqual(service.store.setting('pilot_conversation'), '999999-0')
+
+    def test_placeholder_binding_requires_manual_link_and_then_can_be_confirmed(self):
+        service = self.make_service(Mock(return_value=snapshot()))
+        service.local_session.read_friend_jobs.return_value = {'123456': 'platform-job'}
+        old = service.store.import_conversation({**snapshot(), 'messages': []})
+        self.assertTrue(old['position_id'].startswith('context-'))
+        service.jobs.import_snapshot({'complete': True, 'total': 1, 'jobs': [
+            {'platform_id': 'platform-job', 'title': '前端工程师', 'status': '开放中', 'details': []}]})
+        with self.assertRaisesRegex(ValueError, '尚未关联平台岗位'):
+            service.confirm_binding('123456-0', '张三', '前端工程师', '98765')
+        self.assertEqual(service.store.row('conversations', old['id'])['position_id'], old['position_id'])
+        service.link_position(old['id'], 'platform-job')
+        result = service.confirm_binding('123456-0', '张三', '前端工程师', '98765')
+        self.assertEqual(result['position_id'], 'boss-platform-job')
+        self.assertEqual(len(json.loads(result['snapshot'])['messages']), 1)
+        self.assertFalse(result['auto_send'])
+
+    def test_real_platform_identity_change_still_rejects_binding(self):
+        service = self.make_service(Mock(return_value=snapshot()))
+        service.store.import_conversation({**snapshot(), 'position_platform_id': 'original-job'})
+        service.local_session.read_friend_jobs.return_value = {'123456': 'different-job'}
+        with self.assertRaisesRegex(ValueError, '平台岗位身份已变化'):
+            service.confirm_binding('123456-0', '张三', '前端工程师', '98765')
+        self.assertEqual(service.store.row('conversations', '123456-0')['position_id'], 'boss-original-job')
 
 
     def test_monitor_state_persists_across_restart(self):

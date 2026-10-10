@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 from bosshunter.recruiting.service import RecruitingService
 from bosshunter.recruiting.browser import BrowserError
+from recruiting_fixtures import authorize
 
 
 class AutoResumeTests(TestCase):
@@ -19,10 +20,11 @@ class AutoResumeTests(TestCase):
         self.assess = self.score.start()
         self.browser = Mock()
         self.session = Mock()
-        self.snapshot = {'id': '123-0', 'name': '测试候选人', 'position_title': '测试岗位', 'messages': [], 'account_uid': '456', 'received_resume_message_id': '789'}
-        self.session.read_conversation.side_effect = lambda *args: dict(self.snapshot)
+        self.snapshot = {'id': '123-0', 'name': '测试候选人', 'position_title': '测试岗位', 'position_platform_id': 'test-job', 'messages': [], 'account_uid': '456', 'received_resume_message_id': '789'}
+        self.session.read_conversation.side_effect = lambda *args, **kwargs: dict(self.snapshot)
         self.session.read_resume.side_effect = lambda *args: {'source': 'boss_attachment_pdf_http', 'text': '岗位相关经历。' * 30, 'complete': False, 'meta': {'page_count': 1, 'message_id': self.snapshot['received_resume_message_id']}}
         self.service = self.make_service()
+        authorize(self.service)
         c = self.service.store.import_conversation(self.snapshot)
         self.cid = c['id']; self.pid = c['position_id']
         self.service.store.save_position(self.pid, '测试岗位', '岗位职责与经验要求', 'human', True)
@@ -99,9 +101,11 @@ class AutoResumeTests(TestCase):
         self.assertEqual(self.session.read_resume.call_count, 1)
         self.assertEqual(len(self.service.state()['documents']), 1)
 
-    def test_takeover_and_paused_job_do_not_run_automatic_processing(self):
+    def test_takeover_reads_without_scoring_and_paused_job_still_stops_reads(self):
         self.service.control(self.cid, True, False); self.service.sync()
-        self.session.read_resume.assert_not_called(); self.assess.assert_not_called()
+        self.session.read_resume.assert_called_once(); self.assess.assert_not_called()
+        self.session.read_resume.reset_mock()
+        self.snapshot['received_resume_message_id'] = '790'
         self.service.control(self.cid, False, False)
         self.service.store.save_position(self.pid, '测试岗位', '职责', 'human', False)
         self.service.sync(); self.session.read_resume.assert_not_called()

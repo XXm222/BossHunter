@@ -4,6 +4,15 @@ import { PublishedJobs, PublishedJobsState } from './PublishedJobs'
 const data: PublishedJobsState = { jobs: [{ id: 'boss-one', platform_id: 'one', title: '开放岗位', status: '开放中', details: ['金华', '7-12K'], selected: 0 }, { id: 'boss-two', platform_id: 'two', title: '关闭岗位', status: '已关闭', details: [], selected: 0 }], sync: { attempted_at: '2026-01-01', synced_at: '2026-01-01' }, budget: { mode: 'platform', limit: 100 }, daily: { sent: 0, attempted: 0, date: '2026-01-01', platform_remaining: null, custom_remaining: null }, selected_count: 0, running: false, blockers: ['请先勾选岗位'] }
 afterEach(cleanup)
 describe('published employer jobs', () => {
+  it('distinguishes saved scope from an unsaved change without claiming execution is unavailable', () => {
+    const value = { ...data, jobs: data.jobs.map(j => ({ ...j, selected: j.id === 'boss-one' ? 1 : 0 })) }
+    render(<PublishedJobs data={value} act={vi.fn(async () => true)} busy={false} />)
+    fireEvent.click(screen.getByRole('button', { name: '查看开放岗位详情' }))
+    expect(screen.getByText(/已保存到自动处理范围/)).toBeTruthy()
+    expect(screen.queryByText(/自动执行仍待接通/)).toBeNull()
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择开放岗位' }))
+    expect(screen.getByText(/岗位选择有未保存修改/)).toBeTruthy()
+  })
   it('requires explicit selection and saves only selected open IDs', async () => {
     const act = vi.fn(async (_operation: string, _payload?: object, _success?: string) => true)
     render(<PublishedJobs data={data} act={act} busy={false} />)

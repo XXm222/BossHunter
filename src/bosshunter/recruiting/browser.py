@@ -5,8 +5,11 @@ explicit action with a current conversation check. Invitation submission does
 not exist in this adapter.
 """
 import json
+import re
 import time
-from urllib.parse import urlsplit
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit, parse_qs
 from bosshunter.browser.client import RuntimeClient
 from bosshunter.browser.runtime import ensure_runtime
 from .policy import check_reply
@@ -14,6 +17,38 @@ from .policy import check_reply
 
 class BrowserError(RuntimeError):
     pass
+
+
+class TaskCancelled(BrowserError):
+    """The current task was stopped before its next operation."""
+
+
+class ConversationNotSelected(BrowserError):
+    """Sending requires the user to open the bound conversation."""
+
+
+class AccountPauseError(BrowserError):
+    """账号需要人工处理（验证码、登录失效、身份不一致），应暂停自动任务而非自动重试。"""
+    pass
+
+
+def platform_security_url(url):
+    """Known BOSS verification/restriction destinations; not a ban-code decoder."""
+    parsed = urlsplit(str(url))
+    host = parsed.hostname or ''
+    if not (host == 'zhipin.com' or host.endswith('.zhipin.com')):
+        return False
+    return (parsed.path in {'/web/passport/zp/verify.html', '/web/passport/zp/403.html'}
+            or (parsed.path in {'', '/'} and '_security_check' in parse_qs(parsed.query, keep_blank_values=True)))
+
+
+def refusal_cooldown(retry_after):
+    """At least 30 minutes; honor a longer Retry-After in either HTTP format."""
+    try:
+        extra = int(retry_after) if retry_after.isdigit() else (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
+        return max(1800, extra)
+    except (TypeError, ValueError, OverflowError):
+        return 1800
 
 
 READ_CHAT = r"""
@@ -48,6 +83,14 @@ const contacts = [...document.querySelectorAll('.geek-item')].map(item => {
     const position_title = (item.querySelector('.source-job')?.innerText || item.querySelector('.source-job')?.getAttribute('title') || '').trim();
     return {ident, name, position_title};
 }).filter(c => c.ident && c.name);
+"""
+
+
+# 把左侧联系人列表最后一个条目滚进可视区，触发懒加载下一页；返回当前已加载的条目数。
+SCROLL_CONTACT_LIST = READ_CONTACT_LIST + r"""
+const items = document.querySelectorAll('.geek-item');
+if (items.length) { items[items.length - 1].scrollIntoView(); }
+return JSON.stringify({count: items.length, contacts});
 """
 
 
@@ -106,34 +149,101 @@ class BossBrowser:
     def read_current(self):
         return self.evaluate(READ_CHAT + "return JSON.stringify(snapshot);")
 
+    def verify_account(self, ident, expected_account, on_refusal=None):
+        match = re.fullmatch(r'([1-9][0-9]*)-([01])', ident)
+        if not match or not expected_account:
+            raise AccountPauseError('发送前缺少已核实的招聘账号身份，请先绑定并同步会话')
+        gid, source = match.groups()
+        args = json.dumps({'gid': gid, 'src': source, 'account': str(expected_account)})
+        value = self.evaluate('return (async()=>{try{const expected=' + args + r""";
+            if(location.pathname!=='/web/chat/index' || document.querySelector('.geek-item.selected')?.getAttribute('data-id')!==expected.gid+'-'+expected.src)
+                return JSON.stringify({account_verified:false});
+            const params=new URLSearchParams({gid:expected.gid,src:expected.src,maxMsgId:'0',c:'1',page:'1'});
+            const response=await fetch('/wapi/zpchat/boss/historyMsg?'+params,{credentials:'same-origin',redirect:'error'});
+            if(!response.ok) return JSON.stringify({account_verified:false,refusal_status:response.status,retry_after:response.headers.get('Retry-After')||''});
+            const body=await response.json();
+            const messages=body?.zpData?.messages;
+            if(body.code!==0 || !Array.isArray(messages) || !messages.length) return JSON.stringify({account_verified:false});
+            const valid=messages.every(m=>{
+                const incoming=String(m.from?.uid)===expected.gid, outgoing=String(m.to?.uid)===expected.gid;
+                const peer=incoming?m.from:m.to, account=incoming?m.to:m.from;
+                return incoming!==outgoing && String(peer?.source)===expected.src && String(account?.uid)===expected.account;
+            });
+            return JSON.stringify({account_verified:valid});
+        }catch(e){return JSON.stringify({account_verified:false});}})();
+        """)
+        if value.get('refusal_status') in {403, 429} and on_refusal:
+            on_refusal(refusal_cooldown(value.get('retry_after', '')))
+        if value.get('account_verified') is not True:
+            raise AccountPauseError('浏览器当前招聘账号与已绑定账号不一致或无法核实，停止外发')
+
     def open_conversation(self, ident):
         # Never navigate or switch the user's selected conversation as a side effect.
         previous = self.read_current()
         if previous.get("id") != ident:
-            raise BrowserError("当前页面不是绑定会话，请在 Chrome 手动打开该会话；未切换页面")
+            raise ConversationNotSelected("当前页面不是绑定会话，请在 Chrome 手动打开该会话；未切换页面")
         time.sleep(.35)
         snapshot = self.read_current()
         if snapshot != previous:
             raise BrowserError("当前会话仍在变化，请核对后重试；未执行发送")
         return snapshot
 
-    def read_contact_list(self):
-        """读取聊天页左侧联系人列表（含岗位名）；只读，不点选、不导航、不发消息。"""
-        value = self.evaluate(READ_CONTACT_LIST + "return JSON.stringify({contacts});")
-        return value.get("contacts") if isinstance(value, dict) else []
+    def read_contact_list(self, load_all=False, before_load=None):
+        """读取聊天页左侧联系人列表（含岗位名）；只读，不点选、不导航、不发消息。
 
-    def read_position(self, expected_title):
+        load_all=True 时先反复滚动到底触发懒加载，直到没有新增联系人，再一次性读取全部；
+        联系人列表是滚动加载的，只读当前 DOM 会漏掉未加载的人。
+        """
+        collected = {}
+        reason = 'visible_dom'
+        if load_all:
+            last = -1
+            stable = 0
+            for step in range(200):
+                if before_load:
+                    before_load(step == 0)
+                value = self.evaluate(SCROLL_CONTACT_LIST)
+                for contact in value.get('contacts', []):
+                    if contact.get('ident'):
+                        collected[contact['ident']] = contact
+                count = len(collected) if collected else value.get('count', 0)
+                if count == last:
+                    stable += 1
+                    if stable >= 3:
+                        reason = 'loaded_list_stable'
+                        break
+                else:
+                    stable = 0
+                    last = count
+                time.sleep(0.8)
+            else:
+                reason = 'scroll_limit'
+        value = self.evaluate(READ_CONTACT_LIST + "return JSON.stringify({contacts});")
+        for contact in value.get('contacts', []):
+            if contact.get('ident'):
+                collected[contact['ident']] = contact
+        self.contact_coverage = {'complete': False, 'scope': 'loaded_browser_contacts',
+                                 'reason': reason, 'loaded': len(collected),
+                                 'note': '仅包含当前页面可加载的联系人，未证明覆盖全账号历史联系人'}
+        return list(collected.values())
+
+    def read_position(self, expected_title, expected_job_id):
         return self.evaluate(r"""
             if(location.hostname!=='www.zhipin.com'||location.pathname!=='/web/chat/job/edit') throw Error('请在 Chrome 职位管理中打开目标岗位；只读取，不保存平台表单');
             const f=[...document.querySelectorAll('iframe')].find(e=>new URL(e.src,location.href).pathname==='/web/frame/job/edit');
             const d=f?.contentDocument;
             const title=d?.querySelector('input[placeholder="请填写职位名称，如“销售专员”"]')?.value.trim();
             const jd=d?.querySelector('textarea')?.value.trim();
+            const urls=[new URL(location.href),new URL(f?.src || location.href,location.href)];
+            const ids=urls.flatMap(u=>['encryptJobId','jobId','jobid','id'].map(k=>u.searchParams.get(k))).filter(Boolean);
+            if(!ids.includes(EXPECTED_ID)) throw Error('当前岗位平台 ID 未能核实，停止读取 JD');
             if(title!==EXPECTED || !jd) throw Error('当前平台岗位与绑定会话不一致，已停止读取');
             return JSON.stringify({title,jd,source:'boss_job_form'});
-        """.replace("EXPECTED", json.dumps(expected_title, ensure_ascii=False)))
+        """.replace('EXPECTED_ID', json.dumps(expected_job_id)).replace("EXPECTED", json.dumps(expected_title, ensure_ascii=False)))
 
-    def execute(self, kind, before, content=""):
+    def execute(self, kind, before, content="", preflight=None):
+        if preflight:
+            preflight()
         if kind == "invitation":
             raise BrowserError("本次测试禁止发送面试邀约")
         if kind not in {"reply", "request_resume", "accept_resume"}:
@@ -162,6 +272,8 @@ class BossBrowser:
                 "if(!snapshot.editor_empty) throw Error('编辑器中有人工输入，已停止自动操作');",
                 "if(editor.innerText!==" + json.dumps(content, ensure_ascii=False) + ") throw Error('回复草稿已被修改，停止发送');",
             )
+            if preflight:
+                preflight()
             return self.evaluate(typed_guard + """
                 const send=document.querySelector('.submit-content .submit.active');
                 if(!visible(send)) throw Error('发送按钮尚未就绪；保留待核实状态');
@@ -176,6 +288,8 @@ class BossBrowser:
                 if(!visible(b)) throw Error('找不到求简历入口');
                 b.click(); return JSON.stringify({opened:true});
             """)
+            if preflight:
+                preflight()
             return self.evaluate(guard + """
                 const dialog=[...document.querySelectorAll('.exchange-tooltip')].find(e=>visible(e)&&e.innerText.includes('确定向牛人索取简历吗'));
                 const b=dialog?.querySelector('.boss-btn-primary');
