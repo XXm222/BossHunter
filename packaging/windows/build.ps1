@@ -77,6 +77,8 @@ try {
         throw 'Frontend build did not produce dist\index.html; cannot install the Python project.'
     }
     Run $BuildPython @('-m', 'pip', 'install', "${Root}[recruiting,ocr,pdf]")
+    # Native wheels must work before freezing; PE architecture alone is not enough.
+    Run $BuildPython @($Support, '--check-native')
 
     Push-Location $Root
     try {

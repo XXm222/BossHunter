@@ -252,3 +252,43 @@ class FrozenExternalProcessTests(TestCase):
             with launcher.external_dll_search():
                 self.assertEqual(launcher.external_environment({'PATH': 'original'}), {'PATH': 'original'})
             load.assert_not_called()
+
+
+class NativeBuildPreflightTests(TestCase):
+    def test_checks_pdf_and_ocr_with_the_exact_build_python_and_bounded_processes(self):
+        passed = support.subprocess.CompletedProcess([], 0, 'native check OK', '')
+        with patch.object(support.sys, 'executable', 'C:/Python With Spaces/python.exe'), patch.object(support.subprocess, 'run', return_value=passed) as run:
+            support.main(['--check-native'])
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0][:5], ['C:/Python With Spaces/python.exe', '-I', '-X', 'utf8', '-c'])
+            self.assertEqual(call.kwargs['timeout'], 120)
+            self.assertTrue(call.kwargs['capture_output'])
+
+    def test_unfrozen_dll_failure_stops_and_preserves_error_with_runtime_guidance(self):
+        failed = support.subprocess.CompletedProcess([], 1, '', 'ImportError: DLL load failed while importing _extra: missing module')
+        with patch.object(support.sys, 'platform', 'win32'), patch.object(support.subprocess, 'run', return_value=failed) as run, patch('builtins.print') as output:
+            with self.assertRaisesRegex(RuntimeError, 'UNFROZEN.*possible cause.*vc_redist.x64.exe'):
+                support.check_native_dependencies()
+        run.assert_called_once()
+        self.assertTrue(any('_extra: missing module' in str(call) for call in output.call_args_list))
+
+    def test_native_crash_reports_exit_status_without_assuming_a_missing_runtime(self):
+        crashed = support.subprocess.CompletedProcess([], -1073741795, '', '')
+        with patch.object(support.sys, 'platform', 'win32'), patch.object(support.subprocess, 'run', return_value=crashed):
+            with self.assertRaisesRegex(RuntimeError, '0xc000001d') as error:
+                support.check_native_dependencies()
+        self.assertNotIn('vc_redist', str(error.exception))
+
+    def test_ocr_failure_is_not_hidden_by_a_successful_pdf_check(self):
+        results = [support.subprocess.CompletedProcess([], 0, 'PDF OK', ''),
+                   support.subprocess.CompletedProcess([], 1, '', 'OCR model failed')]
+        with patch.object(support.subprocess, 'run', side_effect=results):
+            with self.assertRaisesRegex(RuntimeError, 'RapidOCR.*UNFROZEN'):
+                support.check_native_dependencies()
+
+    def test_timed_out_native_check_stops_with_a_clear_error(self):
+        with patch.object(support.subprocess, 'run', side_effect=support.subprocess.TimeoutExpired('python', 120)) as run:
+            with self.assertRaisesRegex(RuntimeError, 'timed out.*PyInstaller was not started'):
+                support.check_native_dependencies()
+        run.assert_called_once()

@@ -6,9 +6,10 @@
 
 1. 安装 **Python 3.12 x64**：[官方 3.12.10 x64 安装包](https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe)。文件名中的 `amd64` 就是 Intel/AMD 使用的 x64；可以与已有 Python 3.10 并存。保留 pip、Python Launcher、Tcl/Tk 组件。脚本检查 Python 版本和位数；其他版本不会直接用于构建。
 2. 安装 **Inno Setup 6.3 或更新的 6.x**：<https://jrsoftware.org/isdl.php>。
-3. 构建和测试需要联网；真机流程需要安装 **Google Chrome**。
+3. 安装或更新 **Microsoft Visual C++ v14 x64 运行库**：[微软官方下载](https://aka.ms/vc14/vc_redist.x64.exe)。Python 本身可启动，不代表 PDF/OCR 所需的 C++ DLL 齐全。Windows 11 ARM64 上运行 x64 Python 也使用此安装包。[微软说明](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+4. 构建和测试需要联网；真机流程需要安装 **Google Chrome**。
 
-只需在构建电脑安装 Python 和 Inno Setup。使用安装包的人不需要 Python、Conda、Node.js、npm 或 Inno Setup；仍需安装 Chrome。
+构建电脑需要 Python、Inno Setup 和上述运行库。使用安装包的人不需要 Python、Conda、Node.js、npm 或 Inno Setup；仍需安装 Chrome。目标电脑上的运行库依赖须通过下方的干净环境验收确认。
 
 ### UTM / Windows 11 ARM64 构建
 
@@ -26,12 +27,31 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 - 从 Node.js 官方下载 Node 22 Windows x64，并与官方 SHA-256 清单比对。
 - 使用下载包中的 npm 执行 `npm ci` 和前端生产构建。
 - 确认前端 `dist\index.html` 生成后，再安装项目及招聘、OCR、PDF 可选依赖。源码压缩包不含 dist，不能先安装项目，否则 Hatchling 会报 `Forced include not found`。
+- 打包前在构建虚拟环境中分别验证 PyMuPDF 的 PDF 创建、读取和渲染，以及 RapidOCR 的模型加载和推理；每项限时 120 秒。导入失败或原生崩溃会立即停止并保留错误，避免打包到最后才发现构建环境缺 DLL。
 - 用 `BossHunter.spec` 构建目录形式的程序，附带 Python、Node.js、前端、浏览器代理、Patchright 驱动、OCR 资源和时区数据。
 - 对生成的程序执行离线自检：模块导入、资源、Node 版本、Patchright 本地驱动启动和 OCR 模型加载。自检不启动 BOSS 浏览器，也不执行平台请求或发消息。
 
 成功产物：`dist\windows\BossHunter\BossHunter.exe`。**便携测试要复制整个 BossHunter 文件夹，不能只复制 exe。**
 
 构建日志：`.build\windows\build.log`；自检结果：`.build\windows\smoke-result.json`；自检运行日志：`.build\windows\smoke-result.log`。自检失败会显示具体错误；超过 5 分钟会停止该自检进程树并报告超时。构建失败后窗口会保留错误，修复网络或依赖问题后可以再次双击。依赖安装需要一定时间和磁盘空间；构建采用当前可解析的依赖版本，实际版本记录在构建日志中。
+
+### PyMuPDF 报 `_extra` DLL 加载失败
+
+先在项目根目录运行以下命令，无需重新安装所有依赖：
+
+```bat
+.build\windows\venv\Scripts\python.exe -c "import pymupdf; print(pymupdf.VersionBind)"
+```
+
+若这里也失败，说明未打包的环境本身有问题。PyMuPDF 官方记录过缺少 `MSVCP140.dll` 导致相同错误的情况，先安装或修复上方微软 x64 运行库，再运行该命令验证；不能仅凭此错误认定缺少的具体 DLL。[PyMuPDF 官方故障说明](https://pymupdf.readthedocs.io/en/latest/installation.html#problems-after-installation)
+
+导入成功后，可以先运行完整的原生依赖检查，成功再双击 `build.cmd`：
+
+```bat
+.build\windows\venv\Scripts\python.exe packaging\windows\build_support.py --check-native
+```
+
+如果原环境检查通过而冻结产物自检仍失败，再检查打包收集与 DLL 搜索路径；保留对应日志，不要通过跳过自检或删除 PDF/OCR 依赖来完成安装包。
 
 ## 第二步：双击 `installer.cmd`
 

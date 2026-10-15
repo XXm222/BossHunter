@@ -3,8 +3,64 @@ from pathlib import Path
 import os
 import runpy
 import struct
+import subprocess
 import sys
 import sysconfig
+
+
+VC_REDIST_URL = 'https://aka.ms/vc14/vc_redist.x64.exe'
+NATIVE_CHECKS = (
+    ('PyMuPDF PDF rendering', '''
+import pymupdf
+with pymupdf.open() as document:
+    page = document.new_page()
+    page.insert_text((72, 72), 'BossHunter native dependency check')
+    content = document.tobytes()
+with pymupdf.open(stream=content, filetype='pdf') as document:
+    if 'BossHunter' not in document[0].get_text():
+        raise RuntimeError('PDF text round-trip failed.')
+    if not document[0].get_pixmap().samples:
+        raise RuntimeError('PDF rendering failed.')
+print('PyMuPDF', pymupdf.VersionBind, 'OK')
+'''),
+    ('RapidOCR model loading and inference', '''
+import numpy as np
+from rapidocr_onnxruntime import RapidOCR
+engine = RapidOCR()
+engine(np.full((64, 128, 3), 255, dtype=np.uint8))
+print('RapidOCR model loading and inference OK')
+'''),
+)
+
+
+def check_native_dependencies():
+    """Detect broken native wheels before spending time freezing the app.
+
+    A separate process also turns native crashes into a readable build error.
+    These checks use only local libraries/models and make no platform requests.
+    """
+    for name, script in NATIVE_CHECKS:
+        print(f'Checking {name} in the build environment...', flush=True)
+        try:
+            result = subprocess.run(
+                [sys.executable, '-I', '-X', 'utf8', '-c', script],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f'{name} check timed out after 120 seconds; PyInstaller was not started.') from error
+        output = '\n'.join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+        if output:
+            print(output, flush=True)
+        if result.returncode:
+            message = (f'{name} failed in the UNFROZEN build environment '
+                       f'(exit 0x{result.returncode & 0xffffffff:08x}); PyInstaller was not started.')
+            if sys.platform == 'win32' and 'dll load failed' in output.lower():
+                message += (f' A missing/outdated Visual C++ runtime is one possible cause. '
+                            f'Install or repair the official x64 runtime: {VC_REDIST_URL} '
+                            '(also for x64 Python on Windows 11 ARM64), then rerun this check. '
+                            'If it still fails, preserve the error above for diagnosis.')
+            raise RuntimeError(message)
 
 
 def pe_machine(path):
@@ -48,6 +104,8 @@ def verify_bundle(folder):
 def main(arguments):
     if arguments == ['--probe']:
         probe_python()
+    elif arguments == ['--check-native']:
+        check_native_dependencies()
     elif len(arguments) == 2 and arguments[0] == '--verify-bundle':
         verify_bundle(arguments[1])
     elif arguments and arguments[0] == '--pyinstaller':
@@ -59,7 +117,7 @@ def main(arguments):
         sys.argv = ['pyinstaller'] + arguments[1:]
         runpy.run_module('PyInstaller', run_name='__main__')
     else:
-        raise ValueError('Expected --probe, --verify-bundle DIR or --pyinstaller ARGS.')
+        raise ValueError('Expected --probe, --check-native, --verify-bundle DIR or --pyinstaller ARGS.')
 
 
 if __name__ == '__main__':
