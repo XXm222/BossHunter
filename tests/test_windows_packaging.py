@@ -78,7 +78,7 @@ class WindowsPackagingTests(TestCase):
             controller = launcher.Controller(base)
             process, job = Mock(), Mock()
             process.poll.return_value = None
-            def fail_spawn(*args):
+            def fail_spawn(*args, **kwargs):
                 controller.processes.append(process)
                 raise RuntimeError('synthetic startup error')
             with patch.object(launcher, 'port_free', return_value=True), patch.object(launcher, 'find_chrome', return_value=Path('chrome.exe')), patch.object(launcher, 'node_path', return_value=Mock(is_file=lambda: True)), patch.object(launcher, 'WindowsJob', return_value=job), patch.object(controller, 'spawn', side_effect=fail_spawn):
@@ -87,6 +87,30 @@ class WindowsPackagingTests(TestCase):
             process.terminate.assert_called_once()
             job.close.assert_called_once()
             self.assertEqual(controller.processes, [])
+
+    def test_complete_start_waits_for_services_and_stop_releases_all_owned_children(self):
+        with TemporaryDirectory() as folder:
+            base = Path(folder)
+            (base / 'logs').mkdir()
+            controller = launcher.Controller(base)
+            job = Mock()
+            processes = [Mock() for _ in range(4)]
+            for process in processes:
+                process.poll.return_value = None
+            with patch.object(launcher, 'port_free', return_value=True), patch.object(launcher, 'find_chrome', return_value=Path('chrome.exe')), patch.object(launcher, 'node_path', return_value=Mock(is_file=lambda: True)), patch.object(launcher, 'WindowsJob', return_value=job), patch.object(launcher.subprocess, 'CREATE_NO_WINDOW', 0, create=True), patch.object(launcher.subprocess, 'Popen', side_effect=processes) as spawn, patch.object(controller, 'wait_ready') as ready, patch.object(controller.cancel, 'wait', return_value=False), patch.object(launcher, 'open_dashboard') as opened:
+                controller.start()
+                self.assertEqual(spawn.call_count, 4)
+                self.assertEqual(job.assign.call_count, 4)
+                self.assertEqual(ready.call_count, 3)
+                self.assertEqual(controller.processes, processes)
+                opened.assert_called_once()
+                controller.stop()
+            for process in processes:
+                process.terminate.assert_called_once()
+            job.close.assert_called_once()
+            self.assertEqual(controller.logs, [])
+            for call in spawn.call_args_list:
+                self.assertTrue(call.kwargs['stdout'].closed)
 
     def test_stop_handles_already_exited_children_and_is_idempotent(self):
         controller = launcher.Controller(Path('.'))
@@ -193,3 +217,38 @@ class WindowsBuildArchitectureTests(TestCase):
                 support.main(['--pyinstaller', 'BossHunter.spec'])
             self.assertEqual(os.environ['PROCESSOR_ARCHITECTURE'], 'ARM64')
             run.assert_not_called()
+
+
+class FrozenExternalProcessTests(TestCase):
+    def test_external_path_filters_only_bundle_entries_and_preserves_input(self):
+        original = {'PATH': r'C:\BossHunter\_internal;C:\BossHunter\_internal\pywin32_system32;C:\Windows\System32;D:\tools;C:\BossHunter\_internal-other',
+                    'BOSSHUNTER_NODE_PATH': r'C:\BossHunter\_internal\vendor\node\node.exe'}
+        with patch.object(launcher.sys, 'platform', 'win32'), patch.object(launcher.sys, 'frozen', True, create=True), patch.object(launcher.sys, '_MEIPASS', r'C:\BossHunter\_internal', create=True):
+            result = launcher.external_environment(original)
+        self.assertEqual(result['PATH'], r'C:\Windows\System32;D:\tools;C:\BossHunter\_internal-other')
+        self.assertEqual(result['BOSSHUNTER_NODE_PATH'], original['BOSSHUNTER_NODE_PATH'])
+        self.assertIn('pywin32_system32', original['PATH'])
+
+    def test_external_dll_directory_is_restored_even_when_start_fails(self):
+        import ctypes
+        previous = r'C:\BossHunter\_internal'
+        def get_directory(size, buffer):
+            if buffer is not None:
+                buffer.value = previous
+            return len(previous)
+        kernel = Mock()
+        kernel.GetDllDirectoryW.side_effect = get_directory
+        kernel.SetDllDirectoryW.return_value = True
+        with patch.object(launcher.sys, 'platform', 'win32'), patch.object(launcher.sys, 'frozen', True, create=True), patch.object(ctypes, 'WinDLL', return_value=kernel, create=True):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic launch failure'):
+                with launcher.external_dll_search():
+                    kernel.SetDllDirectoryW.assert_called_once_with(None)
+                    raise RuntimeError('synthetic launch failure')
+        self.assertEqual([call.args[0] for call in kernel.SetDllDirectoryW.call_args_list], [None, previous])
+
+    def test_source_execution_keeps_existing_environment_and_does_not_call_windows_api(self):
+        import ctypes
+        with patch.object(launcher.sys, 'frozen', False, create=True), patch.object(ctypes, 'WinDLL', create=True) as load:
+            with launcher.external_dll_search():
+                self.assertEqual(launcher.external_environment({'PATH': 'original'}), {'PATH': 'original'})
+            load.assert_not_called()

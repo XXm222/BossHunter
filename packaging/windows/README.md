@@ -4,7 +4,7 @@
 
 ## 构建电脑首次准备
 
-1. 安装 **Python 3.12 x64**：<https://www.python.org/downloads/windows/>。保留 pip、Python Launcher、Tcl/Tk 组件。脚本检查 Python 版本和位数；其他版本不会直接用于构建。
+1. 安装 **Python 3.12 x64**：[官方 3.12.10 x64 安装包](https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe)。文件名中的 `amd64` 就是 Intel/AMD 使用的 x64；可以与已有 Python 3.10 并存。保留 pip、Python Launcher、Tcl/Tk 组件。脚本检查 Python 版本和位数；其他版本不会直接用于构建。
 2. 安装 **Inno Setup 6.3 或更新的 6.x**：<https://jrsoftware.org/isdl.php>。
 3. 构建和测试需要联网；真机流程需要安装 **Google Chrome**。
 
@@ -31,7 +31,7 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 
 成功产物：`dist\windows\BossHunter\BossHunter.exe`。**便携测试要复制整个 BossHunter 文件夹，不能只复制 exe。**
 
-构建日志：`.build\windows\build.log`；自检结果：`.build\windows\smoke-result.json`。构建失败后窗口会保留错误，修复网络或依赖问题后可以再次双击。依赖安装需要一定时间和磁盘空间；构建采用当前可解析的依赖版本，实际版本记录在构建日志中。
+构建日志：`.build\windows\build.log`；自检结果：`.build\windows\smoke-result.json`；自检运行日志：`.build\windows\smoke-result.log`。自检失败会显示具体错误；超过 5 分钟会停止该自检进程树并报告超时。构建失败后窗口会保留错误，修复网络或依赖问题后可以再次双击。依赖安装需要一定时间和磁盘空间；构建采用当前可解析的依赖版本，实际版本记录在构建日志中。
 
 ## 第二步：双击 `installer.cmd`
 
@@ -51,7 +51,9 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 4. 在独立 Chrome 登录自己的 BOSS，在项目网页配置模型、选择岗位并确认绑定会话。首次保存模型配置后停止系统再启动，让独立 worker 读取最新配置。自动任务仍由项目内的开关控制，安装或打开启动器不会自行开启任务；已有数据中开启的任务按原项目逻辑恢复。
 5. “停止系统”或关闭启动器会停止本次启动的服务和独立 Chrome，保留登录资料及数据库；普通 Chrome 不受影响。
 
-数据位置：`%LOCALAPPDATA%\BossHunter\`，其中 `logs` 保存日志，`chrome-profile` 保存默认独立浏览器资料。安装文件位置：`%LOCALAPPDATA%\Programs\BossHunter\`。升级和卸载不删除用户数据。
+数据位置：`%LOCALAPPDATA%\BossHunter\`，其中 `logs` 保存日志，`chrome-profile` 保存默认独立浏览器资料。安装文件位置：`%LOCALAPPDATA%\Programs\BossHunter\`。升级会先清理安装目录中由 PyInstaller 管理的 `_internal` 运行库目录再复制新文件，避免旧依赖残留；升级和卸载不删除独立用户数据目录。
+
+启动 Chrome 和 Node.js 时临时清理 PyInstaller DLL 搜索目录及外部子进程 PATH 中的打包目录，随后恢复启动器自身的 DLL 搜索设置，避免将 Python 运行库传给独立程序。Web 和 worker 仍使用原打包环境。[PyInstaller 官方说明](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html#launching-external-programs-from-the-frozen-application)
 
 默认使用本机端口 8686（Web）、3456（代理）、9222（Chrome）。端口冲突会停止启动并显示原因，不会杀掉其他软件的进程。第二个启动器不会重复启动服务。启动器异常退出时，Windows Job Object 会清理其管理的进程树。
 

@@ -86,9 +86,21 @@ try {
     Run $BuildPython @($Support, '--verify-bundle', (Join-Path $Output 'BossHunter'))
     $SmokeResult = Join-Path $Work 'smoke-result.json'
     if (Test-Path $SmokeResult) { Remove-Item -LiteralPath $SmokeResult }
-    $Process = Start-Process -FilePath $Exe -ArgumentList @('--smoke-test', ('"' + $SmokeResult + '"')) -Wait -PassThru
-    if ($Process.ExitCode -ne 0 -or -not (Test-Path $SmokeResult)) { throw 'Frozen application smoke test failed. Check .build\windows\smoke-result.json.' }
-    if (-not (Get-Content $SmokeResult -Raw | ConvertFrom-Json).ok) { throw 'Frozen application resources/dependencies are incomplete.' }
+    $Process = Start-Process -FilePath $Exe -ArgumentList @('--smoke-test', ('"' + $SmokeResult + '"')) -PassThru
+    $null = $Process.Handle  # Retain the handle for ExitCode on Windows PowerShell 5.1.
+    if (-not $Process.WaitForExit(300000)) {
+        # Stop only this build's self-test and its driver children.
+        & "$env:SystemRoot\System32\taskkill.exe" /PID $Process.Id /T /F | Out-Host
+        throw 'Frozen application smoke test timed out after 5 minutes. Check .build\windows\smoke-result.log.'
+    }
+    if (Test-Path $SmokeResult) {
+        $Smoke = Get-Content $SmokeResult -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $Smoke.ok) {
+            Write-Host $Smoke.error -ForegroundColor Red
+            throw 'Frozen application resources/dependencies are incomplete. See the error above.'
+        }
+    }
+    if ($Process.ExitCode -ne 0 -or -not (Test-Path $SmokeResult)) { throw 'Frozen application smoke test failed. Check .build\windows\smoke-result.log and smoke-result.json.' }
     $Version = & $BuildPython -c 'import bosshunter; print(bosshunter.__version__)'
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read application version.' }
     Run $BuildPython @('-m', 'pip', 'freeze', '--all')

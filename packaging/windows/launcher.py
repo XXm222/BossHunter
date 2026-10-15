@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import ntpath
 import os
 from pathlib import Path
 import queue
@@ -14,8 +15,65 @@ import time
 import traceback
 import urllib.request
 import webbrowser
+from contextlib import contextmanager, nullcontext
 
 APP_MUTEX = 'Local\\BossHunter.Desktop'
+_dll_lock = threading.RLock()
+
+
+def external_environment(env=None):
+    result = dict(os.environ if env is None else env)
+    if sys.platform != 'win32' or not getattr(sys, 'frozen', False):
+        return result
+    root = ntpath.normcase(ntpath.abspath(str(resource_root())))
+    paths = []
+    for entry in result.get('PATH', '').split(';'):
+        if not entry:
+            continue
+        candidate = ntpath.normcase(ntpath.abspath(entry.strip('"')))
+        try:
+            bundled = ntpath.commonpath([root, candidate]) == root
+        except ValueError:  # A different drive cannot be inside the bundle.
+            bundled = False
+        if not bundled:
+            paths.append(entry)
+    result['PATH'] = ';'.join(paths)
+    return result
+
+
+@contextmanager
+def external_dll_search():
+    """Do not pass PyInstaller's Python DLL search directory to Chrome/Node."""
+    if sys.platform != 'win32' or not getattr(sys, 'frozen', False):
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes as w
+    with _dll_lock:
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetDllDirectoryW.argtypes = [w.DWORD, w.LPWSTR]
+        kernel.GetDllDirectoryW.restype = w.DWORD
+        kernel.SetDllDirectoryW.argtypes = [w.LPCWSTR]
+        kernel.SetDllDirectoryW.restype = w.BOOL
+        size = kernel.GetDllDirectoryW(0, None)
+        previous = None
+        if size:
+            buffer = ctypes.create_unicode_buffer(size + 1)
+            if not kernel.GetDllDirectoryW(len(buffer), buffer):
+                raise ctypes.WinError(ctypes.get_last_error())
+            previous = buffer.value
+        if not kernel.SetDllDirectoryW(None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield
+        finally:
+            if not kernel.SetDllDirectoryW(previous):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+
+def open_dashboard():
+    with external_dll_search():
+        webbrowser.open('http://127.0.0.1:8686/recruiting')
 
 
 def resource_root():
@@ -147,11 +205,14 @@ class Controller:
         self.cancel = threading.Event()
         self.lock = threading.RLock()
 
-    def spawn(self, args, name, env):
+    def spawn(self, args, name, env, *, external=False):
         log = (self.base / 'logs' / (name + '.log')).open('ab')
         self.logs.append(log)
-        process = subprocess.Popen(args, cwd=self.base, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=log, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
+        with external_dll_search() if external else nullcontext():
+            process = subprocess.Popen(args, cwd=self.base,
+                                       env=external_environment(env) if external else env,
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
         self.processes.append(process)
         self.job.assign(process)
         return process
@@ -198,11 +259,11 @@ class Controller:
                 self.spawn([str(chrome), f'--remote-debugging-port={chrome_port}',
                                       '--remote-debugging-address=127.0.0.1', f'--user-data-dir={profile}',
                                       '--no-first-run', '--no-default-browser-check', 'https://www.zhipin.com/web/chat/index'],
-                           'chrome', env)
+                           'chrome', env, external=True)
                 self.wait_ready(f'http://127.0.0.1:{chrome_port}/json/version',
                                 lambda body: bool(json.loads(body).get('webSocketDebuggerUrl')))
                 script = resource_root() / 'bosshunter/browser/runtime/cdp-proxy.mjs'
-                self.spawn([str(node_path()), str(script)], 'proxy', env)
+                self.spawn([str(node_path()), str(script)], 'proxy', env, external=True)
                 self.wait_ready(f'http://127.0.0.1:{proxy_port}/health',
                                 lambda body: json.loads(body).get('runtime') == 'bosshunter')
                 self.spawn(child_command('web', config_path), 'web', env)
@@ -211,7 +272,7 @@ class Controller:
                 self.cancel.wait(1)
                 if self.cancel.is_set() or any(p.poll() is not None for p in self.processes):
                     raise RuntimeError('启动取消或后台进程退出，请查看日志。')
-                webbrowser.open('http://127.0.0.1:8686/recruiting')
+                open_dashboard()
             except Exception:
                 self.stop()
                 raise
@@ -258,8 +319,10 @@ def smoke_test(destination):
         assert (resource_root() / 'bosshunter/browser/runtime/chat-observer.mjs').is_file()
         assert (resource_root() / 'bosshunter/data/boss_cities.json').is_file()
         ZoneInfo('Asia/Shanghai')
-        version = subprocess.check_output([str(node_path()), '--version'], text=True,
-                                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).strip()
+        with external_dll_search():
+            version = subprocess.check_output([str(node_path()), '--version'], text=True,
+                                              env=external_environment(),
+                                              creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).strip()
         assert int(version.lstrip('v').split('.')[0]) >= 22
         with sync_playwright():
             pass  # Starts only the bundled local driver, not a browser.
@@ -374,7 +437,7 @@ def desktop():
     start_button.pack(side='left', padx=6)
     stop_button = ttk.Button(row, text='停止系统', command=stop, state='disabled')
     stop_button.pack(side='left', padx=6)
-    ttk.Button(row, text='打开页面', command=lambda: webbrowser.open('http://127.0.0.1:8686/recruiting')).pack(side='left', padx=6)
+    ttk.Button(row, text='打开页面', command=open_dashboard).pack(side='left', padx=6)
     ttk.Button(row, text='查看日志', command=lambda: os.startfile(base / 'logs')).pack(side='left', padx=6)
     ttk.Label(root, text='关闭启动器会停止后台服务和本次独立 Chrome；普通 Chrome 不受影响，数据保留。', wraplength=550).pack(pady=8)
     root.protocol('WM_DELETE_WINDOW', close)

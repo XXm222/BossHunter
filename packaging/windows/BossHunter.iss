@@ -39,6 +39,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 [Files]
 Source: "..\..\dist\windows\BossHunter\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+; PyInstaller owns this folder. Clear removed/renamed libraries on upgrades.
+; Runtime user data lives separately in {localappdata}\BossHunter.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Icons]
 Name: "{group}\BossHunter"; Filename: "{app}\BossHunter.exe"
 Name: "{autodesktop}\BossHunter"; Filename: "{app}\BossHunter.exe"; Tasks: desktopicon
