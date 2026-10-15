@@ -10,6 +10,14 @@
 
 只需在构建电脑安装 Python 和 Inno Setup。使用安装包的人不需要 Python、Conda、Node.js、npm 或 Inno Setup；仍需安装 Chrome。
 
+### UTM / Windows 11 ARM64 构建
+
+Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行。**仍须安装 Python 3.12 的 Windows installer (64-bit/x64)，不能安装 ARM64 版 Python。** 最终目标仍为 Intel/AMD Windows x64，并非原生 ARM64 安装包。
+
+脚本读取 Windows 系统架构与版本，允许 Windows 11 ARM64，拒绝 Windows 10 ARM64；随后检查 Python 的 PE 架构和包 ABI，确保确实是 x64。PyInstaller 在单独的已验证 x64 Python 进程中选择 x64 bootloader，构建后遍历 exe、dll、pyd 检查均为 x64，才执行离线自检并允许编译安装包。
+
+若之前用 ARM64 Python 创建过 `.build\windows\venv`，请先删除这个构建虚拟环境目录再重新构建，保留其他源码和用户数据。最终仍需在目标 AMD/Intel 电脑验收，Windows 11 ARM64 上的构建及自检不能代替目标电脑测试。
+
 ## 第一步：双击 `build.cmd`
 
 脚本会：
@@ -56,6 +64,6 @@
 - 在未安装 Python/Node/Conda 的干净 Windows 用户环境测试；构建虚拟机本身已安装 Python，不能单凭它验证所有运行时都已打入包。
 - 升级或卸载重装后，用户配置和数据仍保留。
 
-当前脚本在 macOS 上开发，Windows 专用 PowerShell、Job Object、PyInstaller Windows 产物及 Inno Setup 编译须在虚拟机实际验证。安装包暂未进行数字签名。
+当前脚本在 macOS 上开发，Windows 专用 PowerShell、Job Object、PyInstaller Windows 产物及 Inno Setup 编译须在虚拟机实际验证。Windows 11 ARM64 构建路径已加入架构检查，但尚未在 ARM64 虚拟机实测。安装包暂未进行数字签名。
 
 参考：[PyInstaller spec](https://pyinstaller.org/en/stable/spec-files.html)、[Inno Setup 命令行编译](https://jrsoftware.org/ishelp/topic_compilercmdline.htm)。

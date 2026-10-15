@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import struct
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -13,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('windows_launcher', ROOT / 'packaging/windows/launcher.py')
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
+SUPPORT_SPEC = importlib.util.spec_from_file_location('windows_build_support', ROOT / 'packaging/windows/build_support.py')
+support = importlib.util.module_from_spec(SUPPORT_SPEC)
+SUPPORT_SPEC.loader.exec_module(support)
 
 
 class WindowsPackagingTests(TestCase):
@@ -125,3 +129,67 @@ class WindowsPackagingTests(TestCase):
         self.assertNotIn(ROOT / 'config.yaml', sources)
         self.assertNotIn(ROOT / 'data', sources)
         self.assertFalse(any('__pycache__' in str(source) for source in sources))
+
+
+class WindowsBuildArchitectureTests(TestCase):
+    @staticmethod
+    def executable(path, machine):
+        content = bytearray(128)
+        content[:2] = b'MZ'
+        struct.pack_into('<I', content, 60, 80)
+        content[80:84] = b'PE\0\0'
+        struct.pack_into('<H', content, 84, machine)
+        path.write_bytes(content)
+
+    def test_accepts_x64_but_rejects_arm64_and_x86_binaries(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'python.exe'
+            self.executable(path, 0x8664)
+            support.require_x64(path)
+            for machine in (0xaa64, 0x14c):
+                self.executable(path, machine)
+                with self.assertRaisesRegex(ValueError, 'x64 required'):
+                    support.require_x64(path)
+
+    def test_invalid_executable_does_not_pass_architecture_check(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'bad.exe'
+            path.write_bytes(b'not an executable')
+            with self.assertRaisesRegex(ValueError, 'Not a Windows executable'):
+                support.pe_machine(path)
+            self.executable(path, 0x8664)
+            content = bytearray(path.read_bytes())
+            content[80:84] = b'bad!'
+            path.write_bytes(content)
+            with self.assertRaisesRegex(ValueError, 'Invalid PE header'):
+                support.pe_machine(path)
+
+    def test_bundle_rejects_mixed_architecture_native_dependency(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.executable(root / 'BossHunter.exe', 0x8664)
+            self.executable(root / 'native.pyd', 0x8664)
+            support.verify_bundle(root)
+            self.executable(root / 'node.exe', 0xaa64)
+            with self.assertRaisesRegex(ValueError, 'x64 required'):
+                support.verify_bundle(root)
+
+    def test_probe_requires_x64_package_abi(self):
+        with patch.object(support.sys, 'platform', 'win32'), patch.object(support.sys, 'version_info', (3,12)), patch.object(support, 'require_x64'), patch.object(support.sysconfig, 'get_platform', return_value='win-arm64'):
+            with self.assertRaisesRegex(ValueError, 'win-amd64'):
+                support.probe_python()
+
+    def test_pyinstaller_bootloader_override_only_after_verified_x64_python(self):
+        with patch.dict(os.environ, {'PROCESSOR_ARCHITECTURE': 'ARM64'}), patch.object(support, 'probe_python') as probe, patch.object(support.runpy, 'run_module') as run, patch.object(support.sys, 'argv', []):
+            support.main(['--pyinstaller', '--clean', 'BossHunter.spec'])
+            probe.assert_called_once()
+            self.assertEqual(os.environ['PROCESSOR_ARCHITECTURE'], 'AMD64')
+            self.assertEqual(support.sys.argv, ['pyinstaller', '--clean', 'BossHunter.spec'])
+            run.assert_called_once_with('PyInstaller', run_name='__main__')
+
+    def test_invalid_python_cannot_change_architecture_or_start_build(self):
+        with patch.dict(os.environ, {'PROCESSOR_ARCHITECTURE': 'ARM64'}), patch.object(support, 'probe_python', side_effect=ValueError('wrong Python')), patch.object(support.runpy, 'run_module') as run:
+            with self.assertRaisesRegex(ValueError, 'wrong Python'):
+                support.main(['--pyinstaller', 'BossHunter.spec'])
+            self.assertEqual(os.environ['PROCESSOR_ARCHITECTURE'], 'ARM64')
+            run.assert_not_called()

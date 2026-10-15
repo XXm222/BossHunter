@@ -9,8 +9,13 @@ try {
     # Invalidate the installer input until this build passes its smoke test.
     $VersionInclude = Join-Path $Output 'version.iss'
     if (Test-Path $VersionInclude) { Remove-Item -LiteralPath $VersionInclude }
-    if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
-        throw 'This build targets Intel/AMD Windows x64 only.'
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        throw 'A 64-bit Windows build host is required.'
+    }
+    $HostArchitecture = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').PROCESSOR_ARCHITECTURE
+    $WindowsBuild = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+    if ($HostArchitecture -eq 'ARM64' -and $WindowsBuild -lt 22000) {
+        throw 'Windows 10 ARM64 cannot run the required x64 build tools. Use Windows 11 ARM64 or an Intel/AMD Windows PC.'
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     function Run([string]$Program, [string[]]$Arguments) {
@@ -19,10 +24,10 @@ try {
     }
     # Builder prerequisites only; recipients need neither Python nor Node.js.
     $Python = $null
-    $Check = "import sys,struct,tkinter; assert sys.version_info[:2] == (3,12) and struct.calcsize('P')==8; print(sys.executable)"
+    $Support = Join-Path $PSScriptRoot 'build_support.py'
     foreach ($Candidate in @('py', 'python')) {
         if (Get-Command $Candidate -ErrorAction SilentlyContinue) {
-            $ProbeArguments = @('-c', $Check)
+            $ProbeArguments = @($Support, '--probe')
             if ($Candidate -eq 'py') { $ProbeArguments = @('-3.12') + $ProbeArguments }
             try {
                 $Found = & $Candidate @ProbeArguments 2>$null
@@ -39,6 +44,8 @@ try {
         Run $Python @('-m', 'venv', $Venv)
     }
     $BuildPython = Join-Path $Venv 'Scripts\python.exe'
+    # Reject an old ARM64/32-bit venv rather than silently shipping its ABI.
+    Run $BuildPython @($Support, '--probe')
     Run $BuildPython @('-m', 'pip', 'install', '--upgrade', 'pip')
     Run $BuildPython @('-m', 'pip', 'install', 'pyinstaller>=6.16,<7', 'tzdata', "${Root}[recruiting,ocr,pdf]")
 
@@ -56,6 +63,7 @@ try {
     Expand-Archive -LiteralPath $Archive -DestinationPath $Work -Force
     $env:PATH = "$NodeFolder;$env:PATH"
     $env:BOSSHUNTER_BUILD_NODE = $NodeFolder
+    Run (Join-Path $NodeFolder 'node.exe') @('--version')
     $Frontend = Join-Path $Root 'src\bosshunter\web\frontend'
     Push-Location $Frontend
     try {
@@ -65,9 +73,10 @@ try {
 
     Push-Location $Root
     try {
-        Run $BuildPython @('-m', 'PyInstaller', '--noconfirm', '--clean', '--distpath', $Output, '--workpath', (Join-Path $Work 'pyinstaller'), (Join-Path $PSScriptRoot 'BossHunter.spec'))
+        Run $BuildPython @($Support, '--pyinstaller', '--noconfirm', '--clean', '--distpath', $Output, '--workpath', (Join-Path $Work 'pyinstaller'), (Join-Path $PSScriptRoot 'BossHunter.spec'))
     } finally { Pop-Location }
     $Exe = Join-Path $Output 'BossHunter\BossHunter.exe'
+    Run $BuildPython @($Support, '--verify-bundle', (Join-Path $Output 'BossHunter'))
     $SmokeResult = Join-Path $Work 'smoke-result.json'
     if (Test-Path $SmokeResult) { Remove-Item -LiteralPath $SmokeResult }
     $Process = Start-Process -FilePath $Exe -ArgumentList @('--smoke-test', ('"' + $SmokeResult + '"')) -Wait -PassThru
