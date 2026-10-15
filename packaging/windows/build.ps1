@@ -49,6 +49,18 @@ try {
     Run $BuildPython @('-m', 'pip', 'install', '--upgrade', 'pip')
     Run $BuildPython @('-m', 'pip', 'install', 'pyinstaller>=6.16,<7', 'tzdata')
 
+    # Stage the release x64 CRT independently of the host Windows architecture.
+    # The x64 redistributable installer also contains ARM64 binaries; scanning
+    # the host system directories can therefore collect ARM64 DLLs on ARM64.
+    $VcManifest = Get-Content (Join-Path $PSScriptRoot 'vc-runtime.json') -Raw | ConvertFrom-Json
+    $VcArchive = Join-Path $Work ('vc-runtime-' + $VcManifest.sha256 + '.vsix')
+    if (-not (Test-Path $VcArchive) -or (Get-FileHash $VcArchive -Algorithm SHA256).Hash -ne $VcManifest.sha256) {
+        Invoke-WebRequest -UseBasicParsing $VcManifest.url -OutFile $VcArchive
+    }
+    $VcRuntime = Join-Path $Work ('vc-runtime\' + $VcManifest.version + '\x64')
+    Run $BuildPython @($Support, '--stage-vc-runtime', $VcArchive, $VcRuntime)
+    $env:BOSSHUNTER_BUILD_VC_RUNTIME = $VcRuntime
+
     # Use the official Node 22 x64 distribution and verify its SHA-256.
     $Sums = Join-Path $Work 'SHASUMS256.txt'
     Invoke-WebRequest -UseBasicParsing 'https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt' -OutFile $Sums

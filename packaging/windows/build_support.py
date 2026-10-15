@@ -1,11 +1,15 @@
 """Build ABI checks, including x64 Python running on Windows 11 ARM64."""
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import hashlib
+import json
 import os
 import runpy
 import struct
 import subprocess
 import sys
 import sysconfig
+from tempfile import TemporaryDirectory
+import zipfile
 
 
 VC_REDIST_URL = 'https://aka.ms/vc14/vc_redist.x64.exe'
@@ -81,6 +85,66 @@ def require_x64(path):
         raise ValueError(f'x64 required, PE machine is 0x{machine:04x}: {path}')
 
 
+def vc_runtime_manifest():
+    return json.loads(Path(__file__).with_name('vc-runtime.json').read_text(encoding='utf-8'))
+
+
+def stage_vc_runtime(archive, folder):
+    """Extract only the release x64 CRT from a hash-pinned Microsoft VSIX.
+
+    ARM64 Windows can expose ARM64 CRT DLLs to an emulated x64 build process.
+    Never use those host files as the runtime for an Intel/AMD distribution.
+    """
+    manifest = vc_runtime_manifest()
+    archive, folder = Path(archive), Path(folder)
+    with archive.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if digest != manifest['sha256']:
+        raise ValueError('Microsoft x64 VC runtime archive SHA-256 mismatch.')
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    # Validate every DLL before changing a previously staged runtime.
+    with TemporaryDirectory(prefix='vc-runtime-', dir=folder.parent) as temporary:
+        temporary = Path(temporary)
+        with zipfile.ZipFile(archive) as package:
+            for name in manifest['dll_names']:
+                path = temporary / name
+                path.write_bytes(package.read(manifest['member_prefix'] + name))
+                require_x64(path)
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in manifest['dll_names']:
+            (temporary / name).replace(folder / name)
+    print(f"Staged Microsoft VC runtime {manifest['version']}: {folder}")
+
+
+def vc_runtime_files(folder):
+    files = [Path(folder) / name for name in vc_runtime_manifest()['dll_names']]
+    for path in files:
+        require_x64(path)
+    return files
+
+
+def pin_vc_runtime(binaries, datas, runtime_files):
+    """Replace CRT entries selected by hooks/dependency scans before COLLECT.
+
+    Keep original destinations (including package-local copies) so an ARM64
+    DLL cannot overwrite our x64 runtime even if collected as a data file.
+    """
+    runtime = {path.name.lower(): str(path) for path in runtime_files}
+    pinned, remaining_data = [], []
+    for entries, target in ((binaries, pinned), (datas, remaining_data)):
+        for destination, source, kind in entries:
+            name = PureWindowsPath(destination).name.lower()
+            if name in runtime:
+                pinned.append((destination, runtime[name], 'BINARY'))
+            else:
+                target.append((destination, source, kind))
+    root_destinations = {destination.lower() for destination, _, _ in pinned}
+    for name, source in runtime.items():
+        if name not in root_destinations:
+            pinned.append((name, source, 'BINARY'))
+    return pinned, remaining_data
+
+
 def probe_python():
     if sys.platform != 'win32' or sys.version_info[:2] != (3, 12):
         raise ValueError('Use Windows Python 3.12 x64, not ARM64 or 32-bit Python.')
@@ -106,6 +170,8 @@ def main(arguments):
         probe_python()
     elif arguments == ['--check-native']:
         check_native_dependencies()
+    elif len(arguments) == 3 and arguments[0] == '--stage-vc-runtime':
+        stage_vc_runtime(arguments[1], arguments[2])
     elif len(arguments) == 2 and arguments[0] == '--verify-bundle':
         verify_bundle(arguments[1])
     elif arguments and arguments[0] == '--pyinstaller':
@@ -117,7 +183,7 @@ def main(arguments):
         sys.argv = ['pyinstaller'] + arguments[1:]
         runpy.run_module('PyInstaller', run_name='__main__')
     else:
-        raise ValueError('Expected --probe, --check-native, --verify-bundle DIR or --pyinstaller ARGS.')
+        raise ValueError('Expected --probe, --check-native, --stage-vc-runtime ARCHIVE DIR, --verify-bundle DIR or --pyinstaller ARGS.')
 
 
 if __name__ == '__main__':

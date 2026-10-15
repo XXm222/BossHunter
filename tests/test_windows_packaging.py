@@ -1,8 +1,10 @@
 """Portable tests for launcher safety; no Windows processes/platform traffic."""
 import importlib.util
+import hashlib
 import json
 import os
 import struct
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -139,12 +141,16 @@ class WindowsPackagingTests(TestCase):
 
     def test_spec_resource_manifest_contains_only_distribution_resources(self):
         captured = {}
-        fake_a = Mock(pure=[], scripts=[], binaries=[], datas=[])
+        fake_a = Mock(pure=[], scripts=[],
+                      binaries=[('MSVCP140.dll', 'C:/Windows/System32/msvcp140.dll', 'BINARY')],
+                      datas=[('package/msvcp140.dll', 'C:/arm64/msvcp140.dll', 'DATA')])
         def analysis(*args, **kwargs):
             captured.update(kwargs)
             return fake_a
         hook = Mock(collect_all=lambda _: ([], [], []), collect_submodules=lambda _: [], copy_metadata=lambda *a, **kw: [])
-        with TemporaryDirectory() as folder, patch.dict(os.environ, {'BOSSHUNTER_BUILD_NODE': folder}), patch.dict('sys.modules', {'PyInstaller': Mock(), 'PyInstaller.utils': Mock(), 'PyInstaller.utils.hooks': hook}):
+        with TemporaryDirectory() as folder, patch.dict(os.environ, {'BOSSHUNTER_BUILD_NODE': folder, 'BOSSHUNTER_BUILD_VC_RUNTIME': folder}), patch.dict('sys.modules', {'PyInstaller': Mock(), 'PyInstaller.utils': Mock(), 'PyInstaller.utils.hooks': hook}):
+            for name in support.vc_runtime_manifest()['dll_names']:
+                WindowsBuildArchitectureTests.executable(Path(folder) / name, 0x8664)
             namespace = {'SPECPATH': str(ROOT / 'packaging/windows'), 'Analysis': analysis,
                          'PYZ': Mock(), 'EXE': Mock(), 'COLLECT': Mock()}
             exec(compile((ROOT / 'packaging/windows/BossHunter.spec').read_text(), 'BossHunter.spec', 'exec'), namespace)
@@ -153,6 +159,11 @@ class WindowsPackagingTests(TestCase):
         self.assertNotIn(ROOT / 'config.yaml', sources)
         self.assertNotIn(ROOT / 'data', sources)
         self.assertFalse(any('__pycache__' in str(source) for source in sources))
+        runtime_binaries = [Path(source) for source, _ in captured['binaries']]
+        self.assertIn(Path(folder) / 'msvcp140.dll', runtime_binaries)
+        self.assertIn(('MSVCP140.dll', str(Path(folder) / 'msvcp140.dll'), 'BINARY'), fake_a.binaries)
+        self.assertIn(('package/msvcp140.dll', str(Path(folder) / 'msvcp140.dll'), 'BINARY'), fake_a.binaries)
+        self.assertEqual(fake_a.datas, [])
 
 
 class WindowsBuildArchitectureTests(TestCase):
@@ -292,3 +303,90 @@ class NativeBuildPreflightTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, 'timed out.*PyInstaller was not started'):
                 support.check_native_dependencies()
         run.assert_called_once()
+
+
+class X64VcRuntimeTests(TestCase):
+    def make_archive(self, root, machine=0x8664, missing=None):
+        manifest = dict(support.vc_runtime_manifest())
+        archive = root / 'runtime.vsix'
+        binary = root / 'fixture.dll'
+        WindowsBuildArchitectureTests.executable(binary, machine)
+        with zipfile.ZipFile(archive, 'w') as package:
+            for name in manifest['dll_names']:
+                if name != missing:
+                    package.writestr(manifest['member_prefix'] + name, binary.read_bytes())
+            package.writestr('debug_nonredist/x64/msvcp140d.dll', b'must not ship')
+            package.writestr('arm64/msvcp140.dll', b'must not ship')
+        manifest['sha256'] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        return archive, manifest
+
+    def test_verified_archive_stages_only_release_x64_runtime(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive, manifest = self.make_archive(root)
+            target = root / 'staged runtime'
+            with patch.object(support, 'vc_runtime_manifest', return_value=manifest):
+                support.stage_vc_runtime(archive, target)
+                files = support.vc_runtime_files(target)
+            self.assertEqual({path.name for path in files}, set(manifest['dll_names']))
+            self.assertEqual({path.name for path in target.iterdir()}, set(manifest['dll_names']))
+
+    def test_hash_mismatch_does_not_extract_or_modify_existing_files(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive, manifest = self.make_archive(root)
+            target = root / 'staged'
+            target.mkdir()
+            (target / 'msvcp140.dll').write_bytes(b'previous runtime')
+            manifest['sha256'] = '0' * 64
+            with patch.object(support, 'vc_runtime_manifest', return_value=manifest):
+                with self.assertRaisesRegex(ValueError, 'SHA-256 mismatch'):
+                    support.stage_vc_runtime(archive, target)
+            self.assertEqual((target / 'msvcp140.dll').read_bytes(), b'previous runtime')
+
+    def test_arm64_archive_payload_cannot_replace_previous_runtime(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive, manifest = self.make_archive(root, machine=0xaa64)
+            target = root / 'staged'
+            target.mkdir()
+            (target / 'msvcp140.dll').write_bytes(b'previous runtime')
+            with patch.object(support, 'vc_runtime_manifest', return_value=manifest):
+                with self.assertRaisesRegex(ValueError, '0xaa64'):
+                    support.stage_vc_runtime(archive, target)
+            self.assertEqual((target / 'msvcp140.dll').read_bytes(), b'previous runtime')
+
+    def test_missing_payload_is_not_silently_ignored(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive, manifest = self.make_archive(root, missing='msvcp140.dll')
+            target = root / 'staged'
+            with patch.object(support, 'vc_runtime_manifest', return_value=manifest):
+                with self.assertRaises(KeyError):
+                    support.stage_vc_runtime(archive, target)
+            self.assertFalse(target.exists())
+
+    def test_hooks_cannot_overwrite_pinned_runtime_even_when_collected_as_data(self):
+        files = [Path('C:/verified/msvcp140.dll'), Path('C:/verified/vcruntime140.dll')]
+        binaries = [('MSVCP140.dll', 'C:/Windows/System32/msvcp140.dll', 'BINARY'),
+                    ('python312.dll', 'C:/Python312/python312.dll', 'BINARY')]
+        datas = [(r'package\msvcp140.dll', 'C:/arm64/msvcp140.dll', 'DATA'),
+                 ('models/model.onnx', 'C:/models/model.onnx', 'DATA')]
+        pinned, data = support.pin_vc_runtime(binaries, datas, files)
+        self.assertEqual(pinned, [
+            ('MSVCP140.dll', 'C:/verified/msvcp140.dll', 'BINARY'),
+            ('python312.dll', 'C:/Python312/python312.dll', 'BINARY'),
+            (r'package\msvcp140.dll', 'C:/verified/msvcp140.dll', 'BINARY'),
+            ('vcruntime140.dll', 'C:/verified/vcruntime140.dll', 'BINARY'),
+        ])
+        self.assertEqual(data, [('models/model.onnx', 'C:/models/model.onnx', 'DATA')])
+        self.assertEqual(binaries[0][1], 'C:/Windows/System32/msvcp140.dll')
+
+    def test_other_arm64_dependencies_still_fail_bundle_validation(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            WindowsBuildArchitectureTests.executable(root / 'BossHunter.exe', 0x8664)
+            WindowsBuildArchitectureTests.executable(root / 'msvcp140.dll', 0x8664)
+            WindowsBuildArchitectureTests.executable(root / 'other.dll', 0xaa64)
+            with self.assertRaisesRegex(ValueError, 'other.dll'):
+                support.verify_bundle(root)

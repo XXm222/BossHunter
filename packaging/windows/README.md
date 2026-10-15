@@ -9,13 +9,15 @@
 3. 安装或更新 **Microsoft Visual C++ v14 x64 运行库**：[微软官方下载](https://aka.ms/vc14/vc_redist.x64.exe)。Python 本身可启动，不代表 PDF/OCR 所需的 C++ DLL 齐全。Windows 11 ARM64 上运行 x64 Python 也使用此安装包。[微软说明](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 4. 构建和测试需要联网；真机流程需要安装 **Google Chrome**。
 
-构建电脑需要 Python、Inno Setup 和上述运行库。使用安装包的人不需要 Python、Conda、Node.js、npm 或 Inno Setup；仍需安装 Chrome。目标电脑上的运行库依赖须通过下方的干净环境验收确认。
+构建电脑需要 Python、Inno Setup 和上述运行库。使用安装包的人不需要 Python、Conda、Node.js、npm 或 Inno Setup；仍需安装 Chrome。发布目录会携带经过架构校验的独立 x64 C++ 运行库，最终仍须通过下方的干净环境验收。
 
 ### UTM / Windows 11 ARM64 构建
 
 Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行。**仍须安装 Python 3.12 的 Windows installer (64-bit/x64)，不能安装 ARM64 版 Python。** 最终目标仍为 Intel/AMD Windows x64，并非原生 ARM64 安装包。
 
 脚本读取 Windows 系统架构与版本，允许 Windows 11 ARM64，拒绝 Windows 10 ARM64；随后检查 Python 的 PE 架构和包 ABI，确保确实是 x64。PyInstaller 在单独的已验证 x64 Python 进程中选择 x64 bootloader，构建后遍历 exe、dll、pyd 检查均为 x64，才执行离线自检并允许编译安装包。
+
+微软的 x64 运行库安装包同时包含 ARM64 和 x64 文件，不能仅凭安装包名称认定宿主机中的 DLL 可用于 x64 发布。构建脚本从微软官方下载固定版本的独立 x64 CRT 组件，按 `vc-runtime.json` 校验 SHA-256，只提取 release x64 DLL，并逐个检查 PE 架构。spec 在依赖分析前显式加入这些文件，分析后再次固定所有同名 CRT 副本（包括被钩子作为 data 收集的副本），避免 ARM64 宿主机 DLL 覆盖发布文件。该步骤仅写项目构建缓存，不修改 Windows 系统目录。[微软运行库架构说明](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 若之前用 ARM64 Python 创建过 `.build\windows\venv`，请先删除这个构建虚拟环境目录再重新构建，保留其他源码和用户数据。最终仍需在目标 AMD/Intel 电脑验收，Windows 11 ARM64 上的构建及自检不能代替目标电脑测试。
 
@@ -24,6 +26,7 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 脚本会：
 
 - 在项目 `.build\windows\venv` 中创建隔离构建环境，先安装 PyInstaller 和时区数据。
+- 下载并校验固定版本的微软 x64 CRT 组件，在 `.build\windows\vc-runtime` 中准备发布运行库；已下载且 SHA-256 正确的包会复用。
 - 从 Node.js 官方下载 Node 22 Windows x64，并与官方 SHA-256 清单比对。
 - 使用下载包中的 npm 执行 `npm ci` 和前端生产构建。
 - 确认前端 `dist\index.html` 生成后，再安装项目及招聘、OCR、PDF 可选依赖。源码压缩包不含 dist，不能先安装项目，否则 Hatchling 会报 `Forced include not found`。
@@ -52,6 +55,8 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 ```
 
 如果原环境检查通过而冻结产物自检仍失败，再检查打包收集与 DLL 搜索路径；保留对应日志，不要通过跳过自检或删除 PDF/OCR 依赖来完成安装包。
+
+如果构建提示 `_internal\msvcp140.dll` 架构为 `0xaa64`，说明发布目录混入 ARM64 DLL；请更新整个 `packaging\windows` 文件夹（包含新增的 `vc-runtime.json`）再运行 `build.cmd`。已有 `.build\windows\venv` 可以保留，脚本会重新构建发布目录。不要删除架构检查，也不要把 ARM64 DLL 重命名后用于 Intel/AMD 安装包。
 
 ## 第二步：双击 `installer.cmd`
 
