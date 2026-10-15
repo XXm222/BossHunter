@@ -22,9 +22,10 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 
 脚本会：
 
-- 在项目 `.build\windows\venv` 中创建隔离构建环境并安装 PyInstaller、项目依赖及招聘、OCR、PDF 可选依赖。
+- 在项目 `.build\windows\venv` 中创建隔离构建环境，先安装 PyInstaller 和时区数据。
 - 从 Node.js 官方下载 Node 22 Windows x64，并与官方 SHA-256 清单比对。
 - 使用下载包中的 npm 执行 `npm ci` 和前端生产构建。
+- 确认前端 `dist\index.html` 生成后，再安装项目及招聘、OCR、PDF 可选依赖。源码压缩包不含 dist，不能先安装项目，否则 Hatchling 会报 `Forced include not found`。
 - 用 `BossHunter.spec` 构建目录形式的程序，附带 Python、Node.js、前端、浏览器代理、Patchright 驱动、OCR 资源和时区数据。
 - 对生成的程序执行离线自检：模块导入、资源、Node 版本、Patchright 本地驱动启动和 OCR 模型加载。自检不启动 BOSS 浏览器，也不执行平台请求或发消息。
 

@@ -47,7 +47,7 @@ try {
     # Reject an old ARM64/32-bit venv rather than silently shipping its ABI.
     Run $BuildPython @($Support, '--probe')
     Run $BuildPython @('-m', 'pip', 'install', '--upgrade', 'pip')
-    Run $BuildPython @('-m', 'pip', 'install', 'pyinstaller>=6.16,<7', 'tzdata', "${Root}[recruiting,ocr,pdf]")
+    Run $BuildPython @('-m', 'pip', 'install', 'pyinstaller>=6.16,<7', 'tzdata')
 
     # Use the official Node 22 x64 distribution and verify its SHA-256.
     $Sums = Join-Path $Work 'SHASUMS256.txt'
@@ -70,6 +70,13 @@ try {
         Run (Join-Path $NodeFolder 'npm.cmd') @('ci')
         Run (Join-Path $NodeFolder 'npm.cmd') @('run', 'build')
     } finally { Pop-Location }
+
+    # Hatchling force-includes frontend/dist even during metadata preparation.
+    # A fresh source ZIP has no dist, so install the project only AFTER npm build.
+    if (-not (Test-Path (Join-Path $Frontend 'dist\index.html'))) {
+        throw 'Frontend build did not produce dist\index.html; cannot install the Python project.'
+    }
+    Run $BuildPython @('-m', 'pip', 'install', "${Root}[recruiting,ocr,pdf]")
 
     Push-Location $Root
     try {
