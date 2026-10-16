@@ -164,6 +164,14 @@ class WindowsPackagingTests(TestCase):
         self.assertIn(('MSVCP140.dll', str(Path(folder) / 'msvcp140.dll'), 'BINARY'), fake_a.binaries)
         self.assertIn(('package/msvcp140.dll', str(Path(folder) / 'msvcp140.dll'), 'BINARY'), fake_a.binaries)
         self.assertEqual(fake_a.datas, [])
+        self.assertEqual(namespace['EXE'].call_args.kwargs['icon'], str(ROOT / 'packaging/windows/assets/BossHunter.ico'))
+
+    def test_windows_icon_and_inno_setup_icon_are_present(self):
+        icon = ROOT / 'packaging/windows/assets/BossHunter.ico'
+        self.assertTrue(icon.is_file())
+        self.assertEqual(icon.read_bytes()[:4], b'\x00\x00\x01\x00')
+        script = (ROOT / 'packaging/windows/BossHunter.iss').read_text()
+        self.assertIn(r'SetupIconFile=assets\BossHunter.ico', script)
 
 
 class WindowsBuildArchitectureTests(TestCase):

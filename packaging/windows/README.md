@@ -32,6 +32,7 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 - 确认前端 `dist\index.html` 生成后，再安装项目及招聘、OCR、PDF 可选依赖。源码压缩包不含 dist，不能先安装项目，否则 Hatchling 会报 `Forced include not found`。
 - 打包前在构建虚拟环境中分别验证 PyMuPDF 的 PDF 创建、读取和渲染，以及 RapidOCR 的模型加载和推理；每项限时 120 秒。导入失败或原生崩溃会立即停止并保留错误，避免打包到最后才发现构建环境缺 DLL。
 - 用 `BossHunter.spec` 构建目录形式的程序，附带 Python、Node.js、前端、浏览器代理、Patchright 驱动、OCR 资源和时区数据。
+- 使用项目现有 `src\bosshunter\web\frontend\public\favicon.svg` 的橙色 “BH” 设计生成 `assets\BossHunter.ico`，并应用到程序、安装程序和快捷方式图标。
 - 对生成的程序执行离线自检：模块导入、资源、Node 版本、Patchright 本地驱动启动和 OCR 模型加载。自检不启动 BOSS 浏览器，也不执行平台请求或发消息。
 
 成功产物：`dist\windows\BossHunter\BossHunter.exe`。**便携测试要复制整个 BossHunter 文件夹，不能只复制 exe。**

@@ -13,6 +13,7 @@ AppId={{91C59E64-C1B4-4A92-9658-BB7579CE5A67}
 AppName=BossHunter
 AppVersion={#MyAppVersion}
 AppPublisher=BossHunter Contributors
+SetupIconFile=assets\BossHunter.ico
 DefaultDirName={localappdata}\Programs\BossHunter
 DefaultGroupName=BossHunter
 PrivilegesRequired=lowest

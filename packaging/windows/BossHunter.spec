@@ -5,6 +5,9 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metada
 
 root = Path(SPECPATH).parents[1]
 node = Path(os.environ['BOSSHUNTER_BUILD_NODE'])
+icon = root / 'packaging/windows/assets/BossHunter.ico'
+if not icon.is_file():
+    raise FileNotFoundError(f'Windows application icon is missing: {icon}')
 support = runpy.run_path(str(root / 'packaging/windows/build_support.py'))
 vc_runtime = support['vc_runtime_files'](Path(os.environ['BOSSHUNTER_BUILD_VC_RUNTIME']))
 datas = [
@@ -41,5 +44,6 @@ a.binaries, a.datas = support['pin_vc_runtime'](a.binaries, a.datas, vc_runtime)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='BossHunter',
           debug=False, bootloader_ignore_signals=False, strip=False,
-          upx=False, console=False, disable_windowed_traceback=False)
+          upx=False, console=False, disable_windowed_traceback=False,
+          icon=str(icon))
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='BossHunter')
