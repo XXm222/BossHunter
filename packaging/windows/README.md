@@ -79,6 +79,8 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 
 “请求统计”页可修改招聘端读取间隔、分页间隔、主动招呼间隔、每岗每轮人数和 HTTP 轮询间隔。点击“保存节流参数”后会列出改动并要求确认；取消会放弃本次编辑，不写配置。确认后保存，但正在运行的进程继续使用原节流参数，页面显示“待重启生效”。当前使用手动重启：退出 BossHunter 启动器后重新打开并启动系统；源码运行时需同时停止并重启 Web 和招聘监测进程。只重启 Web 而旧 worker 仍运行时，页面继续提示待重启。
 
+Windows 登录状态读取使用同一个 Chrome 资料目录内的 `Default\Network\Cookies`（兼容旧位置 `Default\Cookies`）和 `Local State` 密钥文件，不能将独立 Chrome 的 Cookie 数据库与普通 Chrome 的密钥混用。使用者应在启动器打开的独立 Chrome 中登录；若本机读取或解密失败，页面会显示错误类型，排查时同时提供 Chrome 版本。安装包的离线自检不包含真实用户 Cookie 解密，需要在目标 Windows 电脑验证。
+
 数据位置：`%LOCALAPPDATA%\BossHunter\`，其中 `logs` 保存日志，`chrome-profile` 保存默认独立浏览器资料。安装文件位置：`%LOCALAPPDATA%\Programs\BossHunter\`。升级会先清理安装目录中由 PyInstaller 管理的 `_internal` 运行库目录再复制新文件，避免旧依赖残留；升级和卸载不删除独立用户数据目录。
 
 启动 Chrome 和 Node.js 时临时清理 PyInstaller DLL 搜索目录及外部子进程 PATH 中的打包目录，随后恢复启动器自身的 DLL 搜索设置，避免将 Python 运行库传给独立程序。Web 和 worker 仍使用原打包环境。[PyInstaller 官方说明](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html#launching-external-programs-from-the-frozen-application)

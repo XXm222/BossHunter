@@ -379,16 +379,28 @@ class LocalBossSession:
         except ImportError as exc:
             raise BrowserError('请安装招聘依赖：pip install -e ".[recruiting]"') from exc
         if self._user_data_dir:
-            root = Path(self._user_data_dir).expanduser() / 'Default'
+            user_data = Path(self._user_data_dir).expanduser()
         else:
-            root = _default_chrome_user_data_dir() / 'Default'
+            user_data = _default_chrome_user_data_dir()
+        root = user_data / 'Default'
         cookie_file = next((p for p in [root / 'Cookies', root / 'Network/Cookies'] if p.is_file()), None)
         if cookie_file is None:
             raise BrowserError('未找到 Chrome 的 BOSS 登录 Cookie；独立 Chrome 请配置 browser.recruiting_user_data_dir')
+        options = {'cookie_file': str(cookie_file), 'domain_name': '.zhipin.com'}
+        if sys.platform == 'win32':
+            # Chrome's Windows AES key belongs to this user-data directory.
+            # Without key_file browser-cookie3 searches the ordinary Chrome
+            # profile, even when cookie_file points at our independent profile.
+            key_file = user_data / 'Local State'
+            if not key_file.is_file():
+                raise AccountPauseError('未找到当前 Chrome 资料目录的 Local State 密钥文件，请在本程序启动的独立 Chrome 中完成登录')
+            options['key_file'] = str(key_file)
         try:
-            raw = browser_cookie3.chrome(cookie_file=str(cookie_file), domain_name='.zhipin.com')
-        except Exception:
-            raise AccountPauseError('无法读取 Chrome 中的 BOSS 登录状态，请检查系统凭证访问权限或关闭 Chrome 后重试') from None
+            raw = browser_cookie3.chrome(**options)
+        except Exception as exc:
+            # Do not expose raw exceptions, which can contain paths or secrets.
+            raise AccountPauseError('无法读取 Chrome 中的 BOSS 登录状态：本机 Cookie 数据库读取或解密失败'
+                                    f'（{type(exc).__name__}）。请提供此错误类型和 Chrome 版本以便排查') from None
         scoped = CookieJar()
         for cookie in raw:
             if cookie.domain.lstrip('.') in {'zhipin.com', 'www.zhipin.com'} and not cookie.is_expired():
