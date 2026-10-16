@@ -1,9 +1,13 @@
 """Portable tests for launcher safety; no Windows processes/platform traffic."""
 import importlib.util
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import struct
+import sys
+from threading import get_ident
+from types import SimpleNamespace
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,6 +26,45 @@ SUPPORT_SPEC.loader.exec_module(support)
 
 
 class WindowsPackagingTests(TestCase):
+    def test_cookie_smoke_check_uses_worker_context_without_cookie_or_shadow_reads(self):
+        events = []
+
+        @contextmanager
+        def com_context():
+            events.append(('init', get_ident()))
+            try:
+                yield
+            finally:
+                events.append(('uninit', get_ident()))
+
+        def connect():
+            self.assertEqual(events, [('init', get_ident())])
+            events.append(('wmi', get_ident()))
+            return object()
+
+        cookies = Mock()
+        wmi = SimpleNamespace(WMI=connect)
+        with patch.object(launcher.sys, 'platform', 'win32'), patch('bosshunter.recruiting.local_session._cookie_com_context', com_context), patch.dict(sys.modules, {'wmi': wmi, 'browser_cookie3': cookies}):
+            launcher.check_cookie_worker()
+        self.assertEqual([event[0] for event in events], ['init', 'wmi', 'uninit'])
+        self.assertEqual(len({thread for _, thread in events}), 1)
+        self.assertNotEqual(events[0][1], get_ident())
+        cookies.chrome.assert_not_called()
+
+    def test_cookie_smoke_check_propagates_worker_failure(self):
+        failure = RuntimeError('synthetic WMI failure')
+        wmi = Mock()
+        wmi.WMI.side_effect = failure
+        with patch.object(launcher.sys, 'platform', 'win32'), patch('bosshunter.recruiting.local_session._cookie_com_context'), patch.dict(sys.modules, {'wmi': wmi}):
+            with self.assertRaisesRegex(RuntimeError, 'COM/WMI worker check failed') as caught:
+                launcher.check_cookie_worker()
+        self.assertIs(caught.exception.__cause__, failure)
+
+    def test_cookie_smoke_check_does_not_require_windows_dependencies_on_macos(self):
+        with patch.object(launcher.sys, 'platform', 'darwin'), patch('bosshunter.recruiting.local_session._cookie_com_context') as context:
+            launcher.check_cookie_worker()
+        context.assert_not_called()
+
     def test_fresh_config_is_separate_and_preserves_recruiting_pacing(self):
         with TemporaryDirectory() as folder:
             base = Path(folder)

@@ -3,6 +3,7 @@
 No navigation, cookie export, session persistence or platform write endpoints.
 """
 from http.cookiejar import CookieJar
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -18,6 +19,34 @@ import httpx
 from .browser import AccountPauseError, BrowserError, TaskCancelled, refusal_cooldown, platform_security_url
 import html
 from bosshunter.throttle import PageThrottle
+
+
+@contextmanager
+def _cookie_com_context():
+    """Initialise COM in the thread that reads Windows Chrome cookies.
+
+    browser-cookie3's locked-database fallback uses WMI. Web request and
+    worker threads do not inherit another thread's COM initialisation.
+    """
+    if sys.platform != 'win32':
+        yield
+        return
+    import pythoncom
+    initialised = False
+    try:
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+    except pythoncom.error as exc:
+        # Another caller already selected a different apartment model. COM
+        # is usable, but this failed call must not decrement their reference.
+        if exc.hresult != -2147417850:  # RPC_E_CHANGED_MODE (0x80010106)
+            raise
+    else:
+        initialised = True
+    try:
+        yield
+    finally:
+        if initialised:
+            pythoncom.CoUninitialize()
 
 
 def _default_chrome_user_data_dir() -> Path:
@@ -374,10 +403,6 @@ class LocalBossSession:
         return f'平台消息（正文类型 {kind}，尚未解析，不作为候选人回答）', 'system', True
 
     def load_cookies(self):
-        try:
-            import browser_cookie3
-        except ImportError as exc:
-            raise BrowserError('请安装招聘依赖：pip install -e ".[recruiting]"') from exc
         if self._user_data_dir:
             user_data = Path(self._user_data_dir).expanduser()
         else:
@@ -396,7 +421,13 @@ class LocalBossSession:
                 raise AccountPauseError('未找到当前 Chrome 资料目录的 Local State 密钥文件，请在本程序启动的独立 Chrome 中完成登录')
             options['key_file'] = str(key_file)
         try:
-            raw = browser_cookie3.chrome(**options)
+            # Initialise before importing as well: Windows dependencies can
+            # access COM while loading, and imports may first occur in a worker.
+            with _cookie_com_context():
+                import browser_cookie3
+                raw = browser_cookie3.chrome(**options)
+        except ImportError as exc:
+            raise BrowserError('请安装招聘依赖：pip install -e ".[recruiting]"') from exc
         except Exception as exc:
             # Do not expose raw exceptions, which can contain paths or secrets.
             raise AccountPauseError('无法读取 Chrome 中的 BOSS 登录状态：本机 Cookie 数据库读取或解密失败'

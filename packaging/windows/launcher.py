@@ -300,6 +300,33 @@ class Controller:
             self.logs.clear()
 
 
+def check_cookie_worker():
+    """Check packaged COM/WMI access in a worker, without reading any cookies."""
+    if sys.platform != 'win32':
+        return
+    from threading import Thread
+    from bosshunter.recruiting.local_session import _cookie_com_context
+    errors = []
+
+    def check():
+        try:
+            with _cookie_com_context():
+                import browser_cookie3  # noqa: F401
+                import wmi
+                connection = wmi.WMI()  # Local service only; no shadow creation.
+                del connection  # Release COM objects before leaving the apartment.
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = Thread(target=check, daemon=True, name='cookie-com-smoke-test')
+    worker.start()
+    worker.join(timeout=30)
+    if worker.is_alive():
+        raise RuntimeError('Windows cookie COM/WMI worker check timed out.')
+    if errors:
+        raise RuntimeError('Windows cookie COM/WMI worker check failed.') from errors[0]
+
+
 def smoke_test(destination):
     """Validate frozen imports, native libraries and shipped files, offline."""
     result = {'ok': False}
@@ -307,6 +334,7 @@ def smoke_test(destination):
         from bosshunter.web.server import FRONTEND_DIR, SCHEMA_PATH
         from bosshunter.recruiting.service import RecruitingService  # noqa: F401
         import browser_cookie3  # noqa: F401
+        check_cookie_worker()
         import pymupdf  # noqa: F401
         import xhtml2pdf  # noqa: F401
         from rapidocr_onnxruntime import RapidOCR

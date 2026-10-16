@@ -1,9 +1,12 @@
 """Profile-specific Windows keys; synthetic cookies and no browser/network use."""
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from http.cookiejar import Cookie, CookieJar
 import json
 from pathlib import Path
 import sqlite3
+import sys
+from threading import Barrier, get_ident, local
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -20,7 +23,42 @@ def cookie(value='synthetic-session', domain='.zhipin.com', name='wt2'):
                   '/', True, False, None, True, None, None, {}, False)
 
 
+class ComError(Exception):
+    def __init__(self, hresult):
+        self.hresult = hresult
+
+
+class ThreadCom:
+    """Model COM apartment ownership separately for each calling thread."""
+    COINIT_APARTMENTTHREADED = 2
+    error = ComError
+
+    def __init__(self):
+        self.state = local()
+        self.calls = []
+        self.failure = None
+
+    def CoInitializeEx(self, model):
+        self.calls.append(('init', get_ident()))
+        if self.failure is not None:
+            raise ComError(self.failure)
+        if getattr(self.state, 'depth', 0) and self.state.model != model:
+            raise ComError(-2147417850)
+        self.state.model = model
+        self.state.depth = getattr(self.state, 'depth', 0) + 1
+
+    def CoUninitialize(self):
+        self.calls.append(('uninit', get_ident()))
+        self.state.depth -= 1
+
+
 class CookieProfileTests(TestCase):
+    def setUp(self):
+        self.com = ThreadCom()
+        self.com_modules = patch.dict(sys.modules, {'pythoncom': self.com})
+        self.com_modules.start()
+        self.addCleanup(self.com_modules.stop)
+
     def profile(self, root, key, network=True):
         root.mkdir(parents=True, exist_ok=True)
         (root / 'Local State').write_text(json.dumps({'os_crypt': {
@@ -87,6 +125,7 @@ class CookieProfileTests(TestCase):
                 actual = LocalBossSession(user_data_dir=str(root)).load_cookies()
             load.assert_called_once_with(cookie_file=str(database), domain_name='.zhipin.com')
             self.assertEqual([item.value for item in actual], ['synthetic-session'])
+            self.assertEqual(self.com.calls, [])
 
     def test_failed_decryption_reports_safe_error_type_without_secret_exception_text(self):
         with TemporaryDirectory() as folder:
@@ -98,3 +137,83 @@ class CookieProfileTests(TestCase):
             self.assertIn('ValueError', str(caught.exception))
             self.assertNotIn('synthetic-secret-cookie-value', str(caught.exception))
             self.assertNotIn('关闭 Chrome', str(caught.exception))
+            self.assertEqual(self.com.state.depth, 0)
+            self.assertEqual([call[0] for call in self.com.calls], ['init', 'uninit'])
+
+    def test_each_concurrent_cookie_reader_initialises_and_releases_its_own_thread(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.profile(root, b'S' * 32)
+            barrier = Barrier(2)
+
+            def load(**options):
+                self.assertEqual(self.com.state.depth, 1)
+                barrier.wait(timeout=5)
+                jar = CookieJar()
+                jar.set_cookie(cookie())
+                return jar
+
+            def read():
+                result = LocalBossSession(user_data_dir=str(root)).load_cookies()
+                self.assertEqual(self.com.state.depth, 0)
+                return [item.value for item in result]
+
+            with patch('bosshunter.recruiting.local_session.sys.platform', 'win32'), patch.object(browser_cookie3, 'chrome', side_effect=load):
+                with ThreadPoolExecutor(max_workers=2) as workers:
+                    results = [workers.submit(read) for _ in range(2)]
+                    self.assertEqual([result.result(timeout=10) for result in results],
+                                     [['synthetic-session'], ['synthetic-session']])
+            initialised = [thread for action, thread in self.com.calls if action == 'init']
+            released = [thread for action, thread in self.com.calls if action == 'uninit']
+            self.assertEqual(len(set(initialised)), 2)
+            self.assertCountEqual(initialised, released)
+            self.assertNotIn(get_ident(), initialised)
+
+    def test_existing_apartment_keeps_its_original_com_reference(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.profile(root, b'S' * 32)
+            jar = CookieJar()
+            jar.set_cookie(cookie())
+            for model in (0, self.com.COINIT_APARTMENTTHREADED):
+                with self.subTest(model=model):
+                    self.com.calls.clear()
+                    self.com.state.model = model
+                    self.com.state.depth = 1
+                    with patch('bosshunter.recruiting.local_session.sys.platform', 'win32'), patch.object(browser_cookie3, 'chrome', return_value=jar):
+                        LocalBossSession(user_data_dir=str(root)).load_cookies()
+                    self.assertEqual(self.com.state.depth, 1)
+                    self.assertEqual(self.com.state.model, model)
+                    expected = ['init'] if model == 0 else ['init', 'uninit']
+                    self.assertEqual([call[0] for call in self.com.calls], expected)
+
+    def test_com_initialisation_failure_stops_before_loading_and_does_not_release(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.profile(root, b'S' * 32)
+            self.com.failure = -2147024882  # E_OUTOFMEMORY, not an existing apartment.
+            with patch('bosshunter.recruiting.local_session.sys.platform', 'win32'), patch.object(browser_cookie3, 'chrome') as load:
+                with self.assertRaisesRegex(AccountPauseError, 'ComError'):
+                    LocalBossSession(user_data_dir=str(root)).load_cookies()
+            load.assert_not_called()
+            self.assertEqual([call[0] for call in self.com.calls], ['init'])
+
+    def test_com_is_ready_before_browser_cookie_dependency_import(self):
+        import builtins
+        original_import = builtins.__import__
+        imported = []
+
+        def import_checked(name, *args, **kwargs):
+            if name == 'browser_cookie3':
+                self.assertEqual(self.com.state.depth, 1)
+                imported.append(name)
+            return original_import(name, *args, **kwargs)
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.profile(root, b'S' * 32)
+            jar = CookieJar()
+            jar.set_cookie(cookie())
+            with patch('bosshunter.recruiting.local_session.sys.platform', 'win32'), patch.object(browser_cookie3, 'chrome', return_value=jar), patch('builtins.__import__', side_effect=import_checked):
+                LocalBossSession(user_data_dir=str(root)).load_cookies()
+            self.assertEqual(imported, ['browser_cookie3'])
