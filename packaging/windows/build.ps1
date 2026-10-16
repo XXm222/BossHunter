@@ -72,6 +72,8 @@ try {
     }
     if ((Get-FileHash $Archive -Algorithm SHA256).Hash -ne $Match.Groups[1].Value) { throw 'Node archive SHA-256 mismatch.' }
     $NodeFolder = Join-Path $Work ([IO.Path]::GetFileNameWithoutExtension($Archive))
+    # Deep npm paths can exceed MAX_PATH even if CHANGELOG.md itself is short.
+    Run $BuildPython @($Support, '--check-node-archive', $Archive, $Work)
     Expand-Archive -LiteralPath $Archive -DestinationPath $Work -Force
     $env:PATH = "$NodeFolder;$env:PATH"
     $env:BOSSHUNTER_BUILD_NODE = $NodeFolder

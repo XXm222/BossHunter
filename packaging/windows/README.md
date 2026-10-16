@@ -2,6 +2,8 @@
 
 目标：Windows 10/11、Intel/AMD 64 位。请把整个项目复制到 Windows 虚拟机的本地磁盘目录（例如 `C:\BossHunter`），不要只复制本文件夹。源码路径支持空格，建议避免虚拟机共享盘和过长路径。
 
+解压 GitHub 源码 ZIP 时，不要保留两层带提交编号的长文件夹。请让 `C:\BossHunter\pyproject.toml` 和 `C:\BossHunter\packaging\windows\build.cmd` 直接存在。Node 的 npm 目录层级较深，Windows PowerShell 5.1 解压时可能超过路径限制；脚本会先检查 ZIP 中的实际路径长度，再解压。
+
 ## 构建电脑首次准备
 
 1. 安装 **Python 3.12 x64**：[官方 3.12.10 x64 安装包](https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe)。文件名中的 `amd64` 就是 Intel/AMD 使用的 x64；可以与已有 Python 3.10 并存。保留 pip、Python Launcher、Tcl/Tk 组件。脚本检查 Python 版本和位数；其他版本不会直接用于构建。
@@ -38,6 +40,8 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 成功产物：`dist\windows\BossHunter\BossHunter.exe`。**便携测试要复制整个 BossHunter 文件夹，不能只复制 exe。**
 
 构建日志：`.build\windows\build.log`；自检结果：`.build\windows\smoke-result.json`；自检运行日志：`.build\windows\smoke-result.log`。自检失败会显示具体错误；超过 5 分钟会停止该自检进程树并报告超时。构建失败后窗口会保留错误，修复网络或依赖问题后可以再次双击。依赖安装需要一定时间和磁盘空间；构建采用当前可解析的依赖版本，实际版本记录在构建日志中。
+
+若 Node 解压时报 `CHANGELOG.md` 路径不存在或提示 ZIP 路径过长，请将完整源码重新解压到 `C:\BossHunter` 后构建。该顶层文件名不一定是最早失败的位置，应检查 ZIP 内深层 npm 文件的完整路径。更换源码目录时不要直接搬用旧 `.build\windows\venv`：Python 虚拟环境含绝对路径，应在新位置重新创建；无需重新安装系统 Python、C++ 运行库或 Inno Setup。[Windows 路径限制](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)、[Python 虚拟环境可移植性说明](https://docs.python.org/3/library/venv.html#how-venvs-work)
 
 ### PyMuPDF 报 `_extra` DLL 加载失败
 

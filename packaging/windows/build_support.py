@@ -1,5 +1,5 @@
 """Build ABI checks, including x64 Python running on Windows 11 ARM64."""
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import hashlib
 import json
 import os
@@ -155,6 +155,38 @@ def probe_python():
     print(sys.executable)
 
 
+def check_node_archive(archive, destination):
+    """Check actual ZIP members against PowerShell 5.1's legacy path limits.
+
+    Check every member, including deeply nested npm files, instead of relying
+    on the one filename reported by an extraction error. Inspect before
+    extraction so this check cannot leave a half-unpacked cache.
+    """
+    destination = PureWindowsPath(str(destination))
+    with zipfile.ZipFile(archive) as package:
+        members = package.infolist()
+    if not members:
+        raise ValueError('Node archive is empty.')
+    longest = 0
+    exceeds_limit = False
+    for member in members:
+        path = destination.joinpath(*PurePosixPath(member.filename).parts)
+        units = len(str(path).encode('utf-16-le')) // 2
+        parent_units = len(str(path.parent).encode('utf-16-le')) // 2
+        longest = max(longest, units)
+        if units >= (248 if member.is_dir() else 260) or parent_units >= 248:
+            exceeds_limit = True
+    if exceeds_limit:
+        raise ValueError(
+            f'Node ZIP paths are too long for Windows PowerShell 5.1 '
+            f'(longest: {longest} UTF-16 characters). '
+            r'Re-extract the complete project to C:\BossHunter without nested '
+            r'archive-name folders, then run packaging\windows\build.cmd. '
+            r'Do not move or reuse the old .build\windows\venv; rebuild it at the new location.'
+        )
+    print(f'Node ZIP path check passed (longest: {longest} UTF-16 characters).')
+
+
 def verify_bundle(folder):
     files = [path for path in Path(folder).rglob('*')
              if path.is_file() and path.suffix.lower() in {'.exe', '.dll', '.pyd'}]
@@ -172,6 +204,8 @@ def main(arguments):
         check_native_dependencies()
     elif len(arguments) == 3 and arguments[0] == '--stage-vc-runtime':
         stage_vc_runtime(arguments[1], arguments[2])
+    elif len(arguments) == 3 and arguments[0] == '--check-node-archive':
+        check_node_archive(arguments[1], arguments[2])
     elif len(arguments) == 2 and arguments[0] == '--verify-bundle':
         verify_bundle(arguments[1])
     elif arguments and arguments[0] == '--pyinstaller':
@@ -183,7 +217,7 @@ def main(arguments):
         sys.argv = ['pyinstaller'] + arguments[1:]
         runpy.run_module('PyInstaller', run_name='__main__')
     else:
-        raise ValueError('Expected --probe, --check-native, --stage-vc-runtime ARCHIVE DIR, --verify-bundle DIR or --pyinstaller ARGS.')
+        raise ValueError('Expected --probe, --check-native, --stage-vc-runtime ARCHIVE DIR, --check-node-archive ARCHIVE DIR, --verify-bundle DIR or --pyinstaller ARGS.')
 
 
 if __name__ == '__main__':

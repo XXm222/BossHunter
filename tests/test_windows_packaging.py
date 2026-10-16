@@ -238,6 +238,46 @@ class WindowsBuildArchitectureTests(TestCase):
             run.assert_not_called()
 
 
+class NodeArchivePathTests(TestCase):
+    def archive(self, folder, members):
+        path = Path(folder) / 'node.zip'
+        with zipfile.ZipFile(path, 'w') as package:
+            for member in members:
+                package.writestr(member, 'synthetic file')
+        return path
+
+    def test_real_node_member_fails_at_nested_commit_root_but_fits_short_root(self):
+        member = 'node-v22.23.3-win-x64/node_modules/npm/node_modules/@npmcli/metavuln-calculator/node_modules/pacote/lib/util/tar-create-options.js'
+        root = 'C:\\Users\\test\\Desktop\\' + ('BossHunter-' + 'a' * 40 + '\\') * 2 + '.build\\windows'
+        with TemporaryDirectory() as folder:
+            archive = self.archive(folder, [member])
+            with self.assertRaisesRegex(ValueError, r'271.*C:\\BossHunter'):
+                support.check_node_archive(archive, root)
+            support.check_node_archive(archive, r'C:\BossHunter\.build\windows')
+
+    def test_short_changelog_does_not_hide_a_deeper_path_failure(self):
+        with TemporaryDirectory() as folder:
+            archive = self.archive(folder, ['node/CHANGELOG.md', 'node/' + 'nested/' * 35 + 'file.js'])
+            with self.assertRaisesRegex(ValueError, 'Node ZIP paths are too long'):
+                support.check_node_archive(archive, r'C:\BossHunter\.build\windows')
+            self.assertEqual(list(Path(folder).iterdir()), [archive])
+
+    def test_windows_path_lengths_count_utf16_units_and_directory_limits(self):
+        with TemporaryDirectory() as folder:
+            archive = self.archive(folder, ['node/' + 'x' * 200 + '.js'])
+            with self.assertRaises(ValueError):
+                support.check_node_archive(archive, 'C:\\' + '\U0001f600' * 30)
+            archive = self.archive(folder, ['node/' + 'x' * 240 + '/'])
+            with self.assertRaises(ValueError):
+                support.check_node_archive(archive, r'C:\build')
+
+    def test_empty_archive_fails_before_extraction(self):
+        with TemporaryDirectory() as folder:
+            archive = self.archive(folder, [])
+            with self.assertRaisesRegex(ValueError, 'empty'):
+                support.check_node_archive(archive, r'C:\build')
+
+
 class FrozenExternalProcessTests(TestCase):
     def test_external_path_filters_only_bundle_entries_and_preserves_input(self):
         original = {'PATH': r'C:\BossHunter\_internal;C:\BossHunter\_internal\pywin32_system32;C:\Windows\System32;D:\tools;C:\BossHunter\_internal-other',
