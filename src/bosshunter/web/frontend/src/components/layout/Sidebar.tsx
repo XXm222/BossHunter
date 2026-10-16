@@ -9,6 +9,7 @@ const main: { to: string; icon: RecruitIconName; label: string; end?: boolean }[
   { to: '/recruiting/company', icon: 'company', label: '公司说明' },
 ]
 const settings: typeof main = [
+  { to: '/recruiting/requests', icon: 'meter', label: '请求统计' },
   { to: '/recruiting/monitor', icon: 'record', label: '运行记录' },
   { to: '/recruiting/settings', icon: 'settings', label: '模型设置' },
 ]

@@ -1,0 +1,12 @@
+{
+  "version": "14.50.35719",
+  "url": "https://download.visualstudio.microsoft.com/download/pr/a424e95b-20f6-4af6-844f-9d9a806080a7/a4ab48822362df6e478eb4ed33bf825a07a6faacd6879c1e3d59929cd38b984b/Microsoft.VC.14.50.18.0.CRT.Redist.X64.base.vsix",
+  "sha256": "a4ab48822362df6e478eb4ed33bf825a07a6faacd6879c1e3d59929cd38b984b",
+  "member_prefix": "Contents/VC/Redist/MSVC/14.50.35710/x64/Microsoft.VC145.CRT/",
+  "dll_names": [
+    "concrt140.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+    "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "vccorlib140.dll",
+    "vcruntime140.dll", "vcruntime140_1.dll", "vcruntime140_threads.dll"
+  ],
+  "license": "https://visualstudio.microsoft.com/license-terms/vs2026-ga-visualcpp-v14-redist-runtime/"
+}

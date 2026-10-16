@@ -2466,6 +2466,33 @@ def api_history_resume_dismiss(history_id):
 
 # ─── Config APIs ─────────────────────────────────────────
 
+pacing_config_lock = Lock()
+
+@app.post("/api/recruiting/pacing")
+def api_recruiting_pacing_post():
+	from bosshunter.recruiting.pacing import pacing_values, validate_pacing
+	if request.content_type.split(';')[0] != 'application/json':
+		return _json_response({'error': '只接受 JSON 请求'}, 415)
+	if request.content_length > 10000:
+		return _json_response({'error': '请求过大'}, 413)
+	try:
+		payload = request.json
+		if not isinstance(payload, dict) or payload.get('confirmed') is not True:
+			return _json_response({'error': '请先确认保存参数并手动重启程序'}, 400)
+		values = validate_pacing(payload.get('values'))
+		with pacing_config_lock:
+			config = load_config(CONFIG_PATH)
+			if payload.get('expected') != pacing_values(config):
+				return _json_response({'error': '节流参数已被其他页面修改，请刷新后重新核对'}, 409)
+			config['recruiting'] = {**(config.get('recruiting') or {}), **values}
+			_write_config(config)
+		return _json_response({'ok': True, 'restart_required': True, 'restart_mode': 'manual'})
+	except (TypeError, ValueError) as exc:
+		return _json_response({'error': str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({'error': f'保存失败：{exc}'}, 500)
+
+
 @app.route("/api/config")
 def api_config_get():
 	try:

@@ -6,16 +6,17 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from wsgiref.util import setup_testing_defaults
 
 from bosshunter.recruiting import agent
 from bosshunter.recruiting.browser import BossBrowser, BrowserError
 from bosshunter.recruiting.service import RecruitingService
+from recruiting_fixtures import authorize
 
 
 def sample():
-    return {"id": "sample-1", "name": "测试候选人", "position_title": "测试岗位",
+    return {"id": "sample-1", "name": "测试候选人", "position_title": "测试岗位", "position_platform_id": "test-job",
             "messages": [{"direction": "in", "kind": "text", "text": "请问工作时间？", "time": "10:00"}],
             "editor_empty": True, "coverage": "test", "stable_message_ids": False}
 
@@ -43,11 +44,39 @@ class FakeBrowser:
             self.snapshot["messages"].append({"direction": "out", "kind": "text", "text": content, "time": ""})
 
 
+class FakeLocalSession:
+    """模拟本地 HTTP 会话读取：返回 HTTP 结构快照（消息带 id/timestamp）。"""
+
+    def __init__(self, snapshot, friend_jobs=None):
+        self.snapshot = snapshot
+        self.friend_jobs = friend_jobs or {}
+        self.return_none_on_since = False
+
+    def read_conversation(self, ident, name, position_title, expected_account=None,
+                          *, include_attachments=False, throttle=True, since_mid=None):
+        if since_mid is not None and self.return_none_on_since:
+            return None
+        return deepcopy(self.snapshot)
+
+    def read_friend_jobs(self, uids):
+        return {str(u): self.friend_jobs[str(u)] for u in uids if str(u) in self.friend_jobs}
+
+    def set_stop_event(self, stop_event):
+        pass
+
+
+def http_msg(mid, direction, kind, text):
+    """HTTP 接口读到的消息结构，与浏览器 DOM 快照（无 id/timestamp）不同。"""
+    return {"id": str(mid), "direction": direction, "kind": kind, "text": text,
+            "timestamp": 1700000000 + mid, "time": "10:00"}
+
+
 class RecruitingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.browser = FakeBrowser()
         self.service = RecruitingService(Path(self.temp.name) / "recruiting.db", lambda: {}, self.browser)
+        authorize(self.service)
         self.c = self.service.import_current()
         self.cid = self.c["id"]
 
@@ -100,13 +129,120 @@ class RecruitingTests(unittest.TestCase):
         self.assertEqual(self.service.execute(other["id"])["status"], "sent")
         self.assertEqual(self.browser.calls, 2)
 
-    def test_daily_reply_quota(self):
+    def _local_mode_service(self, http_snapshot):
+        """本地模式服务：HTTP 读取走 FakeLocalSession，发送走 FakeBrowser。"""
+        browser = FakeBrowser()
+        browser.snapshot = {
+            "id": http_snapshot["id"], "name": http_snapshot["name"],
+            "position_title": http_snapshot["position_title"],
+            "messages": [{"direction": m["direction"], "kind": m["kind"], "text": m["text"], "time": m.get("time", "")}
+                         for m in http_snapshot["messages"]],
+            "editor_empty": True, "coverage": "test", "stable_message_ids": False}
+        service = RecruitingService(Path(self.temp.name) / "recruiting_local.db", lambda: {},
+                                    browser, local_session=FakeLocalSession(http_snapshot))
+        service.store.import_conversation(http_snapshot)
+        return service, browser
+
+    def test_local_mode_send_succeeds_despite_schema_difference(self):
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                    "messages": [http_msg(1, "in", "text", "请问工作时间？")],
+                    "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        service, browser = self._local_mode_service(snapshot)
+        draft = service.prepare_reply("123-0", "工作时间是 9-6")
+        self.assertEqual(service.execute(draft["id"])["status"], "sent")
+        self.assertEqual(browser.calls, 1)
+
+    def test_local_mode_send_blocked_on_new_message(self):
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                    "messages": [http_msg(1, "in", "text", "请问工作时间？")],
+                    "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        service, browser = self._local_mode_service(snapshot)
+        draft = service.prepare_reply("123-0", "你好")
+        service.local_session.snapshot = {**snapshot,
+            "messages": snapshot["messages"] + [http_msg(2, "in", "text", "算了不用了")]}
+        with self.assertRaisesRegex(ValueError, "新消息"):
+            service.execute(draft["id"])
+        self.assertEqual(service.store.row("outbox", draft["id"])["status"], "expired")
+        self.assertEqual(browser.calls, 0)
+
+    def test_confirm_binding_links_platform_job_by_encrypt_job_id(self):
+        # 问题7：绑定会话时按候选人 uid 查 encryptJobId，关联到 boss-<encryptJobId>
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "电子工程师",
+                    "messages": [], "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(snapshot, friend_jobs={"123": "encryptJob123"})
+        service = RecruitingService(Path(self.temp.name) / "recruiting_bind.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        result = service.confirm_binding("123-0", "候选人", "电子工程师", "u1")
+        self.assertEqual(result["position_id"], "boss-encryptJob123")
+
+    def test_confirm_binding_falls_back_without_job_id(self):
+        snapshot = {"id": "456-0", "name": "候选人", "position_title": "电子工程师",
+                    "messages": [], "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(snapshot)  # 无 friend_jobs
+        service = RecruitingService(Path(self.temp.name) / "recruiting_bind2.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        result = service.confirm_binding("456-0", "候选人", "电子工程师", "u1")
+        self.assertTrue(result["position_id"].startswith("context-"))
+
+    def test_sync_incremental_skips_when_no_new_message(self):
+        snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                    "messages": [http_msg(1, "in", "text", "你好")],
+                    "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(snapshot)
+        local.return_none_on_since = True  # 增量读取返回 None（无新消息）
+        service = RecruitingService(Path(self.temp.name) / "recruiting_inc.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        service.store.import_conversation(snapshot)
+        before = service.store.row("conversations", "123-0")["snapshot"]
+        result = service.sync("123-0")
+        after = service.store.row("conversations", "123-0")["snapshot"]
+        self.assertEqual(before, after)  # 无新消息，快照不变
+        self.assertEqual(result["id"], "123-0")
+
+    def test_sync_appends_new_messages_without_dropping_old(self):
+        old_snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                        "messages": [http_msg(1, "in", "text", "你好"), http_msg(2, "in", "text", "第二条")],
+                        "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        local = FakeLocalSession(old_snapshot)
+        service = RecruitingService(Path(self.temp.name) / "recruiting_merge.db", lambda: {},
+                                    FakeBrowser(), local_session=local)
+        service.store.import_conversation(old_snapshot)
+        # 增量读只返回新消息（mid > 2）
+        local.snapshot = {"id": "123-0", "name": "候选人", "position_title": "测试岗位",
+                          "messages": [http_msg(3, "in", "text", "第三条")],
+                          "account_uid": "u1", "editor_empty": False, "stable_message_ids": True}
+        service.sync("123-0")
+        msgs = json.loads(service.store.row("conversations", "123-0")["snapshot"])["messages"]
+        self.assertEqual([m["id"] for m in msgs], ["1", "2", "3"])  # 旧消息保留 + 新消息追加
+
+    def test_send_channel_status_reports_availability(self):
+        runtime = Mock()
+        runtime.health.return_value = {'runtime': 'other'}
+        browser = BossBrowser(runtime=runtime)
+        service = RecruitingService(Path(self.temp.name) / "sc.db", lambda: {}, browser)
+        self.assertFalse(service.state()['send_channel']['available'])
+        # 健康：正确 Runtime + 招聘页标签存在
+        runtime.health.return_value = {'runtime': 'bosshunter', 'connected': True}
+        runtime.targets.return_value = [{'targetId': 'boss', 'url': 'https://www.zhipin.com/web/chat/index', 'type': 'page'}]
+        self.assertTrue(service.state()['send_channel']['available'])
+
+    def test_auto_reply_quota_counts_only_auto_sends(self):
         self.service.store.set_setting('auto_reply_daily_limit', 1)
-        draft = self.service.prepare_reply(self.cid, "测试回复")
-        self.assertEqual(self.service.execute(draft["id"])["status"], "sent")
-        other = self.service.prepare_reply(self.cid, "另一回复")
+        # 人工手动发送不受自动回复上限约束，也不计入自动额度
+        first = self.service.prepare_reply(self.cid, "人工回复一")
+        self.assertEqual(self.service.execute(first["id"])["status"], "sent")
+        second = self.service.prepare_reply(self.cid, "人工回复二")
+        self.assertEqual(self.service.execute(second["id"])["status"], "sent")
+        self.assertEqual(self.browser.calls, 2)
+
+    def test_auto_reply_quota_blocks_auto_send(self):
+        self.service.set_auto_send(self.cid, True)
+        self.service.store.set_setting('auto_reply_daily_limit', 1)
+        first = self.service.prepare_reply(self.cid, "自动回复一")
+        self.assertEqual(self.service.execute(first["id"], auto=True)["status"], "sent")
+        second = self.service.prepare_reply(self.cid, "自动回复二")
         with self.assertRaisesRegex(ValueError, "上限"):
-            self.service.execute(other["id"])
+            self.service.execute(second["id"], auto=True)
         self.assertEqual(self.browser.calls, 1)
 
     def test_auto_send_per_conversation_switch(self):
@@ -141,17 +277,20 @@ class RecruitingTests(unittest.TestCase):
         self.assertTrue(self.service.state()["monitor"]["running"])
         self.assertTrue(self.service.state()["worker"]["alive"])
 
-    def test_list_contacts_uses_browser(self):
-        self.browser.read_contact_list = lambda: [
-            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
-        ]
+    def test_list_contacts_reads_from_database(self):
+        # list_contacts 从已同步的 conversations 读，而不是从浏览器 DOM 读
+        self.service.store.import_conversation({
+            "id": "96429428-0", "name": "陈健", "position_title": "电子工程师",
+            "messages": [],
+        })
         result = self.service.list_contacts()
-        self.assertEqual(result, [
-            {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师", "last_ts": None},
-        ])
+        by_ident = {c["ident"]: c for c in result}
+        self.assertEqual(by_ident["96429428-0"]["name"], "陈健")
+        self.assertEqual(by_ident["96429428-0"]["position_title"], "电子工程师")
+        self.assertEqual(by_ident["96429428-0"]["last_ts"], None)
 
     def test_sync_all_contacts_imports_and_skips_existing(self):
-        self.browser.read_contact_list = lambda: [
+        self.browser.read_contact_list = lambda load_all=False: [
             {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
             {"ident": "84519593-0", "name": "李四", "position_title": "产品研发经理"},
         ]
@@ -166,8 +305,8 @@ class RecruitingTests(unittest.TestCase):
         self.assertEqual(second["imported"], 0)
         self.assertEqual(second["total"], 2)
 
-    def test_sync_all_contacts_shares_same_title_position(self):
-        self.browser.read_contact_list = lambda: [
+    def test_sync_all_contacts_keeps_same_title_positions_separate(self):
+        self.browser.read_contact_list = lambda load_all=False: [
             {"ident": "96429428-0", "name": "陈健", "position_title": "电子工程师"},
             {"ident": "84519593-0", "name": "李四", "position_title": "电子工程师"},
             {"ident": "81667022-0", "name": "王五", "position_title": "产品经理"},
@@ -176,12 +315,26 @@ class RecruitingTests(unittest.TestCase):
         a = self.service.store.row("conversations", "96429428-0")
         b = self.service.store.row("conversations", "84519593-0")
         c = self.service.store.row("conversations", "81667022-0")
-        # 同名岗位共享同一条 position
-        self.assertEqual(a["position_id"], b["position_id"])
-        # 不同岗位各一条 position
+        # 问题 7：读不到平台岗位 ID 时，同名岗位不再共用同一条 position，避免误共用 JD
+        self.assertNotEqual(a["position_id"], b["position_id"])
         self.assertNotEqual(a["position_id"], c["position_id"])
         titles = sorted(p["title"] for p in self.service.store.rows("positions") if p["title"] in {"电子工程师", "产品经理"})
-        self.assertEqual(titles, ["产品经理", "电子工程师"])
+        self.assertEqual(titles, ["产品经理", "电子工程师", "电子工程师"])
+
+    def test_import_conversation_links_by_platform_id(self):
+        # 问题 7：有平台岗位 ID 时按它关联——同名不同 ID 不共用，同 ID 共用
+        a = {"id": "a-0", "name": "甲", "position_title": "电子工程师", "position_platform_id": "job1", "messages": [], "account_uid": "u1"}
+        b = {"id": "b-0", "name": "乙", "position_title": "电子工程师", "position_platform_id": "job2", "messages": [], "account_uid": "u2"}
+        c = {"id": "c-0", "name": "丙", "position_title": "电子工程师", "position_platform_id": "job1", "messages": [], "account_uid": "u3"}
+        self.service.store.import_conversation(a)
+        self.service.store.import_conversation(b)
+        self.service.store.import_conversation(c)
+        a_row = self.service.store.row("conversations", "a-0")
+        b_row = self.service.store.row("conversations", "b-0")
+        c_row = self.service.store.row("conversations", "c-0")
+        self.assertEqual(a_row["position_id"], "boss-job1")
+        self.assertEqual(b_row["position_id"], "boss-job2")
+        self.assertEqual(a_row["position_id"], c_row["position_id"])
 
     def test_invitation_cannot_use_reply_channel(self):
         with self.assertRaises(PermissionError):
@@ -242,6 +395,8 @@ class RecruitingTests(unittest.TestCase):
     def test_restart_marks_in_flight_as_uncertain(self):
         draft = self.service.prepare_reply(self.cid, "测试")
         self.service.store.claim(draft["id"])
+        with self.service.store.db() as db:
+            db.execute("UPDATE outbox SET owner='999999999:dead' WHERE id=?", (draft['id'],))
         restarted = RecruitingService(self.service.store.path, lambda: {}, self.browser)
         self.assertEqual(restarted.store.row("outbox", draft["id"])["status"], "uncertain")
 
@@ -270,6 +425,106 @@ class RecruitingTests(unittest.TestCase):
     def test_monitor_baseline_does_not_reply_to_history(self):
         self.assertFalse(self.service.monitor_once()["changed"])
         self.assertEqual(self.service.store.rows("outbox"), [])
+
+    def test_monitor_once_round_robins_across_conversations(self):
+        # 问题 6：多个允许处理的会话，监测应按轮询游标逐个处理，而非只读当前选中
+        service = RecruitingService(Path(self.temp.name) / "monitor.db", lambda: {}, self.browser)
+        authorize(service)
+        for ident in ["a-0", "b-0", "c-0"]:
+            service.store.import_conversation({"id": ident, "name": "候选人", "position_title": "测试岗位", "position_platform_id": "test-job",
+                "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
+                "editor_empty": True, "coverage": "test", "stable_message_ids": False}, confirmed=True)
+        synced = []
+
+        def fake_sync(cid=None, **kw):
+            synced.append(cid)
+            return service.store.row("conversations", cid)
+
+        with patch.object(service, "sync", side_effect=fake_sync):
+            for _ in range(3):
+                service.monitor_once()
+        self.assertEqual(synced, ["a-0", "b-0", "c-0"])
+
+    def test_monitor_once_skips_taken_over_and_paused(self):
+        # 问题 6：接管/停止联系/岗位暂停的会话不进入自动监测
+        service = RecruitingService(Path(self.temp.name) / "monitor2.db", lambda: {}, self.browser)
+        service.store.import_conversation({"id": "a-0", "name": "甲", "position_title": "测试岗位",
+            "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
+            "editor_empty": True, "coverage": "test", "stable_message_ids": False}, confirmed=True)
+        with service.store.db() as db:
+            db.execute("UPDATE conversations SET taken_over=1 WHERE id='a-0'")
+        synced = []
+        with patch.object(service, "sync", side_effect=lambda cid=None, **kw: synced.append(cid)):
+            result = service.monitor_once()
+        self.assertEqual(synced, [])
+        self.assertFalse(result["changed"])
+
+    def test_monitor_once_stops_when_monitor_disabled(self):
+        # 问题 9：关闭监测后，worker 的 monitor_once 应中断；但手动检查一次不受约束
+        import threading
+        service = RecruitingService(Path(self.temp.name) / "monitor3.db", lambda: {}, self.browser)
+        authorize(service)
+        service.store.import_conversation({"id": "a-0", "name": "甲", "position_title": "测试岗位", "position_platform_id": "test-job",
+            "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
+            "editor_empty": True, "coverage": "test", "stable_message_ids": False}, confirmed=True)
+        service.set_monitor_enabled(False)
+        # worker 流程（设置了 stop_event）：关闭监测后应中断
+        service._stop_event = threading.Event()
+        synced = []
+        with patch.object(service, "sync", side_effect=lambda cid=None, **kw: synced.append(cid)):
+            with self.assertRaisesRegex(BrowserError, "监测已停止"):
+                service.monitor_once()
+        self.assertEqual(synced, [])
+        # 手动检查（无 stop_event）：不受监测开关约束，仍会 sync
+        service._stop_event = None
+        synced = []
+        with patch.object(service, "sync", side_effect=lambda cid=None, **kw: synced.append(cid) or service.store.row("conversations", cid)):
+            service.monitor_once()
+        self.assertEqual(synced, ["a-0"])
+
+    def test_worker_loop_pauses_on_account_error(self):
+        # B：账号验证/登录失效/身份不一致 → 关闭监测，暂停等人工，不自动重试
+        import threading, time
+        from bosshunter.recruiting.browser import AccountPauseError
+        service = RecruitingService(Path(self.temp.name) / "worker.db", lambda: {}, self.browser)
+        service.set_monitor_enabled(True)
+        stop = threading.Event()
+        with patch.object(service, "monitor_once", side_effect=AccountPauseError("需要验证")):
+            t = threading.Thread(target=service.worker_loop, args=(stop,))
+            t.start()
+            time.sleep(0.5)
+            stop.set()
+            t.join(timeout=3)
+        self.assertFalse(service.store.setting('monitor_enabled', False))
+        self.assertTrue(any('已暂停，需人工处理' in e['detail'] for e in service.store.rows('events')))
+
+    def test_state_reads_persisted_monitor_from_db(self):
+        # C：state() 应读 DB 里 worker 写入的最新成功时间/错误，而不是本进程内存
+        service = RecruitingService(Path(self.temp.name) / "s.db", lambda: {}, self.browser)
+        service.store.set_setting('monitor_state', {'last_success': '2026-10-06T10:00:00', 'error': '登录失效'})
+        service.monitor['last_success'] = '2000-01-01T00:00:00'
+        service.monitor['error'] = ''
+        state = service.state()
+        self.assertEqual(state['monitor']['last_success'], '2026-10-06T10:00:00')
+        self.assertEqual(state['monitor']['error'], '登录失效')
+
+    def test_state_monitor_status_flags(self):
+        # C：区分 running（处理中）/ paused（已暂停）/ disconnected（已断线）
+        from bosshunter.recruiting.store import now
+        service = RecruitingService(Path(self.temp.name) / "s2.db", lambda: {}, self.browser)
+        # 无心跳 → 断线
+        self.assertTrue(service.state()['monitor']['disconnected'])
+        # 有心跳 + 监测开启 → 处理中
+        service.store.set_setting('worker_heartbeat', now())
+        service.set_monitor_enabled(True)
+        state = service.state()
+        self.assertTrue(state['monitor']['running'])
+        self.assertFalse(state['monitor']['paused'])
+        # 有心跳 + 监测关闭 → 已暂停
+        service.set_monitor_enabled(False)
+        state = service.state()
+        self.assertTrue(state['monitor']['paused'])
+        self.assertFalse(state['monitor']['running'])
 
     def test_model_missing_is_not_a_fake_score(self):
         with patch.object(agent, "get_ai_api_key", return_value=None), patch.object(agent, "call_anthropic_text") as call:
@@ -327,6 +582,58 @@ class RecruitingTests(unittest.TestCase):
         self.assertFalse(context["conversation"]["history_complete"])
         self.assertEqual(json.loads(draft["refs"])["message_count"], 2)
         self.assertEqual(self.browser.calls, 0)
+
+    def test_prepare_reply_syncs_target_conversation_not_selected(self):
+        # 问题 4：当前选中 A，给 B 生成回复，两次 sync 都必须传 B 而不是默认的 A
+        b_snapshot = {"id": "sample-2", "name": "候选人B", "position_title": "测试岗位",
+                      "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
+                      "editor_empty": True, "coverage": "test", "stable_message_ids": False}
+        self.service.store.import_conversation(b_snapshot)
+        synced = []
+        with patch.object(self.service, "sync", side_effect=lambda cid=None, **kw: synced.append(cid)), \
+             patch.object(agent, "reply", return_value={"text": "你好，收到。", "basis": ["conversation"], "needs_human": False}):
+            self.service.prepare_reply("sample-2")
+        self.assertEqual(synced, ["sample-2", "sample-2"])
+
+    def test_prepare_reply_detects_change_during_generation(self):
+        # 问题 4：生成期间 B 来了新消息，第二次 sync 后应检测到变化并作废，而不是用旧上下文
+        b_snapshot = {"id": "sample-2", "name": "候选人B", "position_title": "测试岗位",
+                      "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
+                      "editor_empty": True, "coverage": "test", "stable_message_ids": False}
+        self.service.store.import_conversation(b_snapshot)
+        calls = {"n": 0}
+
+        def fake_sync(cid=None, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                new_snapshot = {**b_snapshot, "messages": b_snapshot["messages"] + [
+                    {"direction": "in", "kind": "text", "text": "在吗", "time": "10:05"}]}
+                self.service.store.import_conversation(new_snapshot)
+
+        with patch.object(self.service, "sync", side_effect=fake_sync), \
+             patch.object(agent, "reply", return_value={"text": "你好", "basis": ["conversation"], "needs_human": False}):
+            with self.assertRaisesRegex(ValueError, "发生变化"):
+                self.service.prepare_reply("sample-2")
+
+    def test_prepare_reply_concurrent_clients_sync_own_conversation(self):
+        # 遗漏 4：两个客户端（各自 service 共享 DB）并发给不同会话生成回复，互不干扰
+        import threading
+        service_a = RecruitingService(Path(self.temp.name) / "conc.db", lambda: {}, self.browser)
+        service_b = RecruitingService(Path(self.temp.name) / "conc.db", lambda: {}, self.browser)
+        for ident, name in [("a-0", "甲"), ("b-0", "乙")]:
+            service_a.store.import_conversation({"id": ident, "name": name, "position_title": "测试岗位",
+                "messages": [{"direction": "in", "kind": "text", "text": "你好", "time": "10:00"}],
+                "editor_empty": True, "coverage": "test", "stable_message_ids": False})
+        synced_a, synced_b = [], []
+        with patch.object(service_a, "sync", side_effect=lambda cid=None, **kw: synced_a.append(cid)), \
+             patch.object(service_b, "sync", side_effect=lambda cid=None, **kw: synced_b.append(cid)), \
+             patch.object(agent, "reply", return_value={"text": "你好", "basis": ["conversation"], "needs_human": False}):
+            ta = threading.Thread(target=lambda: service_a.prepare_reply("a-0"))
+            tb = threading.Thread(target=lambda: service_b.prepare_reply("b-0"))
+            ta.start(); tb.start()
+            ta.join(timeout=3); tb.join(timeout=3)
+        self.assertEqual(synced_a, ["a-0", "a-0"])
+        self.assertEqual(synced_b, ["b-0", "b-0"])
 
     def test_context_ignores_stale_assessments(self):
         doc = self.service.store.save_document(self.cid, "test", "完整资料" * 20, True, {})

@@ -1,0 +1,1 @@
+.rc-pacing{margin-top:22px}.rc-pacing-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 24px}.rc-pacing-fields>label{display:flex;flex-direction:column;gap:6px}.rc-pacing-fields .rc-caption{margin:0}.rc-pacing .rc-actions{margin-top:4px}@media(max-width:650px){.rc-pacing-fields{grid-template-columns:1fr}}

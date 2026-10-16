@@ -9,6 +9,10 @@ LIMITS = {"duties": 40, "skills": 25, "experience": 20, "requirements": 15}
 LABELS = {"duties": "核心职责", "skills": "岗位技能", "experience": "相关经验", "requirements": "必要资格"}
 
 
+class ModelOutputError(ValueError):
+    """The provider returned unusable output; require an explicit retry."""
+
+
 def parse_json(text):
     text = (text or "").strip()
     if text.startswith("```"):
@@ -16,9 +20,9 @@ def parse_json(text):
     try:
         result = json.loads(text)
     except ValueError as exc:
-        raise ValueError("模型输出不是有效 JSON，请检查模型后重试") from exc
+        raise ModelOutputError("模型输出不是有效 JSON，请检查模型后重试") from exc
     if not isinstance(result, dict):
-        raise ValueError("模型输出必须是对象")
+        raise ModelOutputError("模型输出必须是对象")
     return result
 
 
@@ -137,14 +141,14 @@ resume 是候选人资料，assessment 是岗位证据分析；缺失或不完�
     if context["assessment"]:
         available.add("assessment")
     if not isinstance(text, str) or not 1 <= len(text.strip()) <= 500:
-        raise ValueError("回复内容为空或过长")
+        raise ModelOutputError("回复内容为空或过长")
     if not isinstance(basis, list) or not basis or any(not isinstance(x, str) or x not in available for x in basis):
-        raise ValueError("回复引用了未提供的上下文来源")
+        raise ModelOutputError("回复引用了未提供的上下文来源")
     if type(result.get("needs_human")) is not bool:
-        raise ValueError("回复缺少人工处理标记")
+        raise ModelOutputError("回复缺少人工处理标记")
     missing = result.get("missing", [])
     if not isinstance(missing, list) or len(missing) > 5 or any(not isinstance(x, str) for x in missing):
-        raise ValueError("待确认问题格式无效")
+        raise ModelOutputError("待确认问题格式无效")
     if missing:
         result["needs_human"] = True
     return result

@@ -8,6 +8,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
+import { ChatObserver, securityURL } from './chat-observer.mjs';
+
+const chatObserver = new ChatObserver();
 
 const PORT = parseInt(process.env.BOSSHUNTER_BROWSER_PROXY_PORT || process.env.CDP_PROXY_PORT || '3456', 10);
 const ENABLE_PORT_GUARD = !['0', 'false', 'no'].includes(String(process.env.BOSSHUNTER_ENABLE_PORT_GUARD || 'true').toLowerCase());
@@ -180,11 +183,19 @@ async function connect() {
       chromeName = null;
       sessions.clear();
       portGuardedSessions.clear();
+      chatObserver.reset();
     };
     const onMessage = (event) => {
       const data = typeof event === 'string' ? event : (event.data || event);
       const text = typeof data === 'string' ? data : data.toString();
       const msg = JSON.parse(text);
+      chatObserver.handle(msg);
+      if (msg.method === 'Target.detachedFromTarget') {
+        chatObserver.remove(msg.params.sessionId);
+        for (const [target, session] of sessions) {
+          if (session === msg.params.sessionId) sessions.delete(target);
+        }
+      }
 
       if (msg.method === 'Target.attachedToTarget') {
         const { sessionId, targetInfo } = msg.params;
@@ -314,7 +325,25 @@ const server = http.createServer(async (req, res) => {
 
     await connect();
 
-    if (pathname === '/targets') {
+    if (pathname === '/recruiting/ws') {
+      // Observe exactly the caller's validated bound page; no navigation or new socket.
+      const targets = await sendCDP('Target.getTargets');
+      const target = targets.result?.targetInfos?.find(t => t.targetId === q.target && t.type === 'page');
+      let url;
+      try { url = new URL(target?.url); } catch {}
+      if (!url || url.origin !== 'https://www.zhipin.com' || !url.pathname.startsWith('/web/chat/')) {
+        sendJson(res, { connected: false, paused: securityURL(target?.url), reason: '绑定的 BOSS 沟通标签页不可用，使用 HTTP 轮询' });
+        return;
+      }
+      const session = await ensureSession(q.target);
+      if (!chatObserver.states.has(session)) {
+        chatObserver.state(session);
+        const network = await sendCDP('Network.enable', {}, session);
+        const page = await sendCDP('Page.enable', {}, session);
+        if (network.error || page.error) { chatObserver.remove(session); throw Error('WS observer unavailable'); }
+      }
+      sendJson(res, chatObserver.snapshot(session, Math.max(0, Number(q.after) || 0)));
+    } else if (pathname === '/targets') {
       const resp = await sendCDP('Target.getTargets');
       sendJson(res, resp.result.targetInfos.filter((target) => target.type === 'page'));
     } else if (pathname === '/new') {
