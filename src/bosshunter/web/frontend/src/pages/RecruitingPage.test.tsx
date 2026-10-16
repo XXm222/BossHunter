@@ -56,6 +56,15 @@ describe('recruiting workspace', () => {
     expect(await screen.findByText('HTTP 请求 3 次；浏览器加载及招呼动作 22 次。一次浏览器动作不等于一次 HTTP 请求。')).toBeTruthy()
     expect(screen.getByText('联系人加载动作')).toBeTruthy()
   })
+  it('places recruiting pacing settings inside request statistics', async () => {
+    seed({ ...state, request_budget: { count: 0, daily_limit: 100, remaining: 100, by_kind: {} },
+      pacing: { saved: { monitor_interval_seconds: 600 }, active: { monitor_interval_seconds: 600 },
+        fields: [{ key: 'monitor_interval_seconds', label: 'HTTP 轮询间隔', unit: '秒', min: 60 }],
+        ranges: [], restart_required: false, restart_mode: 'manual' } })
+    show('/recruiting/requests')
+    expect(await screen.findByRole('form', { name: '招聘端节流设置' })).toBeTruthy()
+    expect((screen.getByLabelText('HTTP 轮询间隔（秒）') as HTMLInputElement).value).toBe('600')
+  })
   it('does not overlap slow local state polls', async () => {
     vi.useFakeTimers()
     let release!: (value: Response) => void

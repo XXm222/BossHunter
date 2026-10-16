@@ -14,6 +14,7 @@ from .policy import check_reply
 from .jobs import RecruitingJobs
 from .local_session import LocalBossSession
 from .ws_monitor import HybridMonitor
+from .pacing import FIELDS as PACING_FIELDS, RANGES as PACING_RANGES, pacing_values
 from bosshunter.browser.client import RuntimeClient
 from bosshunter.throttle import PageThrottle
 from bosshunter.ai.credentials import get_ai_base_url, get_ai_service
@@ -28,6 +29,8 @@ class RecruitingService:
         self.store = Store(path)
         self.jobs = RecruitingJobs(self.store)
         self.config_provider = config_provider
+        # Saved pacing edits take effect only after this process restarts.
+        self._startup_pacing = pacing_values(config_provider() or {})
         self.browser = browser or BossBrowser(runtime=RuntimeClient(config_provider()),
                                               target_id=config_provider().get("browser", {}).get("recruiting_target_id"))
         cfg = self._recruiting_cfg()
@@ -55,7 +58,17 @@ class RecruitingService:
 
     def _recruiting_cfg(self):
         config = self.config_provider() or {}
-        return config.get("recruiting") or {}
+        return {**(config.get("recruiting") or {}), **self._startup_pacing}
+
+    def pacing_state(self):
+        saved = pacing_values(self.config_provider() or {})
+        worker_alive = self._worker_alive()
+        worker = self.store.setting('worker_pacing') if worker_alive else None
+        return {'saved': saved, 'active': dict(self._startup_pacing),
+                'worker_active': worker,
+                'fields': PACING_FIELDS, 'ranges': PACING_RANGES,
+                'restart_required': saved != self._startup_pacing or (worker_alive and worker != saved),
+                'restart_mode': 'manual'}
 
     def _reply_stage(self, stage, message):
         progress = getattr(self, '_reply_progress_local', None)
@@ -208,6 +221,7 @@ class RecruitingService:
                 "auto_send": {"daily_limit": s.setting('auto_reply_daily_limit', self._recruiting_cfg().get("auto_reply_daily_limit", 5)),
                               "sent_today": reply_budget['sent'], 'reserved_today': reply_budget['reserved']},
                 "request_budget": request_budget,
+                "pacing": self.pacing_state(),
                 'contact_sync': s.setting('contact_sync', {}),
                 "model_ready": bool(model_basis[1]),
                 "pilot": {"max_conversations": 20, "invitation_sending": False,
@@ -1308,6 +1322,7 @@ class RecruitingService:
 
     def worker_loop(self, stop_event):
         """独立进程主循环：独立心跳线程 + 轮询 monitor_enabled 标志、定期跑 monitor_once。"""
+        self.store.set_setting('worker_pacing', self._startup_pacing)
         self.store.event('worker_started', '', '独立监测进程已启动')
         self._stop_event = stop_event
         if hasattr(self.local_session, 'set_stop_event'):

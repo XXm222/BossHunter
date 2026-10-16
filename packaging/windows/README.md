@@ -77,6 +77,8 @@ Windows 11 ARM64 可作为构建主机，利用系统的 x64 应用兼容运行�
 4. 在独立 Chrome 登录自己的 BOSS，在项目网页配置模型、选择岗位并确认绑定会话。首次保存模型配置后停止系统再启动，让独立 worker 读取最新配置。自动任务仍由项目内的开关控制，安装或打开启动器不会自行开启任务；已有数据中开启的任务按原项目逻辑恢复。
 5. “停止系统”或关闭启动器会停止本次启动的服务和独立 Chrome，保留登录资料及数据库；普通 Chrome 不受影响。
 
+“请求统计”页可修改招聘端读取间隔、分页间隔、主动招呼间隔、每岗每轮人数和 HTTP 轮询间隔。点击“保存节流参数”后会列出改动并要求确认；取消会放弃本次编辑，不写配置。确认后保存，但正在运行的进程继续使用原节流参数，页面显示“待重启生效”。当前使用手动重启：退出 BossHunter 启动器后重新打开并启动系统；源码运行时需同时停止并重启 Web 和招聘监测进程。只重启 Web 而旧 worker 仍运行时，页面继续提示待重启。
+
 数据位置：`%LOCALAPPDATA%\BossHunter\`，其中 `logs` 保存日志，`chrome-profile` 保存默认独立浏览器资料。安装文件位置：`%LOCALAPPDATA%\Programs\BossHunter\`。升级会先清理安装目录中由 PyInstaller 管理的 `_internal` 运行库目录再复制新文件，避免旧依赖残留；升级和卸载不删除独立用户数据目录。
 
 启动 Chrome 和 Node.js 时临时清理 PyInstaller DLL 搜索目录及外部子进程 PATH 中的打包目录，随后恢复启动器自身的 DLL 搜索设置，避免将 Python 运行库传给独立程序。Web 和 worker 仍使用原打包环境。[PyInstaller 官方说明](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html#launching-external-programs-from-the-frozen-application)
